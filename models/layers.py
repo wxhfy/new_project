@@ -14,8 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import softmax, add_self_loops
+from torch_geometric.utils import softmax
 from torch_geometric.nn.inits import glorot, zeros
+from torch_scatter import scatter_add
 
 
 class GATv2Conv(MessagePassing):
@@ -86,7 +87,8 @@ class GATv2Conv(MessagePassing):
         glorot(self.att)
         if self.lin_edge is not None:
             glorot(self.lin_edge.weight)
-        zeros(self.bias)
+        if self.bias is not None:
+            zeros(self.bias)
 
     def forward(self, x, edge_index, edge_attr=None, return_attention_weights=False):
         """
@@ -101,27 +103,23 @@ class GATv2Conv(MessagePassing):
         返回:
             tuple: (输出特征, 注意力权重) 或 输出特征
         """
-        # 处理输入
-        if isinstance(x, tuple):
-            x_src, x_dst = x  # 如果输入是元组，分别处理源节点和目标节点
-        else:
+        # 自环处理
+        if isinstance(x, torch.Tensor):
             x_src = x_dst = x
+        else:
+            x_src, x_dst = x
 
-        H, C = self.heads, self.out_channels
+        # 对源节点和目标节点进行线性变换
+        x_src = self.lin_src(x_src).view(-1, self.heads, self.out_channels)
+        x_dst = self.lin_dst(x_dst).view(-1, self.heads, self.out_channels)
 
-        # 线性变换
-        x_src = self.lin_src(x_src).view(-1, H, C)  # [num_nodes, heads, channels]
-        x_dst = self.lin_dst(x_dst).view(-1, H, C)
+        # 执行消息传递
+        out = self.propagate(edge_index, x=(x_src, x_dst), edge_attr=edge_attr,
+                             size=None, return_attention_weights=return_attention_weights)
 
-        # 传播过程
-        out, attention_weights = self._propagate(
-            edge_index, x=x, x_src=x_src, x_dst=x_dst, edge_attr=edge_attr,
-            size=None, return_attention_weights=return_attention_weights
-        )
-
-        # 应用残差连接 (如果启用)
-        if self.add_residual and x_src.size(-2) == out.size(-2):
-            out = out + x_src
+        # 处理返回的注意力权重
+        if isinstance(out, tuple):
+            out, alpha = out
 
         # 重塑输出
         out = out.view(-1, self.heads * self.out_channels)
@@ -130,13 +128,17 @@ class GATv2Conv(MessagePassing):
         if self.bias is not None:
             out = out + self.bias
 
+        # 添加残差连接
+        if self.add_residual and x_src.size(0) == out.size(0):
+            out = out + x_src.view(-1, self.heads * self.out_channels)
+
         # 返回结果
-        if return_attention_weights:
-            return out, attention_weights
+        if isinstance(out, tuple):
+            return out[0], (edge_index, alpha)
         else:
             return out
 
-    def message(self, x_j, x_i, edge_attr, index, ptr, size_i):
+    def message(self, x_j, x_i, edge_attr, index, size_i):
         """
         定义消息传递函数
 
@@ -145,17 +147,9 @@ class GATv2Conv(MessagePassing):
             x_i: 目标节点特征
             edge_attr: 边特征
             index: 边的目标节点索引
-            ptr: 稀疏表示的指针
             size_i: 目标节点数量
-
-        返回:
-            更新后的消息
         """
-        # 计算注意力分数 (GATv2方式): a(Wh_i || Wh_j)
-        x_j = x_j.view(-1, self.heads, self.out_channels)
-        x_i = x_i.view(-1, self.heads, self.out_channels)
-
-        # 合并源节点和目标节点信息
+        # 计算节点对特征
         x = x_i + x_j
 
         # 如果有边特征，融合进来
@@ -163,91 +157,46 @@ class GATv2Conv(MessagePassing):
             edge_attr = self.lin_edge(edge_attr).view(-1, self.heads, self.out_channels)
             x = x + edge_attr
 
-        # 计算注意力分数
+        # 计算注意力得分 - GATv2方式
         alpha = (x * self.att).sum(dim=-1)
-
-        # 应用LeakyReLU激活函数
         alpha = F.leaky_relu(alpha, self.negative_slope)
-
-        # 归一化
-        alpha = softmax(alpha, index, ptr, size_i)
-
-        # Dropout
+        alpha = softmax(alpha, index, ptr=None, num_nodes=size_i)
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
 
         # 应用注意力权重
         return x_j * alpha.unsqueeze(-1)
 
-    def _propagate(self, edge_index, x, x_src, x_dst, edge_attr=None, size=None, return_attention_weights=False):
+    def propagate(self, edge_index, size=None, **kwargs):
         """
-        自定义传播函数
-
-        参数:
-            edge_index: 边索引
-            x: 原始节点特征
-            x_src: 源节点转换特征
-            x_dst: 目标节点转换特征
-            edge_attr: 边特征
-            size: 图大小
-            return_attention_weights: 是否返回注意力权重
-
-        返回:
-            (输出特征, 注意力权重)
+        重写传播函数，支持注意力权重返回
         """
-        # 准备边索引
-        if isinstance(edge_index, torch.Tensor):
-            edge_index = edge_index.view(2, -1)
+        return_attention_weights = kwargs.pop('return_attention_weights', False)
 
-        # 获取源节点和目标节点索引
-        src_idx, dst_idx = edge_index[0], edge_index[1]
+        # 正常传播
+        output = super(GATv2Conv, self).propagate(edge_index, size=size, **kwargs)
 
-        # 获取源节点和目标节点特征
-        x_j = x_src[src_idx]  # 源节点特征
-        x_i = x_dst[dst_idx]  # 目标节点特征
-
-        # 准备边特征 (如果有)
-        if edge_attr is not None:
-            assert edge_attr.size(0) == edge_index.size(1)
-
-        # 计算注意力分数 (GATv2方式): a(Wh_i || Wh_j)
-        x_j = x_j.view(-1, self.heads, self.out_channels)
-        x_i = x_i.view(-1, self.heads, self.out_channels)
-
-        # 合并源节点和目标节点信息
-        x_combined = x_i + x_j
-
-        # 如果有边特征，融合进来
-        if edge_attr is not None and self.lin_edge is not None:
-            edge_embedding = self.lin_edge(edge_attr).view(-1, self.heads, self.out_channels)
-            x_combined = x_combined + edge_embedding
-
-        # 计算注意力分数
-        alpha = (x_combined * self.att).sum(dim=-1)
-
-        # 应用LeakyReLU激活函数
-        alpha = F.leaky_relu(alpha, self.negative_slope)
-
-        # 归一化
-        if isinstance(edge_index, torch.Tensor):
-            alpha = softmax(alpha, dst_idx, num_nodes=x_dst.size(0))
-        else:
-            # 对于稀疏表示的特殊处理
-            alpha = softmax(alpha, dst_idx, ptr=None, num_nodes=x_dst.size(0))
-
-        # Dropout
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-
-        # 计算消息
-        out = x_j * alpha.unsqueeze(-1)
-
-        # 聚合消息
-        out = scatter_add(out, dst_idx, dim=0, dim_size=x_dst.size(0))
-
-        attention_weights = None
+        # 处理注意力权重返回
         if return_attention_weights:
-            attention_weights = (edge_index, alpha)
+            # 重新计算注意力权重
+            x_j = kwargs['x'][0][edge_index[0]]  # 源节点特征
+            x_i = kwargs['x'][1][edge_index[1]]  # 目标节点特征
 
-        return out, attention_weights
+            # 计算节点对特征
+            x = x_i + x_j
+
+            # 如果有边特征，融合进来
+            if 'edge_attr' in kwargs and kwargs['edge_attr'] is not None and self.lin_edge is not None:
+                edge_attr = self.lin_edge(kwargs['edge_attr']).view(-1, self.heads, self.out_channels)
+                x = x + edge_attr
+
+            # 计算注意力得分
+            alpha = (x * self.att).sum(dim=-1)
+            alpha = F.leaky_relu(alpha, self.negative_slope)
+
+            # 不应用softmax和dropout，保留原始权重
+            return output, alpha
+
+        return output
 
 
 class SelfAttention(nn.Module):
@@ -299,25 +248,3 @@ class SelfAttention(nn.Module):
         out = torch.matmul(attn, value)
 
         return out
-
-
-def scatter_add(src, index, dim=-1, dim_size=None):
-    """
-    自定义的scatter_add函数，用于消息聚合
-
-    参数:
-        src: 源张量
-        index: 目标索引
-        dim: 维度
-        dim_size: 输出维度大小
-
-    返回:
-        聚合后的张量
-    """
-    if torch_geometric.is_compiled():
-        return torch_geometric.scatter_add(src, index, dim, dim_size)
-    else:
-        return torch.scatter_add(
-            torch.zeros((dim_size,) + src.shape[1:], dtype=src.dtype, device=src.device),
-            dim, index.reshape(-1, 1).expand(-1, src.shape[1:]), src
-        )

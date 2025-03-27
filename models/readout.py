@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-图级别嵌入池化模块
+蛋白质图嵌入系统 - 图读出层
 
-为蛋白质知识图谱提供多种图池化策略，
-包括注意力池化、分层池化、差分池化等。
+实现图级别的嵌入聚合机制，将节点级特征整合为图级表示，
+专为蛋白质图谱的结构特点设计。
 
 作者: 基于wxhfy的知识图谱处理工作扩展
 """
@@ -14,124 +14,124 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool, global_max_pool, global_add_pool
+from torch_geometric.utils import to_dense_batch
 
 
-class AttentiveReadout(nn.Module):
+class GraphReadout(nn.Module):
     """
-    注意力加权的图级别池化
+    图级别嵌入聚合模块
 
-    学习节点的重要性权重，进行加权求和，得到图级别表示
-    """
-
-    def __init__(self, hidden_dim):
-        """
-        参数:
-            hidden_dim: 节点特征维度
-        """
-        super(AttentiveReadout, self).__init__()
-
-        # 注意力网络，计算每个节点的重要性分数
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1, bias=False)
-        )
-
-    def forward(self, x, batch):
-        """
-        前向传播
-
-        参数:
-            x: 节点特征 [num_nodes, hidden_dim]
-            batch: 批处理索引 [num_nodes]
-
-        返回:
-            graph_embedding: 图级别嵌入 [batch_size, hidden_dim]
-        """
-        # 计算注意力得分
-        attention_scores = self.attention(x)  # [num_nodes, 1]
-
-        # 进行softmax归一化，分别对每个图中的节点进行
-        max_scores = torch.zeros_like(attention_scores)
-        max_scores.scatter_(0, batch.unsqueeze(-1).expand(-1, attention_scores.size(-1)),
-                            attention_scores, reduce='max')
-        exp_scores = torch.exp(attention_scores - max_scores[batch])
-
-        # 为每个图计算指数和
-        graph_sizes = torch.zeros(batch.max().item() + 1, dtype=torch.float, device=x.device)
-        graph_sizes.scatter_add_(0, batch, torch.ones_like(batch, dtype=torch.float))
-
-        # 计算每个节点的注意力权重
-        sum_exp_scores = torch.zeros_like(exp_scores)
-        sum_exp_scores.scatter_add_(0, batch.unsqueeze(-1).expand(-1, exp_scores.size(-1)),
-                                    exp_scores)
-        normalized_scores = exp_scores / sum_exp_scores[batch]
-
-        # 加权求和得到图嵌入
-        graph_embedding = torch.zeros(batch.max().item() + 1, x.size(-1),
-                                      dtype=torch.float, device=x.device)
-        graph_embedding.scatter_add_(0, batch.unsqueeze(-1).expand(-1, x.size(-1)),
-                                     x * normalized_scores)
-
-        return graph_embedding
-
-
-class MultiReadout(nn.Module):
-    """
-    多种池化方法融合的图级别表示
-
-    结合均值池化、最大池化和注意力池化，捕获更丰富的图级别信息
+    特点:
+    1. 支持多种图池化策略（平均、最大值、和、注意力）
+    2. 针对蛋白质图谱结构优化
+    3. 可选的自注意力聚合机制
     """
 
-    def __init__(self, hidden_dim, use_attention=True):
+    def __init__(self, in_channels, out_channels=None, readout_type='multihead',
+                 num_heads=4, dropout=0.1):
         """
         参数:
-            hidden_dim: 节点特征维度
-            use_attention: 是否使用注意力池化
+            in_channels (int): 输入特征维度
+            out_channels (int, optional): 输出特征维度，None则与输入维度相同
+            readout_type (str): 聚合类型，可选['mean', 'max', 'add', 'attention', 'multihead']
+            num_heads (int): 多头注意力的头数 (仅对attention和multihead有效)
+            dropout (float): Dropout率
         """
-        super(MultiReadout, self).__init__()
+        super(GraphReadout, self).__init__()
 
-        self.use_attention = use_attention
-        if use_attention:
-            self.attentive_pool = AttentiveReadout(hidden_dim)
+        self.in_channels = in_channels
+        self.out_channels = out_channels or in_channels
+        self.readout_type = readout_type
 
-        # 融合不同池化结果的权重
-        self.pool_weights = nn.Parameter(torch.ones(3 if use_attention else 2))
-        self.pool_norm = nn.LayerNorm(hidden_dim)
+        # 基本池化函数
+        self.global_mean_pool = global_mean_pool
+        self.global_max_pool = global_max_pool
+        self.global_add_pool = global_add_pool
 
-    def forward(self, x, batch):
-        """
-        前向传播
+        # 多种池化方式的融合层
+        if readout_type == 'multihead':
+            self.attention = nn.Sequential(
+                nn.Linear(in_channels * 3, in_channels),
+                nn.LayerNorm(in_channels),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(in_channels, num_heads)
+            )
 
-        参数:
-            x: 节点特征 [num_nodes, hidden_dim]
-            batch: 批处理索引 [num_nodes]
+        # 注意力池化层
+        elif readout_type == 'attention':
+            self.attention_layer = nn.Sequential(
+                nn.Linear(in_channels, in_channels // 2),
+                nn.LayerNorm(in_channels // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(in_channels // 2, 1)
+            )
 
-        返回:
-            graph_embedding: 图级别嵌入 [batch_size, hidden_dim]
-        """
-        # 均值池化
-        mean_pool = global_mean_pool(x, batch)
-
-        # 最大池化
-        max_pool = global_max_pool(x, batch)
-
-        # 总和池化
-        sum_pool = global_add_pool(x, batch)
-
-        # 注意力池化（可选）
-        if self.use_attention:
-            att_pool = self.attentive_pool(x, batch)
-
-            # 对各种池化结果进行加权平均
-            weights = F.softmax(self.pool_weights, dim=0)
-            graph_embedding = (weights[0] * mean_pool +
-                               weights[1] * max_pool +
-                               weights[2] * att_pool)
+        # 输出映射层
+        if self.out_channels != self.in_channels:
+            if readout_type == 'multihead':
+                self.out_proj = nn.Linear(in_channels, out_channels)
+            else:
+                self.out_proj = nn.Linear(in_channels, out_channels)
         else:
-            # 不使用注意力池化的加权平均
-            weights = F.softmax(self.pool_weights, dim=0)
-            graph_embedding = weights[0] * mean_pool + weights[1] * max_pool
+            self.out_proj = nn.Identity()
 
-        # 归一化
-        return self.pool_norm(graph_embedding)
+    def forward(self, x, batch, mask=None):
+        """
+        前向传播
+
+        参数:
+            x (Tensor): 节点特征 [num_nodes, in_channels]
+            batch (Tensor): 节点对应的批次索引
+            mask (Tensor, optional): 节点掩码，用于过滤部分节点
+
+        返回:
+            Tensor: 图级嵌入向量 [batch_size, out_channels]
+        """
+        if self.readout_type == 'mean':
+            # 平均池化
+            return self.out_proj(self.global_mean_pool(x, batch))
+
+        elif self.readout_type == 'max':
+            # 最大值池化
+            return self.out_proj(self.global_max_pool(x, batch))
+
+        elif self.readout_type == 'add':
+            # 求和池化
+            return self.out_proj(self.global_add_pool(x, batch))
+
+        elif self.readout_type == 'attention':
+            # 注意力池化
+            x_dense, mask = to_dense_batch(x, batch)
+
+            # 计算注意力得分
+            scores = self.attention_layer(x_dense).squeeze(-1)
+            scores = scores.masked_fill(~mask, float('-inf'))
+            attention_weights = F.softmax(scores, dim=1)
+
+            # 应用注意力权重
+            out = torch.bmm(attention_weights.unsqueeze(1), x_dense).squeeze(1)
+            return self.out_proj(out)
+
+        elif self.readout_type == 'multihead':
+            # 多头池化 (结合平均、最大值和求和)
+            x_mean = self.global_mean_pool(x, batch)
+            x_max = self.global_max_pool(x, batch)
+            x_add = self.global_add_pool(x, batch)
+
+            # 拼接不同池化结果
+            x_cat = torch.cat([x_mean, x_max, x_add], dim=1)
+
+            # 计算不同池化方式的权重
+            attention_weights = self.attention(x_cat)
+            attention_weights = F.softmax(attention_weights, dim=1)
+
+            # 加权融合
+            x_stacked = torch.stack([x_mean, x_max, x_add], dim=1)
+            out = torch.bmm(attention_weights.unsqueeze(1), x_stacked).squeeze(1)
+
+            return self.out_proj(out)
+
+        else:
+            raise ValueError(f"不支持的聚合类型: {self.readout_type}")
