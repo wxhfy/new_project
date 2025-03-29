@@ -2,249 +2,1248 @@
 # -*- coding: utf-8 -*-
 
 """
-蛋白质图嵌入系统 - 图注意力层实现
+增强型蛋白质图神经网络基础层组件
 
-包含GATv2图注意力层的实现，专为蛋白质知识图谱优化，
-支持节点间关系（肽键和空间邻近）的特殊处理。
+该模块实现了针对蛋白质设计与抗菌肽(AMPs)生成的专用图神经网络层组件，
+包括异质边处理、物化属性感知、结构敏感注意力等先进特性。
 
-作者: 基于wxhfy的知识图谱处理工作扩展
+作者: wxhfy
+日期: 2025-03-29
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import softmax
-from torch_geometric.nn.inits import glorot, zeros
-from torch_scatter import scatter_add
+from torch_geometric.nn import GATv2Conv, MessagePassing
+from torch_geometric.utils import softmax, add_self_loops
+from torch_scatter import scatter_add, scatter_mean, scatter_max
 
 
-class GATv2Conv(MessagePassing):
+class GATv2ConvLayer(nn.Module):
     """
-    GATv2注意力层实现，针对蛋白质知识图谱优化
+    增强型GATv2卷积层，支持残差连接、层归一化和自定义激活函数
 
-    特点:
-    1. 支持边特征融合，针对肽键/空间邻近关系进行差异化处理
-    2. 基于GATv2机制，解决了原始GAT中的静态注意力问题
-    3. 增强了节点间相互作用的表达能力
+    该层特别针对蛋白质结构进行了优化，支持边特征以区分肽键、空间连接和相互作用类型
+
+    参数:
+        in_channels (int): 输入特征维度
+        out_channels (int): 输出特征维度
+        heads (int): 注意力头数量
+        edge_dim (int, optional): 边特征维度
+        dropout (float, optional): Dropout率
+        residual (bool, optional): 是否使用残差连接
+        use_layer_norm (bool, optional): 是否使用层归一化
+        activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
     """
 
-    def __init__(self, in_channels, out_channels, heads=1, negative_slope=0.2,
-                 dropout=0.0, edge_dim=None, bias=True, share_weights=False,
-                 add_residual=True):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            heads=4,
+            edge_dim=None,
+            dropout=0.2,
+            residual=True,
+            use_layer_norm=True,
+            activation='gelu'
+    ):
+        super(GATv2ConvLayer, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.residual = residual
+        self.use_layer_norm = use_layer_norm
+
+        # GATv2卷积
+        self.conv = GATv2Conv(
+            in_channels=in_channels,
+            out_channels=out_channels // heads if heads > 1 else out_channels,
+            heads=heads,
+            edge_dim=edge_dim,
+            dropout=dropout,
+            concat=True if heads > 1 else False,
+            add_self_loops=False  # 手动控制自环，更适合蛋白质图
+        )
+
+        # 残差连接投影
+        if residual:
+            if in_channels != out_channels:
+                self.res_proj = nn.Linear(in_channels, out_channels)
+            else:
+                self.res_proj = nn.Identity()
+
+        # 层归一化
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(out_channels)
+
+        # 激活函数选择
+        if activation == 'relu':
+            self.act = nn.ReLU()
+        elif activation == 'gelu':
+            self.act = nn.GELU()
+        elif activation == 'leaky_relu':
+            self.act = nn.LeakyReLU(0.2)
+        else:
+            self.act = nn.GELU()
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, edge_index, edge_attr=None):
         """
+        前向传递
+
         参数:
-            in_channels (int): 输入特征维度
-            out_channels (int): 输出特征维度
-            heads (int, optional): 注意力头数量
-            negative_slope (float, optional): LeakyReLU负斜率
-            dropout (float, optional): Dropout比率
-            edge_dim (int, optional): 边特征维度，None表示不使用边特征
-            bias (bool, optional): 是否使用偏置
-            share_weights (bool, optional): 是否在源节点和目标节点间共享变换权重
-            add_residual (bool, optional): 是否添加残差连接
+            x (torch.Tensor): 节点特征 [num_nodes, in_channels]
+            edge_index (torch.LongTensor): 边连接 [2, num_edges]
+            edge_attr (torch.Tensor, optional): 边特征 [num_edges, edge_dim]
+
+        返回:
+            out (torch.Tensor): 更新的节点特征 [num_nodes, out_channels]
         """
-        super(GATv2Conv, self).__init__(aggr='add', node_dim=0)
+        # GAT卷积
+        out = self.conv(x, edge_index, edge_attr)
+
+        # 应用激活函数
+        out = self.act(out)
+
+        # 残差连接
+        if self.residual:
+            res = self.res_proj(x)
+            out = out + res
+
+        # 层归一化
+        if self.use_layer_norm:
+            out = self.layer_norm(out)
+
+        # Dropout
+        out = self.dropout(out)
+
+        return out
+
+
+class HeterogeneousGATv2Layer(MessagePassing):
+    """
+    异质边GATv2层，针对不同类型的边使用不同的注意力计算机制
+
+    为肽键和空间边设计分离的注意力计算通道，通过门控机制融合不同类型边的信息。
+    特别适合处理蛋白质中的多种相互作用类型。
+
+    参数:
+        in_channels (int): 输入特征维度
+        out_channels (int): 输出特征维度
+        heads (int): 注意力头数量
+        edge_types (int): 边类型数量（默认为2，对应肽键和空间连接）
+        edge_dim (int, optional): 边特征维度
+        dropout (float, optional): Dropout率
+        use_layer_norm (bool, optional): 是否使用层归一化
+        activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
+    """
+
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            heads=4,
+            edge_types=2,
+            edge_dim=None,
+            dropout=0.2,
+            use_layer_norm=True,
+            activation='gelu',
+            **kwargs
+    ):
+        super(HeterogeneousGATv2Layer, self).__init__(aggr='add', node_dim=0, **kwargs)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.heads = heads
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.edge_types = edge_types
         self.edge_dim = edge_dim
-        self.share_weights = share_weights
-        self.add_residual = add_residual
+        self.use_layer_norm = use_layer_norm
 
-        # 定义线性变换 (针对源节点和目标节点)
-        self.lin_src = nn.Linear(in_channels, heads * out_channels, bias=False)
-        if self.share_weights:
-            self.lin_dst = self.lin_src
-        else:
-            self.lin_dst = nn.Linear(in_channels, heads * out_channels, bias=False)
+        # 维度计算
+        self.head_dim = out_channels // heads
 
-        # 注意力机制
-        self.att = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        # 为每种边类型创建独立的线性变换
+        self.linear_q = nn.ModuleList([
+            nn.Linear(in_channels, self.head_dim * heads) for _ in range(edge_types)
+        ])
+        self.linear_k = nn.ModuleList([
+            nn.Linear(in_channels, self.head_dim * heads) for _ in range(edge_types)
+        ])
+        self.linear_v = nn.ModuleList([
+            nn.Linear(in_channels, self.head_dim * heads) for _ in range(edge_types)
+        ])
 
-        # 边特征处理 (如果有)
+        # 如果有边特征，创建边特征变换
         if edge_dim is not None:
-            self.lin_edge = nn.Linear(edge_dim, heads * out_channels, bias=False)
+            self.edge_encoders = nn.ModuleList([
+                nn.Linear(edge_dim, self.head_dim * heads) for _ in range(edge_types)
+            ])
+
+        # 注意力得分计算
+        self.att_layers = nn.ModuleList([
+            nn.Linear(self.head_dim * 2, 1) for _ in range(edge_types)
+        ])
+
+        # 边类型门控权重
+        self.gate_weights = nn.Parameter(torch.Tensor(edge_types, heads))
+        nn.init.ones_(self.gate_weights)  # 初始化为平均权重
+        self.gate_scale = nn.Parameter(torch.Tensor(1))
+        nn.init.constant_(self.gate_scale, 5.0)  # 控制门控的软硬程度
+
+        # 输出投影
+        self.output_proj = nn.Linear(self.head_dim * heads, out_channels)
+
+        # 激活函数选择
+        if activation == 'relu':
+            self.act = nn.ReLU()
+        elif activation == 'gelu':
+            self.act = nn.GELU()
+        elif activation == 'leaky_relu':
+            self.act = nn.LeakyReLU(0.2)
         else:
-            self.lin_edge = None
+            self.act = nn.GELU()
 
-        # 偏置
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        else:
-            self.register_parameter('bias', None)
+        # Dropout & LayerNorm
+        self.dropout = nn.Dropout(dropout)
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(out_channels)
 
-        self.reset_parameters()
+        # 残差投影
+        self.res_proj = nn.Linear(in_channels, out_channels)
 
-    def reset_parameters(self):
-        """初始化模型参数"""
-        glorot(self.lin_src.weight)
-        if not self.share_weights:
-            glorot(self.lin_dst.weight)
-        glorot(self.att)
-        if self.lin_edge is not None:
-            glorot(self.lin_edge.weight)
-        if self.bias is not None:
-            zeros(self.bias)
-
-    def forward(self, x, edge_index, edge_attr=None, return_attention_weights=False):
+    def forward(self, x, edge_index, edge_type, edge_attr=None):
         """
-        前向传播
+        前向传递
 
         参数:
-            x (Tensor): 节点特征矩阵 [num_nodes, in_channels]
-            edge_index (LongTensor): 边索引 [2, num_edges]
-            edge_attr (Tensor, optional): 边特征 [num_edges, edge_dim]
-            return_attention_weights (bool, optional): 是否返回注意力权重
+            x (torch.Tensor): 节点特征 [num_nodes, in_channels]
+            edge_index (torch.LongTensor): 边连接 [2, num_edges]
+            edge_type (torch.LongTensor): 边类型索引 [num_edges]
+            edge_attr (torch.Tensor, optional): 边特征 [num_edges, edge_dim]
 
         返回:
-            tuple: (输出特征, 注意力权重) 或 输出特征
+            out (torch.Tensor): 更新的节点特征 [num_nodes, out_channels]
         """
-        # 自环处理
-        if isinstance(x, torch.Tensor):
-            x_src = x_dst = x
-        else:
-            x_src, x_dst = x
+        # 残差连接
+        res = self.res_proj(x)
 
-        # 对源节点和目标节点进行线性变换
-        x_src = self.lin_src(x_src).view(-1, self.heads, self.out_channels)
-        x_dst = self.lin_dst(x_dst).view(-1, self.heads, self.out_channels)
+        # 消息传递
+        out = self.propagate(
+            edge_index,
+            x=x,
+            edge_type=edge_type,
+            edge_attr=edge_attr,
+            size=None
+        )
 
-        # 执行消息传递
-        out = self.propagate(edge_index, x=(x_src, x_dst), edge_attr=edge_attr,
-                             size=None, return_attention_weights=return_attention_weights)
+        # 输出投影
+        out = self.output_proj(out)
 
-        # 处理返回的注意力权重
-        if isinstance(out, tuple):
-            out, alpha = out
+        # 残差连接
+        out = out + res
 
-        # 重塑输出
-        out = out.view(-1, self.heads * self.out_channels)
+        # 激活函数
+        out = self.act(out)
 
-        # 添加偏置
-        if self.bias is not None:
-            out = out + self.bias
+        # 层归一化
+        if self.use_layer_norm:
+            out = self.layer_norm(out)
 
-        # 添加残差连接
-        if self.add_residual and x_src.size(0) == out.size(0):
-            out = out + x_src.view(-1, self.heads * self.out_channels)
+        # Dropout
+        out = self.dropout(out)
 
-        # 返回结果
-        if isinstance(out, tuple):
-            return out[0], (edge_index, alpha)
-        else:
-            return out
+        return out
 
-    def message(self, x_j, x_i, edge_attr, index, size_i):
+    def message(self, x_i, x_j, edge_type, edge_attr, index, ptr, size_i):
         """
-        定义消息传递函数
+        计算每条边上的消息
 
         参数:
-            x_j: 源节点特征
-            x_i: 目标节点特征
-            edge_attr: 边特征
-            index: 边的目标节点索引
-            size_i: 目标节点数量
+            x_i (torch.Tensor): 目标节点特征
+            x_j (torch.Tensor): 源节点特征
+            edge_type (torch.LongTensor): 边类型索引
+            edge_attr (torch.Tensor, optional): 边特征
+            index (torch.LongTensor): 目标节点索引
+            ptr (torch.LongTensor): 指向目标节点索引的指针
+            size_i (int): 目标节点数量
         """
-        # 计算节点对特征
-        x = x_i + x_j
+        # 初始化结果张量
+        num_edges, num_types = edge_type.size(0), self.edge_types
 
-        # 如果有边特征，融合进来
-        if edge_attr is not None and self.lin_edge is not None:
-            edge_attr = self.lin_edge(edge_attr).view(-1, self.heads, self.out_channels)
-            x = x + edge_attr
+        # 每个边类型的消息
+        messages = torch.zeros(num_edges, self.heads, self.head_dim, device=x_i.device)
 
-        # 计算注意力得分 - GATv2方式
-        alpha = (x * self.att).sum(dim=-1)
-        alpha = F.leaky_relu(alpha, self.negative_slope)
-        alpha = softmax(alpha, index, ptr=None, num_nodes=size_i)
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        # 对每种类型分别计算注意力和消息
+        for t in range(num_types):
+            # 选择当前类型的边
+            mask = (edge_type == t)
+            if not mask.any():
+                continue
 
-        # 应用注意力权重
-        return x_j * alpha.unsqueeze(-1)
+            # 当前类型的边索引
+            curr_indices = torch.where(mask)[0]
 
-    def propagate(self, edge_index, size=None, **kwargs):
+            # 获取当前类型边的源节点和目标节点
+            curr_x_i = x_i[curr_indices]  # 目标节点
+            curr_x_j = x_j[curr_indices]  # 源节点
+
+            # 变换查询、键、值
+            q_i = self.linear_q[t](curr_x_i).view(-1, self.heads, self.head_dim)
+            k_j = self.linear_k[t](curr_x_j).view(-1, self.heads, self.head_dim)
+            v_j = self.linear_v[t](curr_x_j).view(-1, self.heads, self.head_dim)
+
+            # 合并边特征(如果有)
+            if edge_attr is not None:
+                curr_edge_attr = edge_attr[curr_indices]
+                edge_embedding = self.edge_encoders[t](curr_edge_attr).view(-1, self.heads, self.head_dim)
+                k_j = k_j + edge_embedding
+
+            # 注意力得分计算
+            alpha = torch.cat([q_i, k_j], dim=-1)
+            alpha = self.att_layers[t](alpha.view(-1, 2 * self.head_dim)).view(-1, self.heads, 1)
+
+            # 边类型特定的门控权重
+            gate = torch.sigmoid(self.gate_weights[t] * self.gate_scale).view(1, self.heads, 1)
+
+            # 应用门控注意力缩放
+            alpha = alpha * gate
+
+            # Softmax归一化(按目标节点聚合)
+            alpha = softmax(alpha, index[curr_indices], ptr, size_i)
+
+            # 保存当前类型的加权消息
+            messages[curr_indices] = alpha * v_j
+
+        # 合并所有头的消息
+        return messages.view(num_edges, -1)
+
+    def update(self, aggr_out):
         """
-        重写传播函数，支持注意力权重返回
-        """
-        return_attention_weights = kwargs.pop('return_attention_weights', False)
+        更新节点表示
 
-        # 正常传播
-        output = super(GATv2Conv, self).propagate(edge_index, size=size, **kwargs)
-
-        # 处理注意力权重返回
-        if return_attention_weights:
-            # 重新计算注意力权重
-            x_j = kwargs['x'][0][edge_index[0]]  # 源节点特征
-            x_i = kwargs['x'][1][edge_index[1]]  # 目标节点特征
-
-            # 计算节点对特征
-            x = x_i + x_j
-
-            # 如果有边特征，融合进来
-            if 'edge_attr' in kwargs and kwargs['edge_attr'] is not None and self.lin_edge is not None:
-                edge_attr = self.lin_edge(kwargs['edge_attr']).view(-1, self.heads, self.out_channels)
-                x = x + edge_attr
-
-            # 计算注意力得分
-            alpha = (x * self.att).sum(dim=-1)
-            alpha = F.leaky_relu(alpha, self.negative_slope)
-
-            # 不应用softmax和dropout，保留原始权重
-            return output, alpha
-
-        return output
-
-
-class SelfAttention(nn.Module):
-    """
-    节点内部特征的自注意力机制，增强不同通道间的交互
-    """
-
-    def __init__(self, in_features, hidden_dim=None):
-        """
         参数:
-            in_features (int): 输入特征维度
-            hidden_dim (int, optional): 注意力隐藏层维度
+            aggr_out (torch.Tensor): 聚合后的消息 [num_nodes, heads*head_dim]
         """
-        super(SelfAttention, self).__init__()
+        return aggr_out
 
-        if hidden_dim is None:
-            hidden_dim = in_features // 8
-            hidden_dim = max(1, hidden_dim)
 
-        self.query = nn.Linear(in_features, hidden_dim)
-        self.key = nn.Linear(in_features, hidden_dim)
-        self.value = nn.Linear(in_features, in_features)
+class MLPLayer(nn.Module):
+    """
+    增强型多层感知机层，支持层归一化和多种激活函数
 
-        # 初始化
-        nn.init.xavier_normal_(self.query.weight)
-        nn.init.xavier_normal_(self.key.weight)
-        nn.init.xavier_normal_(self.value.weight)
+    灵活的MLP实现，支持可变层数和特性，可用于节点特征变换、嵌入映射等任务
+
+    参数:
+        in_channels (int): 输入特征维度
+        hidden_channels (int): 隐藏层维度
+        out_channels (int): 输出特征维度
+        layers (int, optional): MLP层数，默认2
+        dropout (float, optional): Dropout率
+        use_layer_norm (bool, optional): 是否使用层归一化
+        activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
+        residual (bool, optional): 是否使用残差连接(仅当in_channels=out_channels时有效)
+    """
+
+    def __init__(
+            self,
+            in_channels,
+            hidden_channels,
+            out_channels,
+            layers=2,
+            dropout=0.2,
+            use_layer_norm=True,
+            activation='gelu',
+            residual=False
+    ):
+        super(MLPLayer, self).__init__()
+
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.layers = layers
+        self.residual = residual and (in_channels == out_channels)
+
+        # 激活函数选择
+        if activation == 'relu':
+            act = nn.ReLU()
+        elif activation == 'gelu':
+            act = nn.GELU()
+        elif activation == 'leaky_relu':
+            act = nn.LeakyReLU(0.2)
+        else:
+            act = nn.GELU()
+
+        # 构建MLP
+        layers_list = []
+
+        # 输入层
+        layers_list.append(nn.Linear(in_channels, hidden_channels))
+        if use_layer_norm:
+            layers_list.append(nn.LayerNorm(hidden_channels))
+        layers_list.append(act)
+        layers_list.append(nn.Dropout(dropout))
+
+        # 中间层
+        for _ in range(max(0, self.layers - 2)):
+            layers_list.append(nn.Linear(hidden_channels, hidden_channels))
+            if use_layer_norm:
+                layers_list.append(nn.LayerNorm(hidden_channels))
+            layers_list.append(act)
+            layers_list.append(nn.Dropout(dropout))
+
+        # 输出层
+        layers_list.append(nn.Linear(hidden_channels, out_channels))
+        if use_layer_norm:
+            layers_list.append(nn.LayerNorm(out_channels))
+
+        self.mlp = nn.Sequential(*layers_list)
 
     def forward(self, x):
         """
-        前向传播
+        前向传递
 
         参数:
-            x (Tensor): 输入特征 [batch_size, sequence_length, in_features]
+            x (torch.Tensor): 输入特征
 
         返回:
-            Tensor: 注意力加权后的特征
+            out (torch.Tensor): 变换后的特征
         """
-        # 计算注意力分数
-        query = self.query(x)  # [batch, seq_len, hidden_dim]
-        key = self.key(x)  # [batch, seq_len, hidden_dim]
-        value = self.value(x)  # [batch, seq_len, in_features]
+        out = self.mlp(x)
 
-        # 计算注意力权重
-        scores = torch.matmul(query, key.transpose(-2, -1)) / (key.size(-1) ** 0.5)
-        attn = F.softmax(scores, dim=-1)
-
-        # 应用注意力权重
-        out = torch.matmul(attn, value)
+        # 可选的残差连接
+        if self.residual:
+            out = out + x
 
         return out
+
+
+class EdgeTypeEncoder(nn.Module):
+    """
+    边类型编码器，专门处理蛋白质图中的不同边类型
+
+    可以区分肽键连接、空间邻近连接和各种相互作用类型，为GATv2卷积层提供丰富的边特征
+
+    参数:
+        in_features (int): 输入边特征维度
+        out_features (int): 输出边嵌入维度
+        num_edge_types (int): 边类型数量，默认为2（肽键和空间连接）
+        activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
+    """
+
+    def __init__(
+            self,
+            in_features,
+            out_features,
+            num_edge_types=2,
+            activation='gelu'
+    ):
+        super(EdgeTypeEncoder, self).__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_edge_types = num_edge_types
+
+        # 边类型嵌入表
+        self.edge_type_embedding = nn.Embedding(num_edge_types, out_features // 2)
+
+        # 边特征变换
+        self.edge_proj = nn.Linear(in_features, out_features // 2)
+
+        # 激活函数选择
+        if activation == 'relu':
+            self.act = nn.ReLU()
+        elif activation == 'gelu':
+            self.act = nn.GELU()
+        elif activation == 'leaky_relu':
+            self.act = nn.LeakyReLU(0.2)
+        else:
+            self.act = nn.GELU()
+
+        # 输出归一化
+        self.layer_norm = nn.LayerNorm(out_features)
+
+    def forward(self, edge_attr):
+        """
+        编码边特征
+
+        参数:
+            edge_attr (torch.Tensor): 边特征 [num_edges, in_features]
+                                      假设第一个特征是边类型 (0:肽键, 1:空间连接, ...)
+
+        返回:
+            edge_emb (torch.Tensor): 边嵌入 [num_edges, out_features]
+        """
+        # 提取边类型
+        edge_types = edge_attr[:, 0].long()  # 假设第一列是边类型
+
+        # 获取边类型嵌入
+        type_embedding = self.edge_type_embedding(edge_types)  # [num_edges, out_features//2]
+
+        # 处理边特征
+        edge_features = edge_attr[:, 1:] if edge_attr.size(1) > 1 else torch.zeros_like(edge_attr)
+        edge_features = self.edge_proj(edge_features)  # [num_edges, out_features//2]
+        edge_features = self.act(edge_features)
+
+        # 连接类型嵌入和特征嵌入
+        edge_emb = torch.cat([type_embedding, edge_features], dim=1)  # [num_edges, out_features]
+
+        # 应用层归一化
+        edge_emb = self.layer_norm(edge_emb)
+
+        return edge_emb
+
+
+class EdgeUpdateModule(nn.Module):
+    """
+    边特征动态更新模块
+
+    根据连接节点的特征更新边属性，增强对残基间相互作用的动态表达能力
+
+    参数:
+        node_dim (int): 节点特征维度
+        edge_dim (int): 边特征维度
+        edge_types (int, optional): 边类型数量，用于异质边处理
+        hidden_dim (int, optional): 隐藏层维度
+        activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
+    """
+
+    def __init__(
+            self,
+            node_dim,
+            edge_dim,
+            edge_types=None,
+            hidden_dim=None,
+            activation='gelu'
+    ):
+        super(EdgeUpdateModule, self).__init__()
+
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.edge_types = edge_types
+        self.hidden_dim = hidden_dim or max(node_dim, edge_dim)
+
+        # 激活函数选择
+        if activation == 'relu':
+            act_fn = nn.ReLU()
+        elif activation == 'gelu':
+            act_fn = nn.GELU()
+        elif activation == 'leaky_relu':
+            act_fn = nn.LeakyReLU(0.2)
+        else:
+            act_fn = nn.GELU()
+
+        # 异质边处理
+        if edge_types is not None:
+            # 为每种类型的边创建独立的更新网络
+            self.edge_updaters = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(node_dim * 2 + edge_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    act_fn,
+                    nn.Linear(self.hidden_dim, edge_dim)
+                ) for _ in range(edge_types)
+            ])
+        else:
+            # 统一的边更新网络
+            self.edge_update = nn.Sequential(
+                nn.Linear(node_dim * 2 + edge_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                act_fn,
+                nn.Linear(self.hidden_dim, edge_dim)
+            )
+
+    def forward(self, x, edge_index, edge_attr=None, edge_type=None):
+        """
+        更新边特征
+
+        参数:
+            x (torch.Tensor): 节点特征 [num_nodes, node_dim]
+            edge_index (torch.LongTensor): 边连接 [2, num_edges]
+            edge_attr (torch.Tensor): 边特征 [num_edges, edge_dim]
+            edge_type (torch.LongTensor, optional): 边类型 [num_edges]
+
+        返回:
+            updated_edge_attr (torch.Tensor): 更新后的边特征 [num_edges, edge_dim]
+        """
+        if edge_attr is None:
+            return None
+
+        # 获取源节点和目标节点
+        src, dst = edge_index
+
+        # 获取源节点和目标节点特征
+        src_features = x[src]  # [num_edges, node_dim]
+        dst_features = x[dst]  # [num_edges, node_dim]
+
+        if self.edge_types is not None and edge_type is not None:
+            # 初始化结果张量
+            updated_edge_attr = torch.zeros_like(edge_attr)
+
+            # 对每种边类型分别更新
+            for t in range(self.edge_types):
+                mask = (edge_type == t)
+                if mask.sum() > 0:
+                    # 拼接特征
+                    combined = torch.cat([
+                        src_features[mask],
+                        dst_features[mask],
+                        edge_attr[mask]
+                    ], dim=1)
+
+                    # 使用对应类型的更新网络
+                    updated_edge_attr[mask] = self.edge_updaters[t](combined)
+        else:
+            # 拼接源节点、目标节点和当前边特征
+            combined = torch.cat([src_features, dst_features, edge_attr], dim=1)
+
+            # 更新边特征
+            updated_edge_attr = self.edge_update(combined)
+
+        return updated_edge_attr
+
+
+class StructureAwareAttention(nn.Module):
+    """
+    结构感知注意力层，考虑蛋白质的空间和序列结构特性
+
+    针对抗菌肽的二级结构和局部构象特点进行了优化，融合了几何信息和化学相互作用特征
+
+    参数:
+        in_channels (int): 输入特征维度
+        attention_dim (int, optional): 注意力维度
+        heads (int, optional): 注意力头数量
+        structure_types (int, optional): 结构类型数量(如螺旋、折叠、环)
+        dropout (float, optional): Dropout率
+    """
+
+    def __init__(
+            self,
+            in_channels,
+            attention_dim=None,
+            heads=4,
+            structure_types=3,  # 螺旋、折叠、环
+            dropout=0.1
+    ):
+        super(StructureAwareAttention, self).__init__()
+
+        self.in_channels = in_channels
+        self.attention_dim = attention_dim or in_channels
+        self.heads = heads
+        self.head_dim = self.attention_dim // heads
+        self.structure_types = structure_types
+
+        # 查询、键、值投影
+        self.query = nn.Linear(in_channels, self.attention_dim)
+        self.key = nn.Linear(in_channels, self.attention_dim)
+        self.value = nn.Linear(in_channels, self.attention_dim)
+
+        # 结构类型特定的偏置
+        self.structure_bias = nn.Parameter(torch.Tensor(structure_types, heads, 1, 1))
+        nn.init.zeros_(self.structure_bias)  # 初始化为零
+
+        # 输出投影
+        self.output_proj = nn.Linear(self.attention_dim, in_channels)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(in_channels)
+
+    def forward(self, x, structure_type=None, mask=None, edge_index=None):
+        """
+        计算结构感知注意力
+
+        参数:
+            x (torch.Tensor): 节点特征 [batch_size, seq_len, in_channels] 或 [num_nodes, in_channels]
+            structure_type (torch.LongTensor, optional): 结构类型 [batch_size, seq_len] 或 [num_nodes]
+            mask (torch.BoolTensor, optional): 注意力掩码 [batch_size, seq_len]
+            edge_index (torch.LongTensor, optional): 图连接 [2, num_edges]
+
+        返回:
+            out (torch.Tensor): 更新的特征，维度与输入相同
+        """
+        residual = x
+        batch_first = len(x.shape) == 3
+
+        if batch_first:
+            batch_size, seq_len, _ = x.shape
+            q = self.query(x).view(batch_size, seq_len, self.heads, self.head_dim)
+            k = self.key(x).view(batch_size, seq_len, self.heads, self.head_dim)
+            v = self.value(x).view(batch_size, seq_len, self.heads, self.head_dim)
+
+            # 转置以适应注意力计算
+            q = q.transpose(1, 2)  # [batch_size, heads, seq_len, head_dim]
+            k = k.transpose(1, 2)  # [batch_size, heads, seq_len, head_dim]
+            v = v.transpose(1, 2)  # [batch_size, heads, seq_len, head_dim]
+
+            # 计算注意力分数
+            attn = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(
+                self.head_dim)  # [batch_size, heads, seq_len, seq_len]
+
+            # 添加结构偏置(如果提供)
+            if structure_type is not None:
+                structure_bias = self.structure_bias[structure_type]  # [batch_size, seq_len, heads, 1, 1]
+                structure_bias = structure_bias.permute(0, 2, 1, 3)  # [batch_size, heads, seq_len, 1]
+                attn = attn + structure_bias
+
+            # 掩码(如果提供)
+            if mask is not None:
+                attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+            # Softmax
+            attn = F.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+
+            # 加权求和
+            out = torch.matmul(attn, v)  # [batch_size, heads, seq_len, head_dim]
+            out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)  # [batch_size, seq_len, attention_dim]
+        else:
+            num_nodes = x.size(0)
+
+            if edge_index is None:
+                # 全连接注意力
+                q = self.query(x).view(num_nodes, self.heads, self.head_dim)
+                k = self.key(x).view(num_nodes, self.heads, self.head_dim)
+                v = self.value(x).view(num_nodes, self.heads, self.head_dim)
+
+                # 计算注意力分数
+                attn = torch.matmul(q.unsqueeze(1), k.unsqueeze(2).transpose(-1, -2)).squeeze(2) / math.sqrt(
+                    self.head_dim)
+
+                # 添加结构偏置(如果提供)
+                if structure_type is not None:
+                    attn = attn + self.structure_bias[structure_type].squeeze(-1)
+
+                # Softmax
+                attn = F.softmax(attn, dim=1)
+                attn = self.dropout(attn)
+
+                # 加权求和
+                out = torch.sum(attn.unsqueeze(-1) * v.unsqueeze(1), dim=1)
+                out = out.view(num_nodes, -1)
+            else:
+                # 图结构注意力 - 只在连接的节点间计算注意力
+                q = self.query(x).view(num_nodes, self.heads, self.head_dim)
+                k = self.key(x).view(num_nodes, self.heads, self.head_dim)
+                v = self.value(x).view(num_nodes, self.heads, self.head_dim)
+
+                # 源节点和目标节点
+                src, dst = edge_index
+
+                # 计算边上的注意力分数
+                q_dst = q[dst]  # [num_edges, heads, head_dim]
+                k_src = k[src]  # [num_edges, heads, head_dim]
+
+                # 点积注意力
+                attn = torch.sum(q_dst * k_src, dim=-1) / math.sqrt(self.head_dim)  # [num_edges, heads]
+
+                # 添加结构偏置(如果提供)
+                if structure_type is not None:
+                    edge_structure = structure_type[src]  # [num_edges]
+                    structure_bias = torch.gather(self.structure_bias.view(self.structure_types, self.heads), 0,
+                                                  edge_structure.unsqueeze(-1).expand(-1, self.heads))
+                    attn = attn + structure_bias
+
+                # 按目标节点Softmax归一化
+                attn = softmax(attn, dst, num_nodes=num_nodes)
+                attn = self.dropout(attn)
+
+                # 值向量
+                v_src = v[src]  # [num_edges, heads, head_dim]
+
+                # 加权消息
+                messages = attn.unsqueeze(-1) * v_src  # [num_edges, heads, head_dim]
+
+                # 聚合到目标节点
+                out = torch.zeros(num_nodes, self.heads, self.head_dim, device=x.device)
+                for h in range(self.heads):
+                    out[:, h] = scatter_add(messages[:, h], dst, dim=0, dim_size=num_nodes)
+
+                out = out.view(num_nodes, -1)  # [num_nodes, attention_dim]
+
+        # 输出投影
+        out = self.output_proj(out)
+        out = self.dropout(out)
+
+        # 残差连接与层归一化
+        out = self.layer_norm(residual + out)
+
+        return out
+
+
+class PhysicochemicalEncoder(nn.Module):
+    """
+    蛋白质物理化学特性编码器
+
+    增强蛋白质残基的理化特性表示，特别优化了抗菌肽中关键的电荷和疏水性编码
+
+    参数:
+        hidden_dim (int): 隐藏层维度
+        num_bins (int, optional): 连续特征分箱数量
+        dropout (float, optional): Dropout率
+        use_layer_norm (bool, optional): 是否使用层归一化
+    """
+
+    def __init__(
+            self,
+            hidden_dim,
+            num_bins=10,
+            dropout=0.1,
+            use_layer_norm=True
+    ):
+        super(PhysicochemicalEncoder, self).__init__()
+
+        self.hidden_dim = hidden_dim
+        self.num_bins = num_bins
+        self.use_layer_norm = use_layer_norm
+
+        # 氨基酸类型嵌入 (20种标准氨基酸)
+        self.aa_embedding = nn.Embedding(20, hidden_dim // 4)
+
+        # 疏水性编码
+        self.hydropathy_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim // 8),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 8, hidden_dim // 4)
+        )
+
+        # 电荷编码
+        self.charge_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim // 8),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 8, hidden_dim // 4)
+        )
+
+        # 分子量编码
+        self.weight_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim // 8),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 8, hidden_dim // 4)
+        )
+
+        # 辅助特性编码 (极性、体积等)
+        self.aux_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 8),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 8, hidden_dim // 4)
+        )
+
+        # 特征融合
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # 层归一化
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # 记录物化属性的统计范围用于归一化
+        self.register_buffer('hydropathy_range', torch.tensor([-4.5, 4.5]))  # Kyte-Doolittle疏水性范围
+        self.register_buffer('charge_range', torch.tensor([-2.0, 2.0]))  # 标准电荷范围
+        self.register_buffer('weight_range', torch.tensor([75.0, 204.0]))  # 氨基酸分子量范围
+
+    def forward(self, aa_indices, hydropathy, charge, weight, polarity=None, volume=None):
+        """
+        编码蛋白质残基的物理化学特性
+
+        参数:
+            aa_indices (torch.LongTensor): 氨基酸类型索引 [batch_size, seq_len] 或 [num_nodes]
+            hydropathy (torch.Tensor): 疏水性值 [batch_size, seq_len, 1] 或 [num_nodes, 1]
+            charge (torch.Tensor): 电荷值 [batch_size, seq_len, 1] 或 [num_nodes, 1]
+            weight (torch.Tensor): 分子量 [batch_size, seq_len, 1] 或 [num_nodes, 1]
+            polarity (torch.Tensor, optional): 极性指标 [batch_size, seq_len, 1] 或 [num_nodes, 1]
+            volume (torch.Tensor, optional): 体积指标 [batch_size, seq_len, 1] 或 [num_nodes, 1]
+
+        返回:
+            features (torch.Tensor): 编码后的理化特性 [batch_size, seq_len, hidden_dim] 或 [num_nodes, hidden_dim]
+        """
+        batch_size = aa_indices.size(0)
+        is_graph_input = (aa_indices.dim() == 1)
+
+        # 氨基酸嵌入
+        aa_emb = self.aa_embedding(aa_indices)  # [..., hidden_dim//4]
+
+        # 物化属性归一化
+        hydropathy_norm = self._normalize_and_bin(hydropathy, self.hydropathy_range[0], self.hydropathy_range[1])
+        charge_norm = self._normalize_and_bin(charge, self.charge_range[0], self.charge_range[1])
+        weight_norm = self._normalize_and_bin(weight, self.weight_range[0], self.weight_range[1])
+
+        # 编码各物化属性
+        hydropathy_emb = self.hydropathy_encoder(hydropathy_norm)  # [..., hidden_dim//4]
+        charge_emb = self.charge_encoder(charge_norm)  # [..., hidden_dim//4]
+        weight_emb = self.weight_encoder(weight_norm)  # [..., hidden_dim//4]
+
+        # 处理辅助特性
+        if polarity is not None and volume is not None:
+            aux_input = torch.cat([polarity, volume], dim=-1)
+            aux_emb = self.aux_encoder(aux_input)  # [..., hidden_dim//4]
+        else:
+            # 如果没有提供辅助特性，用零向量替代
+            if is_graph_input:
+                aux_emb = torch.zeros(batch_size, self.hidden_dim // 4, device=aa_indices.device)
+            else:
+                aux_emb = torch.zeros(batch_size, aa_indices.size(1), self.hidden_dim // 4, device=aa_indices.device)
+
+        # 拼接所有特性表示
+        if is_graph_input:
+            combined = torch.cat([aa_emb, hydropathy_emb, charge_emb, weight_emb], dim=-1)
+        else:
+            combined = torch.cat([aa_emb, hydropathy_emb, charge_emb, weight_emb], dim=-1)
+
+        # 特征融合
+        features = self.feature_fusion(combined)
+
+        # 层归一化
+        if self.use_layer_norm:
+            features = self.layer_norm(features)
+
+        return features
+
+    def _normalize_and_bin(self, values, min_val, max_val):
+        """
+        归一化并分箱连续值
+
+        参数:
+            values (torch.Tensor): 输入值
+            min_val (float): 最小值
+            max_val (float): 最大值
+
+        返回:
+            binned_values (torch.Tensor): 归一化并分箱后的值
+        """
+        # 裁剪到范围
+        values_clipped = torch.clamp(values, min=min_val, max=max_val)
+
+        # 归一化到[0,1]
+        values_norm = (values_clipped - min_val) / (max_val - min_val)
+
+        # 可选的分箱
+        if self.num_bins > 1:
+            values_binned = torch.floor(values_norm * self.num_bins) / self.num_bins
+            return values_binned
+        else:
+            return values_norm
+
+
+class DynamicEdgePruning(nn.Module):
+    """
+    动态边修剪模块
+
+    通过可学习的阈值机制动态修剪蛋白质图中的边，重点保留功能上重要的连接
+
+    参数:
+        edge_dim (int): 边特征维度
+        hidden_dim (int, optional): 隐藏层维度
+        init_threshold (float, optional): 初始修剪阈值 (0-1)
+        dropout (float, optional): Dropout率
+    """
+
+    def __init__(
+            self,
+            edge_dim,
+            hidden_dim=None,
+            init_threshold=0.5,
+            dropout=0.1
+    ):
+        super(DynamicEdgePruning, self).__init__()
+
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim or edge_dim * 2
+
+        # 边重要性评分网络
+        self.importance_net = nn.Sequential(
+            nn.Linear(edge_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        # 可学习的修剪阈值
+        self.threshold = nn.Parameter(torch.tensor([init_threshold]))
+
+        # 温度参数，控制软掩码的锐度
+        self.temperature = nn.Parameter(torch.tensor([10.0]))
+
+    def forward(self, edge_attr, edge_index=None, training=True):
+        """
+        动态修剪边
+
+        参数:
+            edge_attr (torch.Tensor): 边特征 [num_edges, edge_dim]
+            edge_index (torch.LongTensor, optional): 边连接 [2, num_edges]
+            training (bool): 是否处于训练模式
+
+        返回:
+            pruned_mask (torch.Tensor): 边掩码 [num_edges]
+            edge_weights (torch.Tensor): 边重要性权重 [num_edges, 1]
+        """
+        # 计算边重要性分数
+        edge_scores = self.importance_net(edge_attr)  # [num_edges, 1]
+
+        if training:
+            # 训练时使用软掩码
+            pruned_mask = torch.sigmoid((edge_scores - self.threshold) * self.temperature)
+        else:
+            # 推理时使用硬掩码
+            pruned_mask = (edge_scores > self.threshold).float()
+
+        return pruned_mask, edge_scores
+
+
+class SequenceStructureFusion(nn.Module):
+    """
+    增强型序列结构融合模块
+
+    通过交叉双模态Transformer架构融合ESM序列表示和GATv2结构表示，
+    实现双向信息流和多层次交互，最大化保留两种模态的关键信息。
+
+    特点：
+    1. 双向交叉注意力，实现序列→结构和结构→序列的双向信息交流
+    2. 层级递进融合，逐步细化和整合两种表示
+    3. 残差连接保证原始信息不丢失
+    4. 向量积交互捕获高阶特征关系
+
+    参数:
+        seq_dim (int): 序列嵌入维度 (来自ESM)
+        graph_dim (int): 图嵌入维度 (来自GATv2)
+        output_dim (int): 输出融合维度
+        hidden_dim (int, optional): 内部隐藏维度
+        num_heads (int, optional): 注意力头数
+        num_layers (int, optional): Transformer层数
+        dropout (float, optional): Dropout率
+    """
+
+    def __init__(
+            self,
+            seq_dim,
+            graph_dim,
+            output_dim,
+            hidden_dim=None,
+            num_heads=8,
+            num_layers=3,
+            dropout=0.1
+    ):
+        super(EnhancedSequenceStructureFusion, self).__init__()
+
+        self.seq_dim = seq_dim
+        self.graph_dim = graph_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim or output_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # 输入映射层 - 将两种嵌入投影到相同维度
+        self.seq_proj = nn.Linear(seq_dim, self.hidden_dim)
+        self.graph_proj = nn.Linear(graph_dim, self.hidden_dim)
+
+        # 构建双向交叉注意力层
+        self.cross_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            layer = BimodalCrossAttentionBlock(
+                dim=self.hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            self.cross_layers.append(layer)
+
+        # 多级融合层
+        self.fusion_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(num_layers)
+        ])
+
+        # 向量积交互层 - 捕获高阶模态交互
+        self.bilinear = nn.Bilinear(self.hidden_dim, self.hidden_dim, self.hidden_dim)
+
+        # 输出转换层
+        self.output_transform = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, output_dim)
+        )
+
+        # 初始化参数
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """初始化模型参数"""
+        if isinstance(module, nn.Linear):
+            # 使用截断正态分布初始化权重，提高训练稳定性
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def forward(self, seq_emb, graph_emb):
+        """
+        融合序列和图嵌入
+
+        参数:
+            seq_emb (torch.Tensor): 序列嵌入 [batch_size, seq_dim]
+            graph_emb (torch.Tensor): 图嵌入 [batch_size, graph_dim]
+
+        返回:
+            fused (torch.Tensor): 融合嵌入 [batch_size, output_dim]
+        """
+        batch_size = seq_emb.size(0)
+
+        # 投影到统一隐藏维度
+        seq_hidden = self.seq_proj(seq_emb)
+        graph_hidden = self.graph_proj(graph_emb)
+
+        # 保存原始投影用于残差连接
+        seq_orig = seq_hidden
+        graph_orig = graph_hidden
+
+        # 多层交叉注意力处理
+        fusion_features = []
+        for i in range(self.num_layers):
+            # 双向交叉注意力
+            seq_hidden, graph_hidden = self.cross_layers[i](seq_hidden, graph_hidden)
+
+            # 每层融合一次，并保存
+            current_fusion = torch.cat([seq_hidden, graph_hidden], dim=-1)
+            current_fusion = self.fusion_layers[i](current_fusion)
+            fusion_features.append(current_fusion)
+
+        # 残差连接，确保原始信息不丢失
+        seq_final = seq_hidden + seq_orig
+        graph_final = graph_hidden + graph_orig
+
+        # 向量积交互，捕获高阶特征关系
+        bilinear_interaction = self.bilinear(seq_final, graph_final)
+
+        # 组合多种特征：最终序列表示、最终结构表示、向量积交互
+        combined = torch.cat([seq_final, graph_final, bilinear_interaction], dim=-1)
+
+        # 转换为最终输出维度
+        fused = self.output_transform(combined)
+
+        return fused
+
+
+class BimodalCrossAttentionBlock(nn.Module):
+    """
+    双模态交叉注意力模块
+
+    实现序列和结构表示之间的双向交叉注意力，
+    让两种模态相互增强、相互提取有用信息。
+    """
+
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super(BimodalCrossAttentionBlock, self).__init__()
+
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        # 序列→结构注意力
+        self.seq_to_graph_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 结构→序列注意力
+        self.graph_to_seq_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 序列前馈网络
+        self.seq_ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
+        # 结构前馈网络
+        self.graph_ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
+        # 层归一化
+        self.seq_norm1 = nn.LayerNorm(dim)
+        self.seq_norm2 = nn.LayerNorm(dim)
+        self.graph_norm1 = nn.LayerNorm(dim)
+        self.graph_norm2 = nn.LayerNorm(dim)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, seq_emb, graph_emb):
+        """
+        执行双向交叉注意力
+
+        参数:
+            seq_emb (torch.Tensor): 序列嵌入 [batch_size, hidden_dim]
+            graph_emb (torch.Tensor): 图嵌入 [batch_size, hidden_dim]
+
+        返回:
+            seq_out (torch.Tensor): 更新后的序列嵌入 [batch_size, hidden_dim]
+            graph_out (torch.Tensor): 更新后的图嵌入 [batch_size, hidden_dim]
+        """
+        # 准备输入形状
+        batch_size = seq_emb.size(0)
+        seq_unsqueezed = seq_emb.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+        graph_unsqueezed = graph_emb.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+
+        # 序列→结构注意力
+        # query=结构, key=value=序列
+        graph_attn, _ = self.seq_to_graph_attn(
+            query=graph_unsqueezed,
+            key=seq_unsqueezed,
+            value=seq_unsqueezed
+        )
+        graph_res = graph_unsqueezed + self.dropout(graph_attn)  # 残差连接
+        graph_res = self.graph_norm1(graph_res)
+
+        # 结构→序列注意力
+        # query=序列, key=value=结构
+        seq_attn, _ = self.graph_to_seq_attn(
+            query=seq_unsqueezed,
+            key=graph_unsqueezed,
+            value=graph_unsqueezed
+        )
+        seq_res = seq_unsqueezed + self.dropout(seq_attn)  # 残差连接
+        seq_res = self.seq_norm1(seq_res)
+
+        # 序列前馈网络
+        seq_ff = self.seq_ffn(seq_res)
+        seq_out = seq_res + self.dropout(seq_ff)  # 残差连接
+        seq_out = self.seq_norm2(seq_out)
+
+        # 结构前馈网络
+        graph_ff = self.graph_ffn(graph_res)
+        graph_out = graph_res + self.dropout(graph_ff)  # 残差连接
+        graph_out = self.graph_norm2(graph_out)
+
+        # 压缩多余维度
+        seq_out = seq_out.squeeze(1)  # [batch_size, hidden_dim]
+        graph_out = graph_out.squeeze(1)  # [batch_size, hidden_dim]
+
+        return seq_out, graph_out

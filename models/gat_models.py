@@ -2,348 +2,882 @@
 # -*- coding: utf-8 -*-
 
 """
-蛋白质图嵌入系统 - GATv2模型
+高级优化蛋白质知识图谱GATv2编码器模型
 
-基于GATv2的蛋白质知识图谱嵌入模型，专为蛋白质图谱的结构特点设计，
-能够有效提取节点和边的信息，并生成高质量的嵌入向量。
+该模块实现了针对抗菌肽(AMPs)设计的先进GATv2编码器，融合了结构感知特征和异质边处理机制，
+并通过跨模态对齐与ESM序列编码器协同工作，构建功能导向的蛋白质表示。
 
-作者: 基于wxhfy的知识图谱处理工作扩展
+作者: wxhfy
+日期: 2025-03-29
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool
-from torch_geometric.utils import to_dense_batch
+import numpy as np
+from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
+from torch_geometric.utils import softmax, to_dense_batch
+from torch_scatter import scatter_add, scatter_mean
 
-from .layers import GATv2Conv, SelfAttention
-from .readout import GraphReadout
+from .layers import MLPLayer, HeterogeneousGATv2Layer, EdgeUpdateModule, GATv2ConvLayer
+from .readout import AttentiveReadout, HierarchicalReadout
 
 
-class ProteinGATv2(nn.Module):
+class ProteinGATv2Encoder(nn.Module):
     """
-    蛋白质知识图谱的GATv2嵌入模型
+    高级优化蛋白质知识图谱GATv2编码器，针对抗菌肽特性与ESM协同设计
 
-    特点:
-    1. 多层GATv2结构，针对节点级别特征提取
-    2. 高级聚合层，捕获全局图级别信息
-    3. 适应蛋白质知识图谱的特殊结构和特性
-    4. 支持节点级和图级嵌入输出
-    5. 残差连接与层归一化，提高训练稳定性
+    优化特点：
+    1. 相对位置编码与局部参考系：增强旋转平移不变性
+    2. 物化属性分箱归一化：避免量纲差异影响注意力
+    3. 异质边注意力设计：区分肽键与空间连接的不同信息流
+    4. 跨模态对齐机制：与ESM编码器深度融合
+    5. 注意力引导技术：整合ESM的序列进化信息
+
+    参数:
+        node_input_dim (int): 节点特征输入维度
+        edge_input_dim (int): 边特征输入维度
+        hidden_dim (int): 隐藏层维度
+        output_dim (int): 输出嵌入维度
+        num_layers (int): GATv2卷积层数量
+        num_heads (int): 多头注意力的头数
+        edge_types (int): 边类型数量（肽键/空间连接等）
+        dropout (float): Dropout概率
+        use_pos_encoding (bool): 是否使用相对位置编码
+        use_heterogeneous_edges (bool): 是否使用异质边处理
+        esm_guidance (bool): 是否使用ESM注意力引导
+        activation (str): 激活函数类型
     """
 
-    def __init__(self,
-                 in_channels,
-                 hidden_channels,
-                 out_channels,
-                 num_layers=3,
-                 heads=4,
-                 dropout=0.1,
-                 edge_dim=None,
-                 add_self_loops=True,
-                 readout_type='multihead',
-                 jk_mode='cat',
-                 use_layer_norm=True,
-                 node_level=True,
-                 graph_level=True,
-                 use_edge_attr=True):
-        """
-        参数:
-            in_channels (int): 输入节点特征维度
-            hidden_channels (int): 隐藏层维度
-            out_channels (int): 输出特征维度
-            num_layers (int): GAT层数
-            heads (int): 每层的注意力头数
-            dropout (float): Dropout率
-            edge_dim (int, optional): 边特征维度，None表示不使用边特征
-            add_self_loops (bool): 是否添加自环
-            readout_type (str): 图读出类型
-            jk_mode (str): 跳跃连接模式，可选['cat', 'lstm', 'max', 'last']
-            use_layer_norm (bool): 是否使用层归一化
-            node_level (bool): 是否保留节点级嵌入
-            graph_level (bool): 是否输出图级嵌入
-            use_edge_attr (bool): 是否使用边属性
-        """
-        super(ProteinGATv2, self).__init__()
+    def __init__(
+            self,
+            node_input_dim,
+            edge_input_dim,
+            hidden_dim=128,
+            output_dim=128,
+            num_layers=3,
+            num_heads=4,
+            edge_types=2,
+            dropout=0.2,
+            use_pos_encoding=True,
+            use_heterogeneous_edges=True,
+            esm_guidance=True,
+            activation='gelu',
+    ):
+        super(ProteinGATv2Encoder, self).__init__()
 
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.out_channels = out_channels
+        self.node_input_dim = node_input_dim
+        self.edge_input_dim = edge_input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         self.num_layers = num_layers
-        self.heads = heads
-        self.jk_mode = jk_mode
-        self.use_layer_norm = use_layer_norm
-        self.node_level = node_level
-        self.graph_level = graph_level
-        self.use_edge_attr = use_edge_attr and edge_dim is not None
+        self.num_heads = num_heads
+        self.edge_types = edge_types
+        self.use_pos_encoding = use_pos_encoding
+        self.use_heterogeneous_edges = use_heterogeneous_edges
+        self.esm_guidance = esm_guidance
 
-        # 输入投影层
-        self.input_proj = nn.Linear(in_channels, hidden_channels)
-
-        # GATv2层
-        self.convs = nn.ModuleList()
-        # 第一层：in_channels -> hidden_channels
-        self.convs.append(
-            GATv2Conv(
-                hidden_channels,
-                hidden_channels // heads,
-                heads=heads,
-                dropout=dropout,
-                edge_dim=edge_dim if self.use_edge_attr else None,
-                add_residual=True
-            )
-        )
-
-        # 中间层：hidden_channels -> hidden_channels
-        for _ in range(num_layers - 2):
-            self.convs.append(
-                GATv2Conv(
-                    hidden_channels,
-                    hidden_channels // heads,
-                    heads=heads,
-                    dropout=dropout,
-                    edge_dim=edge_dim if self.use_edge_attr else None,
-                    add_residual=True
-                )
-            )
-
-        # 最后一层：hidden_channels -> out_channels (如果不使用跳跃连接)
-        if jk_mode == 'last':
-            last_dim = out_channels
+        # 激活函数选择
+        if activation == 'relu':
+            self.activation = nn.ReLU()
+        elif activation == 'gelu':
+            self.activation = nn.GELU()
+        elif activation == 'leaky_relu':
+            self.activation = nn.LeakyReLU(0.2)
         else:
-            last_dim = hidden_channels
+            self.activation = nn.GELU()
 
-        self.convs.append(
-            GATv2Conv(
-                hidden_channels,
-                last_dim // heads,
-                heads=heads,
-                dropout=dropout,
-                edge_dim=edge_dim if self.use_edge_attr else None,
-                add_residual=True
-            )
-        )
+        # =============== 特征处理模块 ===============
 
-        # 层归一化
-        if use_layer_norm:
-            self.layer_norms = nn.ModuleList()
-            for _ in range(num_layers):
-                self.layer_norms.append(nn.LayerNorm(hidden_channels))
-        else:
-            self.layer_norms = None
-
-        # 跳跃连接处理
-        if jk_mode == 'cat':
-            self.jk_proj = nn.Linear(hidden_channels * num_layers, out_channels)
-        elif jk_mode == 'lstm':
-            self.jk_lstm = nn.LSTM(
-                hidden_channels,
-                out_channels // 2,
-                bidirectional=True,
-                batch_first=True
-            )
-        elif jk_mode == 'max':
-            self.jk_proj = nn.Linear(hidden_channels, out_channels)
-        elif jk_mode == 'last':
-            self.jk_proj = None  # 最后一层已经输出正确维度
-
-        # 图读出层
-        if graph_level:
-            final_dim = out_channels
-            self.readout = GraphReadout(
-                in_channels=final_dim,
-                out_channels=out_channels,
-                readout_type=readout_type,
+        # 相对位置编码 - 新增
+        if self.use_pos_encoding:
+            self.pos_encoder = RelativePositionEncoder(
+                hidden_dim=hidden_dim // 2,
+                max_seq_dist=32,
                 dropout=dropout
             )
+            # 增加节点输入维度以包含位置信息
+            node_encoder_input_dim = node_input_dim + hidden_dim // 2
+        else:
+            node_encoder_input_dim = node_input_dim
 
-        # Dropout层
-        self.dropout = nn.Dropout(dropout)
+        # 节点特征编码 - 增强为多层处理
+        self.node_encoder = MLPLayer(
+            node_encoder_input_dim,
+            hidden_dim * 2,
+            hidden_dim,
+            layers=2,
+            dropout=dropout,
+            activation=activation
+        )
 
-    def reset_parameters(self):
-        """重置模型参数"""
-        self.input_proj.reset_parameters()
-        for conv in self.convs:
-            conv.reset_parameters()
-        if self.layer_norms is not None:
-            for ln in self.layer_norms:
-                ln.reset_parameters()
-        if self.jk_proj is not None:
-            self.jk_proj.reset_parameters()
-        if self.jk_mode == 'lstm':
-            for param in self.jk_lstm.parameters():
-                if len(param.shape) > 1:
-                    nn.init.xavier_uniform_(param)
-                else:
-                    nn.init.zeros_(param)
-        if self.graph_level:
-            self.readout.reset_parameters() if hasattr(self.readout, 'reset_parameters') else None
+        # 物化属性标准化 - 新增
+        self.property_normalizer = PropertyNormalizer()
 
-    def forward(self, data):
+        # 边类型处理 - 区分不同类型边
+        if self.use_heterogeneous_edges:
+            # 不同类型边的嵌入映射
+            self.edge_type_embeddings = nn.Embedding(edge_types, hidden_dim // 4)
+            # 针对不同类型边的特征变换
+            self.edge_encoders = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(edge_input_dim, hidden_dim // 2),
+                    nn.LayerNorm(hidden_dim // 2),
+                    self.activation
+                ) for _ in range(edge_types)
+            ])
+        else:
+            # 统一边特征处理
+            self.edge_encoder = nn.Sequential(
+                nn.Linear(edge_input_dim + edge_types, hidden_dim // 2),  # 加入one-hot边类型
+                nn.LayerNorm(hidden_dim // 2),
+                self.activation
+            )
+
+        # =============== 图卷积模块 ===============
+
+        # 堆叠多层图卷积
+        self.convs = nn.ModuleList()
+        self.edge_updaters = nn.ModuleList()
+
+        # 针对不同类型边的注意力层
+        if self.use_heterogeneous_edges:
+            for i in range(num_layers):
+                in_dim = hidden_dim if i > 0 else hidden_dim
+                out_dim = output_dim if i == num_layers - 1 else hidden_dim
+
+                # 异质边注意力层
+                self.convs.append(
+                    HeterogeneousGATv2Layer(
+                        in_channels=in_dim,
+                        out_channels=out_dim,
+                        heads=1 if i == num_layers - 1 else num_heads,
+                        edge_types=edge_types,
+                        edge_dim=hidden_dim // 2,
+                        dropout=dropout,
+                        use_layer_norm=True,
+                        activation=activation
+                    )
+                )
+
+                # 边更新模块
+                self.edge_updaters.append(
+                    EdgeUpdateModule(
+                        in_dim,
+                        hidden_dim // 2,
+                        edge_types=edge_types
+                    )
+                )
+        else:
+            # 标准GATv2层
+            for i in range(num_layers):
+                in_dim = hidden_dim if i > 0 else hidden_dim
+                out_dim = output_dim if i == num_layers - 1 else hidden_dim
+
+                self.convs.append(
+                    GATv2ConvLayer(
+                        in_dim,
+                        out_dim,
+                        heads=1 if i == num_layers - 1 else num_heads,
+                        edge_dim=hidden_dim // 2,
+                        dropout=dropout,
+                        residual=True,
+                        use_layer_norm=True,
+                        activation=activation
+                    )
+                )
+
+                # 边更新模块
+                self.edge_updaters.append(
+                    EdgeUpdateModule(
+                        in_dim,
+                        hidden_dim // 2
+                    )
+                )
+
+        # =============== 多尺度特征聚合 ===============
+
+        # 多尺度特征聚合 - 改进为注意力加权
+        feature_fusion_input_dim = hidden_dim * (num_layers - 1) + output_dim
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(feature_fusion_input_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            self.activation,
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, output_dim)
+        )
+
+        # 层特征重要性自适应学习
+        self.layer_attention = nn.Sequential(
+            nn.Linear(feature_fusion_input_dim, hidden_dim),
+            self.activation,
+            nn.Linear(hidden_dim, num_layers),
+            nn.Softmax(dim=1)
+        )
+
+        # =============== 读出机制 ===============
+
+        # 层次化读出
+        self.readout = HierarchicalReadout(
+            output_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+
+        # ESM注意力引导模块
+        if self.esm_guidance:
+            self.esm_attention_guide = nn.Sequential(
+                nn.Linear(output_dim, output_dim),
+                nn.Sigmoid()
+            )
+
+        # 残基重要性评分
+        self.residue_importance = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            self.activation,
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(
+            self,
+            x,
+            edge_index,
+            edge_attr=None,
+            edge_type=None,
+            pos=None,
+            batch=None,
+            esm_attention=None
+    ):
         """
-        前向传播
+        前向传递
 
         参数:
-            data: PyG数据对象，包含:
-                - x: 节点特征
-                - edge_index: 边索引
-                - edge_attr: 边特征 (可选)
-                - batch: 批次索引
+            x (torch.Tensor): 节点特征 [num_nodes, node_input_dim]
+            edge_index (torch.LongTensor): 图的边连接 [2, num_edges]
+            edge_attr (torch.Tensor): 边特征 [num_edges, edge_input_dim]
+            edge_type (torch.LongTensor): 边类型索引 [num_edges]
+            pos (torch.Tensor): 节点坐标 [num_nodes, 3]
+            batch (torch.LongTensor): 批处理索引 [num_nodes]
+            esm_attention (torch.Tensor): ESM注意力分数 [num_nodes, 1]
 
         返回:
-            dict: 包含节点级和/或图级嵌入向量的字典
+            node_embeddings (torch.Tensor): 节点级嵌入 [num_nodes, output_dim]
+            graph_embedding (torch.Tensor): 图级嵌入 [batch_size, output_dim]
+            residue_scores (torch.Tensor): 残基重要性分数 [num_nodes, 1]
         """
-        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-
-        # 如果无批次信息，默认一个图
+        # 处理批索引
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-        # 输入投影
-        x = self.input_proj(x)
+        # =============== 特征预处理 ===============
 
-        # 存储每层的输出，用于跳跃连接
-        layer_outputs = []
+        # 物化属性标准化
+        x = self.property_normalizer(x)
 
-        # GAT层传播
-        for i, conv in enumerate(self.convs):
-            # 应用GAT卷积
-            x = conv(x, edge_index,
-                     edge_attr=edge_attr if self.use_edge_attr else None)
+        # 计算相对位置编码（如果启用）
+        if self.use_pos_encoding and pos is not None:
+            pos_encoding = self.pos_encoder(pos, edge_index, batch)
+            # 拼接位置编码和节点特征
+            x = torch.cat([x, pos_encoding], dim=-1)
 
-            # 最后一层特殊处理
-            if i < self.num_layers - 1 or self.jk_mode != 'last':
-                # 层归一化
-                if self.use_layer_norm:
-                    x = self.layer_norms[i](x)
-                # 激活函数 & Dropout
-                x = F.relu(x)
-                x = self.dropout(x)
+        # 节点特征初始编码
+        h = self.node_encoder(x)
 
-            # 存储层输出
-            layer_outputs.append(x)
+        # 边特征处理
+        if edge_attr is not None:
+            if self.use_heterogeneous_edges and edge_type is not None:
+                # 针对不同类型边，分别处理特征
+                edge_features_list = []
+                for t in range(self.edge_types):
+                    mask = (edge_type == t)
+                    if mask.sum() > 0:
+                        # 边特征变换
+                        edge_feats = self.edge_encoders[t](edge_attr[mask])
+                        # 获取边类型嵌入
+                        edge_type_emb = self.edge_type_embeddings(torch.tensor([t], device=edge_attr.device))
+                        # 拼接边类型嵌入和特征
+                        edge_feats = torch.cat([
+                            edge_feats,
+                            edge_type_emb.expand(edge_feats.size(0), -1)
+                        ], dim=-1)
+                        edge_features_list.append((mask, edge_feats))
 
-        # 跳跃连接处理
-        if self.jk_mode == 'cat':
-            # 拼接所有层的输出
-            x = torch.cat(layer_outputs, dim=1)
-            x = self.jk_proj(x)
-        elif self.jk_mode == 'lstm':
-            # 将每层输出作为序列送入LSTM
-            node_count = x.size(0)
-            x_stack = torch.stack(layer_outputs, dim=1)  # [num_nodes, num_layers, hidden_dim]
-            x, _ = self.jk_lstm(x_stack)
-            x = x[:, -1, :]  # 取最后一个时间步
-        elif self.jk_mode == 'max':
-            # 取每个特征维度的最大值
-            x = torch.stack(layer_outputs, dim=0)
-            x, _ = torch.max(x, dim=0)
-            x = self.jk_proj(x)
-        # 对于'last'模式，直接使用最后一层的输出
+                # 初始化完整边特征张量
+                edge_features = torch.zeros(
+                    edge_attr.size(0),
+                    self.hidden_dim // 2,
+                    device=edge_attr.device
+                )
 
-        # 准备输出
-        result = {}
+                # 填入各类型边的特征
+                for mask, feats in edge_features_list:
+                    edge_features[mask] = feats
+            else:
+                # 统一处理所有边
+                # 将边类型转为独热向量
+                if edge_type is not None:
+                    edge_type_onehot = F.one_hot(edge_type, num_classes=self.edge_types).float()
+                    # 拼接边特征和类型
+                    edge_input = torch.cat([edge_attr, edge_type_onehot], dim=-1)
+                else:
+                    edge_input = edge_attr
+
+                edge_features = self.edge_encoder(edge_input)
+        else:
+            edge_features = None
+
+        # =============== 图卷积处理 ===============
+
+        # 存储每一层的特征
+        layer_features = []
+
+        # 当前边特征
+        current_edge_features = edge_features
+
+        # 通过图卷积层
+        for i, (conv, edge_updater) in enumerate(zip(self.convs, self.edge_updaters)):
+            if self.use_heterogeneous_edges:
+                # 使用异质边注意力层
+                h_new = conv(h, edge_index, edge_type, current_edge_features)
+            else:
+                # 使用标准GATv2层
+                h_new = conv(h, edge_index, current_edge_features)
+
+            # 边特征更新
+            if current_edge_features is not None:
+                if self.use_heterogeneous_edges:
+                    current_edge_features = edge_updater(h, edge_index, edge_type, current_edge_features)
+                else:
+                    current_edge_features = edge_updater(h, edge_index, current_edge_features)
+
+            # 存储中间层特征
+            if i < len(self.convs) - 1:
+                layer_features.append(h_new)
+
+            h = h_new
+
+        # 最后一层特征
+        layer_features.append(h)
+
+        # =============== 多尺度特征聚合 ===============
+
+        # 多尺度特征聚合
+        if len(layer_features) > 1:
+            # 拼接所有层特征
+            multi_scale_features = torch.cat(layer_features, dim=-1)
+
+            # 计算层特征重要性
+            layer_weights = self.layer_attention(multi_scale_features)
+
+            # 加权聚合各层特征
+            weighted_features = 0
+            start_idx = 0
+            for i, feat in enumerate(layer_features):
+                feat_dim = feat.size(-1)
+                weight = layer_weights[:, i].unsqueeze(-1)
+                weighted_features += weight * feat
+                start_idx += feat_dim
+
+            # 融合特征
+            h = self.feature_fusion(multi_scale_features) + weighted_features
+
+        # =============== 节点表示和图级表示 ===============
 
         # 节点级嵌入
-        if self.node_level:
-            result['node_embedding'] = x
+        node_embeddings = h
 
-        # 图级嵌入
-        if self.graph_level:
-            graph_embedding = self.readout(x, batch)
-            result['graph_embedding'] = graph_embedding
+        # 计算残基重要性评分
+        residue_scores = self.residue_importance(node_embeddings)
 
-        return result
+        # ESM注意力引导（如果提供）
+        if self.esm_guidance and esm_attention is not None:
+            # 融合ESM注意力和模型学习的注意力
+            esm_weights = self.esm_attention_guide(node_embeddings)
+            guided_attention = esm_weights * esm_attention + (1 - esm_weights) * residue_scores
 
+            # 用引导后的注意力生成图级表示
+            graph_embedding = self.readout(node_embeddings, batch, node_weights=guided_attention)
+        else:
+            # 标准读出
+            graph_embedding = self.readout(node_embeddings, batch)
 
-class ProteinGATv2WithPretraining(nn.Module):
-    """
-    带有预训练任务的蛋白质GATv2模型
+        return node_embeddings, graph_embedding, residue_scores
 
-    支持:
-    1. 节点属性预测（如二级结构预测）
-    2. 边关系预测
-    3. 图级别分类/回归
-    4. 蛋白质功能预测
-    """
-
-    def __init__(self, gat_model, task_type='node', num_tasks=1, hidden_dim=None):
+    @torch.no_grad()
+    def encode_proteins(self, protein_graphs, esm_attention=None, return_importance=False):
         """
-        参数:
-            gat_model (ProteinGATv2): 基础GAT模型
-            task_type (str): 任务类型 ('node', 'edge', 'graph')
-            num_tasks (int): 任务数量
-            hidden_dim (int, optional): 任务特定隐藏层维度
-        """
-        super(ProteinGATv2WithPretraining, self).__init__()
-
-        self.gat_model = gat_model
-        self.task_type = task_type
-        self.num_tasks = num_tasks
-
-        out_dim = gat_model.out_channels
-        hidden_dim = hidden_dim or out_dim
-
-        # 根据任务类型创建预测头
-        if task_type == 'node':
-            self.predictor = nn.Sequential(
-                nn.Linear(out_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, num_tasks)
-            )
-        elif task_type == 'edge':
-            self.predictor = nn.Sequential(
-                nn.Linear(out_dim * 2, hidden_dim),  # 拼接源节点和目标节点的嵌入
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, num_tasks)
-            )
-        elif task_type == 'graph':
-            self.predictor = nn.Sequential(
-                nn.Linear(out_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, num_tasks)
-            )
-
-    def forward(self, data):
-        """
-        前向传播
+        批量编码蛋白质图谱
 
         参数:
-            data: PyG数据对象
+            protein_graphs (List[Data]): 蛋白质图数据对象列表
+            esm_attention (List[torch.Tensor], optional): 每个蛋白质的ESM注意力分数
+            return_importance (bool): 是否返回残基重要性
 
         返回:
-            dict: 包含嵌入和预测结果的字典
+            node_embeddings_list (List[torch.Tensor]): 每个蛋白质的节点嵌入
+            graph_embeddings (torch.Tensor): 图嵌入 [batch_size, output_dim]
+            residue_scores_list (List[torch.Tensor], optional): 残基重要性分数
         """
-        # 获取GAT模型的输出
-        embeddings = self.gat_model(data)
+        device = next(self.parameters()).device
 
-        # 根据任务类型进行预测
-        if self.task_type == 'node':
-            node_emb = embeddings['node_embedding']
-            pred = self.predictor(node_emb)
-            embeddings['node_pred'] = pred
+        # 高效批处理
+        batch_data = self._batch_protein_graphs(protein_graphs, device)
 
-        elif self.task_type == 'edge':
-            node_emb = embeddings['node_embedding']
-            edge_index = data.edge_index
-            # 获取边的源节点和目标节点的嵌入
-            src_emb = node_emb[edge_index[0]]
-            dst_emb = node_emb[edge_index[1]]
-            # 拼接源节点和目标节点的嵌入
-            edge_emb = torch.cat([src_emb, dst_emb], dim=1)
-            pred = self.predictor(edge_emb)
-            embeddings['edge_pred'] = pred
+        # 合并ESM注意力（如果提供）
+        if esm_attention is not None:
+            batch_esm_attention = []
+            ptr = batch_data['ptr']
+            for i, attn in enumerate(esm_attention):
+                batch_esm_attention.append(attn.to(device))
+            batch_esm_attention = torch.cat(batch_esm_attention, dim=0)
+        else:
+            batch_esm_attention = None
 
-        elif self.task_type == 'graph':
-            graph_emb = embeddings['graph_embedding']
-            pred = self.predictor(graph_emb)
-            embeddings['graph_pred'] = pred
+        # 编码
+        node_embeddings, graph_embedding, residue_scores = self.forward(
+            batch_data['x'],
+            batch_data['edge_index'],
+            batch_data.get('edge_attr'),
+            batch_data.get('edge_type'),
+            batch_data.get('pos'),
+            batch_data['batch'],
+            batch_esm_attention
+        )
 
-        return embeddings
+        # 分割结果
+        node_embeddings_list, residue_scores_list = self._split_batch_outputs(
+            node_embeddings,
+            residue_scores,
+            batch_data['ptr']
+        )
 
+        if return_importance:
+            return node_embeddings_list, graph_embedding, residue_scores_list
+        else:
+            return node_embeddings_list, graph_embedding
+
+    def _batch_protein_graphs(self, protein_graphs, device):
+        """高效的批处理方法"""
+        # 预分配必要容量
+        total_nodes = sum(graph.num_nodes for graph in protein_graphs)
+        total_edges = sum(graph.num_edges for graph in protein_graphs)
+
+        # 初始化批数据结构
+        x = torch.zeros((total_nodes, self.node_input_dim), device=device)
+        edge_index = torch.zeros((2, total_edges), dtype=torch.long, device=device)
+        batch = torch.zeros(total_nodes, dtype=torch.long, device=device)
+        ptr = torch.zeros(len(protein_graphs) + 1, dtype=torch.long, device=device)
+
+        # 可选数据
+        edge_attr = torch.zeros((total_edges, self.edge_input_dim), device=device) if hasattr(protein_graphs[0],
+                                                                                              'edge_attr') else None
+        edge_type = torch.zeros(total_edges, dtype=torch.long, device=device) if hasattr(protein_graphs[0],
+                                                                                         'edge_type') else None
+        pos = torch.zeros((total_nodes, 3), device=device) if hasattr(protein_graphs[0], 'pos') else None
+
+        # 填充数据
+        node_offset = 0
+        edge_offset = 0
+
+        for i, graph in enumerate(protein_graphs):
+            num_nodes = graph.num_nodes
+            num_edges = graph.num_edges
+            ptr[i] = node_offset
+
+            # 节点特征
+            x[node_offset:node_offset + num_nodes] = graph.x.to(device)
+            # 批索引
+            batch[node_offset:node_offset + num_nodes] = i
+
+            # 边索引
+            edge_index_i = graph.edge_index.clone().to(device)
+            edge_index_i[0] += node_offset
+            edge_index_i[1] += node_offset
+            edge_index[:, edge_offset:edge_offset + num_edges] = edge_index_i
+
+            # 其他可选数据
+            if edge_attr is not None and hasattr(graph, 'edge_attr'):
+                edge_attr[edge_offset:edge_offset + num_edges] = graph.edge_attr.to(device)
+
+            if edge_type is not None and hasattr(graph, 'edge_type'):
+                edge_type[edge_offset:edge_offset + num_edges] = graph.edge_type.to(device)
+
+            if pos is not None and hasattr(graph, 'pos'):
+                pos[node_offset:node_offset + num_nodes] = graph.pos.to(device)
+
+            node_offset += num_nodes
+            edge_offset += num_edges
+
+        # 设置最后一个指针
+        ptr[-1] = node_offset
+
+        # 构建返回字典
+        batch_data = {
+            'x': x,
+            'edge_index': edge_index[:, :edge_offset],
+            'batch': batch,
+            'ptr': ptr
+        }
+
+        if edge_attr is not None:
+            batch_data['edge_attr'] = edge_attr[:edge_offset]
+
+        if edge_type is not None:
+            batch_data['edge_type'] = edge_type[:edge_offset]
+
+        if pos is not None:
+            batch_data['pos'] = pos
+
+        return batch_data
+
+    def _split_batch_outputs(self, node_embeddings, residue_scores, ptr):
+        """将批处理输出分割为每个蛋白质的结果"""
+        node_embeddings_list = []
+        residue_scores_list = []
+
+        for i in range(len(ptr) - 1):
+            start_idx = ptr[i].item()
+            end_idx = ptr[i + 1].item()
+
+            node_embeddings_list.append(node_embeddings[start_idx:end_idx])
+            residue_scores_list.append(residue_scores[start_idx:end_idx])
+
+        return node_embeddings_list, residue_scores_list
+
+
+# 新增: 相对位置编码器
+class RelativePositionEncoder(nn.Module):
+    """
+    相对位置编码器
+
+    计算残基间的相对位置和方向信息，增强模型的空间感知能力
+    """
+
+    def __init__(self, hidden_dim, max_seq_dist=32, dropout=0.1):
+        super(RelativePositionEncoder, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.max_seq_dist = max_seq_dist
+
+        # 序列距离编码
+        self.seq_distance_embedding = nn.Embedding(max_seq_dist + 1, hidden_dim // 2)
+
+        # 空间向量编码
+        self.spatial_encoder = nn.Sequential(
+            nn.Linear(3, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2)
+        )
+
+        # 输出投影
+        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, pos, edge_index, batch):
+        """
+        计算相对位置编码
+
+        参数:
+            pos (torch.Tensor): 节点坐标 [num_nodes, 3]
+            edge_index (torch.LongTensor): 图的边连接 [2, num_edges]
+            batch (torch.LongTensor): 批处理索引 [num_nodes]
+
+        返回:
+            position_embedding (torch.Tensor): 位置编码 [num_nodes, hidden_dim]
+        """
+        device = pos.device
+        num_nodes = pos.size(0)
+
+        # 初始化位置编码
+        position_embeddings = torch.zeros(num_nodes, self.hidden_dim, device=device)
+
+        # 对每个节点计算相对位置编码
+        src, dst = edge_index
+
+        # 计算CA-CA向量
+        rel_pos = pos[dst] - pos[src]  # [num_edges, 3]
+
+        # 计算向量模长
+        dist = torch.norm(rel_pos, dim=1, keepdim=True)  # [num_edges, 1]
+
+        # 归一化方向向量
+        rel_pos_norm = rel_pos / (dist + 1e-6)
+
+        # 编码空间方向
+        spatial_code = self.spatial_encoder(rel_pos_norm)  # [num_edges, hidden_dim//2]
+
+        # 构建邻接结构，用于聚合边特征到节点
+        for i in range(edge_index.size(1)):
+            node_idx = dst[i]
+            position_embeddings[node_idx] += spatial_code[i]
+
+        # 平均聚合
+        node_degrees = torch.zeros(num_nodes, device=device)
+        for node_idx in dst:
+            node_degrees[node_idx] += 1
+
+        # 避免除零
+        node_degrees = torch.clamp(node_degrees, min=1)
+
+        # 归一化
+        position_embeddings = position_embeddings / node_degrees.unsqueeze(1)
+
+        return position_embeddings
+
+
+# 新增: 物化属性标准化器
+class PropertyNormalizer(nn.Module):
+    """物化属性标准化器，通过分箱和归一化处理氨基酸特性"""
+
+    def __init__(self, num_bins=10):
+        super(PropertyNormalizer, self).__init__()
+        self.num_bins = num_bins
+
+        # 记录各属性的统计信息，用于归一化
+        self.register_buffer('hydropathy_range', torch.tensor([-4.5, 4.5]))
+        self.register_buffer('charge_range', torch.tensor([-1.0, 1.0]))
+        self.register_buffer('weight_range', torch.tensor([75.0, 204.0]))
+
+    def forward(self, x):
+        """
+        标准化蛋白质物化属性
+
+        参数:
+            x (torch.Tensor): 节点特征 [num_nodes, node_input_dim]
+
+        返回:
+            x_normalized (torch.Tensor): 标准化后的节点特征
+        """
+        # 假设特征的前几列分别是: hydropathy, charge, molecular_weight等
+        # 根据实际数据格式调整索引
+        batch_size = x.size(0)
+        device = x.device
+
+        # 深拷贝输入，避免修改原始数据
+        x_normalized = x.clone()
+
+        # 疏水性分箱归一化 (假设在索引0)
+        if x.size(1) > 0:
+            hydropathy = x[:, 0]
+            x_normalized[:, 0] = self._bin_and_normalize(
+                hydropathy,
+                self.hydropathy_range[0],
+                self.hydropathy_range[1]
+            )
+
+        # 电荷分箱归一化 (假设在索引1)
+        if x.size(1) > 1:
+            charge = x[:, 1]
+            x_normalized[:, 1] = self._bin_and_normalize(
+                charge,
+                self.charge_range[0],
+                self.charge_range[1]
+            )
+
+        # 分子量分箱归一化 (假设在索引3)
+        if x.size(1) > 3:
+            weight = x[:, 3]
+            x_normalized[:, 3] = self._bin_and_normalize(
+                weight,
+                self.weight_range[0],
+                self.weight_range[1]
+            )
+
+        return x_normalized
+
+    def _bin_and_normalize(self, values, min_val, max_val):
+        """将连续值分箱并归一化"""
+        # 裁剪到范围
+        values_clipped = torch.clamp(values, min=min_val, max=max_val)
+
+        # 归一化到[0,1]
+        values_norm = (values_clipped - min_val) / (max_val - min_val)
+
+        # 分箱 (可选)
+        values_binned = torch.floor(values_norm * self.num_bins) / self.num_bins
+
+        return values_binned
+
+
+# 针对与ESM编码器对齐的潜空间映射器
+class ProteinLatentMapper(nn.Module):
+    """
+    增强型蛋白质图嵌入潜空间映射器
+
+    使用对比学习和多层残差网络将GATv2嵌入映射到与ESM兼容的空间
+
+    参数:
+        input_dim (int): 输入维度（GATv2嵌入维度）
+        latent_dim (int): 潜在空间维度（ESM兼容维度）
+        hidden_dim (int, optional): 隐藏层维度
+        dropout (float, optional): Dropout率
+    """
+
+    def __init__(
+            self,
+            input_dim,
+            latent_dim,
+            hidden_dim=None,
+            dropout=0.1
+    ):
+        super(ProteinLatentMapper, self).__init__()
+
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim or max(input_dim, latent_dim) * 2
+
+        # 映射网络 - 使用5层ResNet结构
+        self.mapper = nn.Sequential(
+            # 输入层
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            # 残差块1
+            ResidualBlock(nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim)
+            )),
+            nn.GELU(),
+
+            # 残差块2
+            ResidualBlock(nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim)
+            )),
+            nn.GELU(),
+
+            # 输出层
+            nn.Linear(self.hidden_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+        # 特征校准层 - 用于微调输出与ESM特征对齐
+        self.calibration = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.Tanh()
+        )
+
+        def forward(self, x, normalize=True):
+            """
+            将图嵌入映射到潜在空间
+
+            参数:
+                x (torch.Tensor): 输入图嵌入 [batch_size, input_dim]
+                normalize (bool): 是否L2归一化输出
+
+            返回:
+                latent (torch.Tensor): 潜在空间表示 [batch_size, latent_dim]
+            """
+            # 通过映射网络
+            latent = self.mapper(x)
+
+            # 校准（微调与ESM特征对齐）
+            latent = self.calibration(latent)
+
+            # 可选的L2归一化
+            if normalize:
+                latent = F.normalize(latent, p=2, dim=-1)
+
+            return latent
+
+class ResidualBlock(nn.Module):
+    """残差连接块，用于深层网络稳定训练"""
+
+    def __init__(self, module):
+        super(ResidualBlock, self).__init__()
+        self.module = module
+
+    def forward(self, x):
+        return x + self.module(x)
+
+class CrossModalContrastiveHead(nn.Module):
+    """跨模态对比学习头，用于对齐GATv2嵌入和ESM嵌入"""
+
+    def __init__(self, embedding_dim, temperature=0.07):
+        super(CrossModalContrastiveHead, self).__init__()
+        self.temperature = temperature
+        self.projection = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.GELU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+
+    def forward(self, graph_embeddings, esm_embeddings):
+        """
+        计算跨模态对比损失
+
+        参数:
+            graph_embeddings (torch.Tensor): 图嵌入 [batch_size, embedding_dim]
+            esm_embeddings (torch.Tensor): ESM嵌入 [batch_size, embedding_dim]
+
+        返回:
+            loss (torch.Tensor): 对比损失
+            similarity (torch.Tensor): 模态间相似度矩阵
+        """
+        # 投影嵌入到统一空间
+        graph_proj = self.projection(graph_embeddings)
+        esm_proj = self.projection(esm_embeddings)
+
+        # 归一化嵌入
+        graph_proj = F.normalize(graph_proj, dim=-1)
+        esm_proj = F.normalize(esm_proj, dim=-1)
+
+        # 计算余弦相似度
+        similarity = torch.mm(graph_proj, esm_proj.t()) / self.temperature
+
+        # InfoNCE损失
+        labels = torch.arange(similarity.size(0), device=similarity.device)
+        loss_graph_to_esm = F.cross_entropy(similarity, labels)
+        loss_esm_to_graph = F.cross_entropy(similarity.t(), labels)
+
+        # 双向对比损失
+        loss = (loss_graph_to_esm + loss_esm_to_graph) / 2
+
+        return loss, similarity
+
+class ESMGuidanceModule(nn.Module):
+    """ESM注意力引导模块，用于整合ESM的序列进化信息"""
+
+    def __init__(self, input_dim, hidden_dim=None):
+        super(ESMGuidanceModule, self).__init__()
+        self.hidden_dim = hidden_dim or input_dim
+
+        self.attention_processor = nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, node_embeddings, esm_attention):
+        """
+        融合GATv2注意力和ESM注意力
+
+        参数:
+            node_embeddings (torch.Tensor): 节点嵌入 [num_nodes, input_dim]
+            esm_attention (torch.Tensor): ESM注意力分数 [num_nodes, 1]
+
+        返回:
+            guided_attention (torch.Tensor): 引导后的注意力 [num_nodes, 1]
+        """
+        # 计算自适应混合权重
+        alpha = self.attention_processor(node_embeddings)
+
+        # 线性组合
+        guided_attention = alpha * esm_attention + (1 - alpha) * torch.sigmoid(
+            node_embeddings.mean(dim=-1, keepdim=True)
+        )
+
+        return guided_attention
