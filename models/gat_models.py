@@ -76,6 +76,7 @@ class ProteinGATv2Encoder(nn.Module):
         self.edge_types = edge_types
         self.use_pos_encoding = use_pos_encoding
         self.use_heterogeneous_edges = use_heterogeneous_edges
+        self.use_edge_pruning = use_edge_pruning
         self.esm_guidance = esm_guidance
 
         # 激活函数选择
@@ -102,7 +103,13 @@ class ProteinGATv2Encoder(nn.Module):
         else:
             node_encoder_input_dim = node_input_dim
 
-
+        self.use_edge_pruning = use_edge_pruning
+        if self.use_edge_pruning:
+            self.edge_pruning = DynamicEdgePruning(
+                edge_dim=hidden_dim // 2,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
 
         # 节点特征编码 - 增强为多层处理
         self.node_encoder = MLPLayer(
@@ -331,13 +338,9 @@ class ProteinGATv2Encoder(nn.Module):
             edge_features = None
 
         # 应用边修剪（如果启用）
-        if self.use_edge_pruning:
-            pruned_mask, edge_importance = self.edge_pruning(
-                edge_features,
-                edge_index,
-                training=self.training
-            )
-            edge_features = edge_features * pruned_mask
+        if self.use_edge_pruning and edge_features is not None:
+            edge_mask, _ = self.edge_pruning(edge_features)
+            edge_features = edge_features * edge_mask
         # =============== 图卷积处理 ===============
 
         # 存储每一层的特征
