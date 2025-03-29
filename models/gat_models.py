@@ -19,7 +19,7 @@ from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_poo
 from torch_geometric.utils import softmax, to_dense_batch
 from torch_scatter import scatter_add, scatter_mean
 
-from .layers import MLPLayer, HeterogeneousGATv2Layer, EdgeUpdateModule, GATv2ConvLayer
+from .layers import MLPLayer, HeterogeneousGATv2Layer, EdgeUpdateModule, GATv2ConvLayer, DynamicEdgePruning
 from .readout import AttentiveReadout, HierarchicalReadout
 
 
@@ -61,6 +61,7 @@ class ProteinGATv2Encoder(nn.Module):
             dropout=0.2,
             use_pos_encoding=True,
             use_heterogeneous_edges=True,
+            use_edge_pruning=False,  # 新增参数
             esm_guidance=True,
             activation='gelu',
     ):
@@ -101,6 +102,8 @@ class ProteinGATv2Encoder(nn.Module):
         else:
             node_encoder_input_dim = node_input_dim
 
+
+
         # 节点特征编码 - 增强为多层处理
         self.node_encoder = MLPLayer(
             node_encoder_input_dim,
@@ -133,6 +136,7 @@ class ProteinGATv2Encoder(nn.Module):
                 nn.LayerNorm(hidden_dim // 2),
                 self.activation
             )
+
 
         # =============== 图卷积模块 ===============
 
@@ -283,7 +287,7 @@ class ProteinGATv2Encoder(nn.Module):
         # 节点特征初始编码
         h = self.node_encoder(x)
 
-        # 边特征处理
+
         if edge_attr is not None:
             if self.use_heterogeneous_edges and edge_type is not None:
                 # 针对不同类型边，分别处理特征
@@ -326,6 +330,14 @@ class ProteinGATv2Encoder(nn.Module):
         else:
             edge_features = None
 
+        # 应用边修剪（如果启用）
+        if self.use_edge_pruning:
+            pruned_mask, edge_importance = self.edge_pruning(
+                edge_features,
+                edge_index,
+                training=self.training
+            )
+            edge_features = edge_features * pruned_mask
         # =============== 图卷积处理 ===============
 
         # 存储每一层的特征
@@ -767,28 +779,28 @@ class ProteinLatentMapper(nn.Module):
             nn.Tanh()
         )
 
-        def forward(self, x, normalize=True):
-            """
-            将图嵌入映射到潜在空间
+    def forward(self, x, normalize=True):
+        """
+        将图嵌入映射到潜在空间
 
-            参数:
-                x (torch.Tensor): 输入图嵌入 [batch_size, input_dim]
-                normalize (bool): 是否L2归一化输出
+        参数:
+            x (torch.Tensor): 输入图嵌入 [batch_size, input_dim]
+            normalize (bool): 是否L2归一化输出
 
-            返回:
-                latent (torch.Tensor): 潜在空间表示 [batch_size, latent_dim]
-            """
-            # 通过映射网络
-            latent = self.mapper(x)
+        返回:
+            latent (torch.Tensor): 潜在空间表示 [batch_size, latent_dim]
+        """
+        # 通过映射网络
+        latent = self.mapper(x)
 
-            # 校准（微调与ESM特征对齐）
-            latent = self.calibration(latent)
+        # 校准（微调与ESM特征对齐）
+        latent = self.calibration(latent)
 
-            # 可选的L2归一化
-            if normalize:
-                latent = F.normalize(latent, p=2, dim=-1)
+        # 可选的L2归一化
+        if normalize:
+            latent = F.normalize(latent, p=2, dim=-1)
 
-            return latent
+        return latent
 
 class ResidualBlock(nn.Module):
     """残差连接块，用于深层网络稳定训练"""

@@ -1032,7 +1032,7 @@ class SequenceStructureFusion(nn.Module):
             num_layers=3,
             dropout=0.1
     ):
-        super(EnhancedSequenceStructureFusion, self).__init__()
+        super(SequenceStructureFusion, self).__init__()
 
         self.seq_dim = seq_dim
         self.graph_dim = graph_dim

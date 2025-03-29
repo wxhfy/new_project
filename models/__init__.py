@@ -36,7 +36,6 @@ from .readout import (
     AttentiveReadout,
     MultiLevelPooling,
     HierarchicalReadout,
-    FocalReadout
 )
 
 # 定义公开接口
@@ -55,7 +54,6 @@ __all__ = [
     'AttentiveReadout',
     'MultiLevelPooling',
     'HierarchicalReadout',
-    'FocalReadout',
 
     # 便捷函数
     'create_default_amp_encoder',

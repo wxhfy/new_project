@@ -70,13 +70,14 @@ class AttentiveReadout(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(in_features)
 
-    def forward(self, x, batch):
+    def forward(self, x, batch, node_weights=None):
         """
         使用注意力机制聚合节点特征为图级表示
 
         参数:
             x (torch.Tensor): 节点特征 [num_nodes, in_features]
             batch (torch.LongTensor): 批处理索引 [num_nodes]
+            node_weights (torch.Tensor, optional): 预定义节点权重 [num_nodes, 1]
 
         返回:
             graph_embedding (torch.Tensor): 图级嵌入 [batch_size, in_features]
@@ -118,21 +119,26 @@ class AttentiveReadout(nn.Module):
             graph_keys = keys[start_idx:end_idx]  # [nodes_in_graph, num_heads, head_dim]
             graph_values = values[start_idx:end_idx]  # [nodes_in_graph, num_heads, head_dim]
 
-            # 计算注意力分数
-            attn_scores = torch.bmm(
-                graph_keys.transpose(0, 1),  # [num_heads, nodes_in_graph, head_dim]
-                query[b].unsqueeze(-1)  # [num_heads, head_dim, 1]
-            ).squeeze(-1)  # [num_heads, nodes_in_graph]
+            # 如果提供了预定义权重，使用它们
+            if node_weights is not None:
+                graph_weights = node_weights[start_idx:end_idx]  # [nodes_in_graph, 1]
+                # 扩展维度以适应多头注意力
+                graph_weights = graph_weights.expand(-1, self.num_heads).unsqueeze(1)  # [nodes_in_graph, 1, num_heads]
+                attn_weights = F.softmax(graph_weights, dim=0).transpose(1, 2)  # [nodes_in_graph, num_heads, 1]
+            else:
+                # 计算注意力分数
+                attn_scores = torch.bmm(
+                    graph_keys.transpose(0, 1),  # [num_heads, nodes_in_graph, head_dim]
+                    query[b].unsqueeze(-1)  # [num_heads, head_dim, 1]
+                ).squeeze(-1)  # [num_heads, nodes_in_graph]
 
-            # 归一化注意力权重
-            attn_weights = F.softmax(attn_scores, dim=1)  # [num_heads, nodes_in_graph]
-            attn_weights = self.dropout(attn_weights)
+                # 归一化注意力权重
+                attn_weights = F.softmax(attn_scores, dim=1)  # [num_heads, nodes_in_graph]
+                attn_weights = self.dropout(attn_weights)
+                attn_weights = attn_weights.transpose(0, 1).unsqueeze(-1)  # [nodes_in_graph, num_heads, 1]
 
             # 加权求和
-            weighted_values = torch.bmm(
-                attn_weights.unsqueeze(1),  # [num_heads, 1, nodes_in_graph]
-                graph_values.transpose(0, 1)  # [num_heads, nodes_in_graph, head_dim]
-            ).squeeze(1)  # [num_heads, head_dim]
+            weighted_values = torch.sum(attn_weights * graph_values, dim=0)  # [num_heads, head_dim]
 
             # 合并多头注意力
             graph_heads = weighted_values.view(1, -1)  # [1, num_heads * head_dim]
@@ -310,19 +316,21 @@ class HierarchicalReadout(nn.Module):
             nn.Linear(in_features, in_features)
         )
 
-    def forward(self, x, batch):
+    def forward(self, x, batch, node_weights=None):
         """
         使用层次化读出机制聚合节点特征为图级表示
 
         参数:
             x (torch.Tensor): 节点特征 [num_nodes, in_features]
             batch (torch.LongTensor): 批处理索引 [num_nodes]
+            node_weights (torch.Tensor, optional): 节点重要性权重 [num_nodes, 1]
 
         返回:
             graph_embedding (torch.Tensor): 图级嵌入 [batch_size, in_features]
         """
-        # 注意力读出
-        attn_emb = self.attn_readout(x, batch)
+        # 注意力读出（如果提供了node_weights，则传递给注意力读出机制）
+        attn_emb = self.attn_readout(x, batch) if node_weights is None else \
+            self.attn_readout(x, batch, node_weights=node_weights)
 
         # 多层次池化
         pool_emb = self.multi_pool(x, batch)
@@ -333,81 +341,3 @@ class HierarchicalReadout(nn.Module):
 
         return graph_embedding
 
-
-class FocalReadout(nn.Module):
-    """
-    焦点读出机制
-
-    针对抗菌肽(AMPs)的关键功能区域设计的读出机制，
-    通过识别并聚焦于关键残基（如荷电残基、疏水残基）来构建更具功能导向的图表示。
-
-    参数:
-        in_features (int): 输入特征维度
-        hidden_dim (int, optional): 隐藏层维度
-        dropout (float, optional): Dropout率
-    """
-
-    def __init__(
-            self,
-            in_features,
-            hidden_dim=None,
-            dropout=0.1
-    ):
-        super(FocalReadout, self).__init__()
-
-        self.in_features = in_features
-        self.hidden_dim = hidden_dim or in_features
-
-        # 残基重要性评分网络
-        self.importance_net = nn.Sequential(
-            nn.Linear(in_features, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim, 1)
-        )
-
-        # 特征变换
-        self.feature_transform = nn.Sequential(
-            nn.Linear(in_features, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim, in_features)
-        )
-
-    def forward(self, x, batch, node_attr=None):
-        """
-        基于残基重要性聚合节点特征为图级表示
-
-        参数:
-            x (torch.Tensor): 节点特征 [num_nodes, in_features]
-            batch (torch.LongTensor): 批处理索引 [num_nodes]
-            node_attr (torch.Tensor, optional): 额外节点属性 [num_nodes, attr_dim]
-
-        返回:
-            graph_embedding (torch.Tensor): 图级嵌入 [batch_size, in_features]
-        """
-        # 计算残基重要性分数
-        importance = self.importance_net(x).squeeze(-1)  # [num_nodes]
-
-        # 对每个图内的分数进行归一化
-        batch_size = batch.max().item() + 1
-        normalized_importance = torch.zeros_like(importance)
-
-        for i in range(batch_size):
-            batch_mask = (batch == i)
-            batch_imp = importance[batch_mask]
-
-            # 使用softmax归一化
-            batch_norm_imp = F.softmax(batch_imp, dim=0)
-            normalized_importance[batch_mask] = batch_norm_imp
-
-        # 加权特征聚合
-        transformed_features = self.feature_transform(x)
-        weighted_features = transformed_features * normalized_importance.unsqueeze(-1)
-
-        # 按图聚合
-        graph_embedding = scatter_add(weighted_features, batch, dim=0, dim_size=batch_size)
-
-        return graph_embedding
