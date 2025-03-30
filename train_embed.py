@@ -135,7 +135,14 @@ class ProteinMultiModalTrainer:
             logger.info(f"ESM模型成功加载: {self.config.ESM_MODEL_NAME}")
 
             # 测试模型是否正常工作
-            test_input = torch.tensor([[0, 5, 2]], device=self.device)  # 简单的测试输入
+            test_seq = "ACDEFG"  # 6个氨基酸的测试序列
+            test_ids = [0]  # BOS标记
+            ESM_AA_MAP = {'A': 5, 'C': 23, 'D': 13, 'E': 9, 'F': 18, 'G': 6}
+            for aa in test_seq:
+                test_ids.append(ESM_AA_MAP[aa])
+            test_ids.append(2)  # EOS标记
+
+            test_input = torch.tensor([test_ids], device=self.device)  # [1, 8]
             with torch.no_grad():
                 test_tensor = ESMProteinTensor(sequence=test_input)
                 _ = self.esm_model.logits(test_tensor, LogitsConfig(sequence=True, return_embeddings=True))
@@ -284,13 +291,13 @@ class ProteinMultiModalTrainer:
 
     def _get_esm_embedding(self, sequences):
         """
-        获取序列的ESM嵌入
+        获取序列的ESM嵌入，优化序列处理和标记添加
 
         参数:
             sequences (list): 氨基酸序列列表
 
         返回:
-            torch.Tensor: ESM嵌入矩阵 [batch_size, seq_len+2, embedding_dim]
+            torch.Tensor: ESM嵌入矩阵
         """
         batch_embeddings = []
 
@@ -299,34 +306,81 @@ class ProteinMultiModalTrainer:
             'G': 6, 'H': 21, 'I': 12, 'K': 15, 'L': 4,
             'M': 20, 'N': 17, 'P': 14, 'Q': 16, 'R': 10,
             'S': 8, 'T': 11, 'V': 7, 'W': 22, 'Y': 19,
-            '_': 32
+            '_': 32, 'X': 32  # 添加X作为未知氨基酸的映射
         }
 
         # 逐个处理序列
-        for seq in sequences:
-            # 编码序列
-            s = [ESM_AA_MAP.get(aa, ESM_AA_MAP['_']) for aa in seq]
-            token_ids = [0] + s + [2]  # 添加开始和结束标记
+        for seq_idx, seq in enumerate(sequences):
+            try:
+                # 序列长度验证
+                if not seq or len(seq) == 0:
+                    logger.warning(f"检测到空序列(索引:{seq_idx})，使用默认'A'替代")
+                    seq = "A"
 
-            # 转换为张量
-            token_tensor = torch.tensor(token_ids, device=self.device).unsqueeze(0)  # [1, seq_len+2]
+                # 对序列中的字符进行清理
+                cleaned_seq = ''.join(aa for aa in seq if aa in ESM_AA_MAP)
+                if len(cleaned_seq) == 0:
+                    cleaned_seq = 'A'  # 空序列用单个A替代
+                    logger.warning(f"序列(索引:{seq_idx})不含有效氨基酸，使用'A'替代")
 
-            # 使用ESM模型获取嵌入
-            protein_tensor = ESMProteinTensor(sequence=token_tensor)
-            with torch.no_grad():
-                logits_output = self.esm_model.logits(
-                    protein_tensor,
-                    LogitsConfig(sequence=True, return_embeddings=True)
-                )
-            embeddings = logits_output.embeddings  # [1, seq_len+2, embedding_dim]
+                # 序列长度过滤
+                max_length = 1022  # 考虑到会添加BOS和EOS标记
+                if len(cleaned_seq) > max_length:
+                    cleaned_seq = cleaned_seq[:max_length]
+                    logger.warning(f"序列(索引:{seq_idx})长度超出限制，已截断至{max_length}个氨基酸")
 
-            batch_embeddings.append(embeddings)
+                # 序列长度验证 - 确保至少有一个有效字符
+                if len(cleaned_seq) < 1:
+                    logger.warning(f"清理后序列长度为0，使用默认'A'")
+                    cleaned_seq = "A"
+
+                # 确保序列长度至少为4，这样可以避免边界情况
+                if len(cleaned_seq) < 4:
+                    padding = "A" * (4 - len(cleaned_seq))
+                    cleaned_seq += padding
+                    logger.info(f"序列(索引:{seq_idx})长度<4，填充至{len(cleaned_seq)}个氨基酸")
+
+                # 编码序列
+                token_ids = [0]  # BOS标记
+                for aa in cleaned_seq:
+                    token_ids.append(ESM_AA_MAP.get(aa, ESM_AA_MAP['X']))
+                token_ids.append(2)  # EOS标记
+
+                # 转换为张量
+                token_tensor = torch.tensor(token_ids, device=self.device).unsqueeze(0)
+
+                # 使用ESM模型获取嵌入
+                protein_tensor = ESMProteinTensor(sequence=token_tensor)
+                with torch.no_grad():
+                    logits_output = self.esm_model.logits(
+                        protein_tensor,
+                        LogitsConfig(sequence=True, return_embeddings=True)
+                    )
+                embeddings = logits_output.embeddings
+
+                # 验证嵌入维度
+                if embeddings.dim() != 3 or embeddings.size(2) != self.config.ESM_EMBEDDING_DIM:
+                    logger.warning(
+                        f"异常的嵌入维度: {embeddings.shape}，预期: [1, {len(token_ids)}, {self.config.ESM_EMBEDDING_DIM}]"
+                    )
+                    # 生成规范尺寸的替代嵌入
+                    embeddings = torch.zeros(1, len(token_ids), self.config.ESM_EMBEDDING_DIM, device=self.device)
+
+                batch_embeddings.append(embeddings)
+
+            except Exception as e:
+                logger.error(f"处理序列(索引:{seq_idx})嵌入时出错: {e}")
+                # 生成备用嵌入，保证序列长度与原始处理逻辑一致
+                seq_len = len(seq) if seq else 1
+                token_length = seq_len + 2  # 加上BOS和EOS标记
+                embeddings = torch.zeros(1, token_length, self.config.ESM_EMBEDDING_DIM, device=self.device)
+                batch_embeddings.append(embeddings)
 
         # 合并批次嵌入
         if len(batch_embeddings) > 1:
-            return torch.cat(batch_embeddings, dim=0)  # [batch_size, seq_len+2, embedding_dim]
+            return torch.cat(batch_embeddings, dim=0)
         else:
-            return batch_embeddings[0]  # [1, seq_len+2, embedding_dim]
+            return batch_embeddings[0]
 
     def _extract_sequences_from_graphs(self, graphs_batch):
         """
