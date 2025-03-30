@@ -1379,19 +1379,7 @@ def save_results_chunked(all_proteins, output_dir, base_name="protein_data", chu
 
 
 def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_size=10000, format_type="pyg"):
-    """
-    保存蛋白质知识图谱数据，支持JSON和PyG格式，优化后采用容错处理方式代替跳过策略
-
-    参数:
-        kg_data: 知识图谱数据字典
-        output_dir: 输出目录路径
-        base_name: 输出文件基础名称
-        chunk_size: 每个数据块的最大图谱数量
-        format_type: 输出格式，支持"pyg"和"json"
-
-    返回:
-        索引信息字典
-    """
+    """保存知识图谱数据，支持JSON和PyG格式"""
     if not kg_data:
         logger.warning(f"没有知识图谱数据可保存为{format_type}格式")
         return None
@@ -1436,7 +1424,7 @@ def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_siz
                 graphs_data = {}
 
                 for i, pid in enumerate(chunk_ids):
-                    if i % 10000 == 0 or i == len(chunk_ids) - 1:
+                    if i % 1000 == 0 or i == len(chunk_ids) - 1:
                         logger.info(f"  - 正在处理第{i + 1}/{len(chunk_ids)}个蛋白质图谱")
 
                     try:
@@ -1452,8 +1440,6 @@ def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_siz
                         node_features = []  # 节点特征列表
                         edge_index = [[], []]  # 边索引
                         edge_attr = []  # 边特征
-                        residue_codes = []  # 残基代码列表
-                        residue_indices = []  # 残基索引列表
 
                         # 创建节点映射
                         node_mapping = {node: idx for idx, node in enumerate(nx_graph.nodes())}
@@ -1465,122 +1451,96 @@ def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_siz
                         for node in nx_graph.nodes():
                             node_attrs = nx_graph.nodes[node]
 
-                            # 收集基础信息
-                            residue_code = node_attrs.get('residue_code', 'X')  # 默认使用X表示未知氨基酸
-                            residue_codes.append(residue_code)
-                            residue_indices.append(int(node_attrs.get('residue_idx', -1)))
-
-                            # 特征收集 - 使用默认值代替跳过
-                            features = []
-
                             # 1. BLOSUM62编码 (20维)
-                            if 'blosum62' in node_attrs and len(node_attrs['blosum62']) == blosum_dim:
-                                features.extend([float(x) for x in node_attrs['blosum62']])
-
+                            blosum = node_attrs.get('blosum62', [0] * blosum_dim)
+                            if not blosum or len(blosum) != blosum_dim:
+                                blosum = [0] * blosum_dim
 
                             # 2. 相对空间坐标 (3维)
-                            if 'position' in node_attrs and len(node_attrs['position']) >= 3:
-                                features.extend([float(x) for x in node_attrs['position'][:3]])
+                            position = node_attrs.get('position', [0, 0, 0])[:3]
 
-                            # 3. 氨基酸理化特性 (6维)
-                            props = AA_PROPERTIES.get(residue_code, None)
-                            if props:
-                                features.append(float(props['hydropathy']))
-                                features.append(float(props['charge']))
-                                features.append(float(props['mw'] / 200.0))  # 归一化
-                                features.append(float(props['volume'] / 200.0))  # 归一化
-                                features.append(float(props['flexibility']))
-                                features.append(1.0 if props['aromatic'] else 0.0)
+                            # 3. 氨基酸理化特性
+                            residue_code = node_attrs.get('residue_code', 'X')
+                            props = AA_PROPERTIES.get(residue_code, AA_PROPERTIES['X'])
+
+                            hydropathy = props['hydropathy']
+                            charge = props['charge']
+                            molecular_weight = props['mw'] / 200.0  # 归一化
+                            volume = props['volume'] / 200.0  # 归一化
+                            flexibility = props['flexibility']
+                            is_aromatic = 1.0 if props['aromatic'] else 0.0
 
                             # 4. 二级结构编码 (3维)
-                            ss_alpha = node_attrs.get('ss_alpha', 0.0)
-                            ss_beta = node_attrs.get('ss_beta', 0.0)
-                            ss_coil = node_attrs.get('ss_coil', 1.0)  # 默认为无规则卷曲
-                            features.extend([float(ss_alpha), float(ss_beta), float(ss_coil)])
+                            ss_alpha = float(node_attrs.get('ss_alpha', 0))
+                            ss_beta = float(node_attrs.get('ss_beta', 0))
+                            ss_coil = float(node_attrs.get('ss_coil', 0))
 
                             # 5. 表面暴露程度 (1维)
-                            features.append(float(node_attrs.get('sasa', 0.5)))  # 默认中等暴露程度
+                            sasa = float(node_attrs.get('sasa', 0.5))
 
-                            # 6. pLDDT值 (1维)
-                            features.append(float(node_attrs.get('plddt', 70.0)) / 100.0)  # 默认中等可靠度
+                            # 6. 保守性得分 - 暂无，使用默认值 (1维)
+                            conservation = 0.5
 
-                            # 添加到节点特征列表
+                            # 7. 侧链柔性 (1维)
+                            side_chain_flexibility = float(props['flexibility'])
+
+                            # 8. pLDDT值 (1维)
+                            plddt = float(node_attrs.get('plddt', 70.0)) / 100.0  # 归一化到0-1
+
+                            # 合并所有特征
+                            features = blosum + position + [hydropathy, charge, molecular_weight,
+                                                            volume, flexibility, is_aromatic,
+                                                            ss_alpha, ss_beta, ss_coil, sasa,
+                                                            conservation, side_chain_flexibility, plddt]
+
                             node_features.append(features)
 
-                        # 提取边特征 - 使用默认值代替跳过
+                        # 提取边特征
                         for src, tgt, edge_data in nx_graph.edges(data=True):
-                            # 确保节点存在于映射中
-                            if src not in node_mapping or tgt not in node_mapping:
-                                continue  # 这个continue是必要的，因为需要有效的源节点和目标节点
-
-                            src_idx = node_mapping[src]
-                            tgt_idx = node_mapping[tgt]
-
-                            # 确保索引在有效范围内
-                            if src_idx >= len(node_features) or tgt_idx >= len(node_features):
-                                continue  # 这个continue是必要的，防止索引越界
-
-                            edge_index[0].append(src_idx)
-                            edge_index[1].append(tgt_idx)
-
-                            # 边特征收集 - 使用默认值代替跳过
-                            edge_feats = []
+                            edge_index[0].append(node_mapping[src])
+                            edge_index[1].append(node_mapping[tgt])
 
                             # 1. 边类型编码 (4维 one-hot)
-                            edge_type = edge_data.get('edge_type', 0)  # 默认类型0
-                            edge_type_onehot = [0.0, 0.0, 0.0, 0.0]
-                            if 0 <= edge_type < 4:
-                                edge_type_onehot[int(edge_type)] = 1.0
-
-                            edge_feats.extend(edge_type_onehot)
+                            edge_type = edge_data.get('edge_type', 0)
+                            edge_type_onehot = [0, 0, 0, 0]
+                            if edge_type < len(edge_type_onehot):
+                                edge_type_onehot[edge_type] = 1
 
                             # 2. 空间距离 (1维)
-                            edge_feats.append(float(edge_data.get('distance', 8.0)))  # 默认距离8.0埃
+                            distance = float(edge_data.get('distance', 0))
 
                             # 3. 相互作用强度 (1维)
-                            edge_feats.append(float(edge_data.get('interaction_strength', 0.5)))  # 默认中等强度
+                            interaction_strength = float(edge_data.get('interaction_strength', 0.5))
 
                             # 4. 方向性 (2维)
-                            if 'direction' in edge_data and len(edge_data['direction']) == 2:
-                                edge_feats.extend([float(x) for x in edge_data['direction']])
+                            direction = edge_data.get('direction', [0, 0])
+                            if len(direction) != 2:
+                                direction = [0, 0]
 
+                            # 合并边特征
+                            edge_features = edge_type_onehot + [distance, interaction_strength] + direction
+                            edge_attr.append(edge_features)
 
-                            # 添加到边特征列表
-                            edge_attr.append(edge_feats)
-
-                        # 创建PyG数据对象 - 降低阈值要求，确保大多数图谱都能生成
-                        if len(node_features) >= 1:  # 只要有节点就创建图
-                            # 如果没有边，添加自环边确保图的连通性
-                            if len(edge_index[0]) == 0 and len(node_features) > 0:
-                                for i in range(len(node_features)):
-                                    edge_index[0].append(i)
-                                    edge_index[1].append(i)
-                                    # 添加默认的边特征
-                                    default_edge_feat = [1.0, 0.0, 0.0, 0.0]  # 类型0
-                                    default_edge_feat.extend([8.0, 0.5, 0.0, 0.0])  # 其他特征
-                                    edge_attr.append(default_edge_feat)
-
+                        # 创建PyG数据对象
+                        if node_features and edge_index[0]:  # 确保有节点和边
                             data = Data(
                                 x=torch.tensor(node_features, dtype=torch.float),
                                 edge_index=torch.tensor(edge_index, dtype=torch.long),
                                 edge_attr=torch.tensor(edge_attr, dtype=torch.float),
-                                residue_codes=residue_codes,
-                                residue_indices=torch.tensor(residue_indices, dtype=torch.long),
                                 protein_id=pid
                             )
 
                             # 添加额外元数据
-                            for node, attrs in nx_graph.nodes(data=True):
-                                if 'fragment_id' in attrs:
-                                    data.fragment_id = attrs['fragment_id']
-                                    break
+                            if 'fragment_id' in next(iter(nx_graph.nodes(data=True)))[1]:
+                                fragment_id = next(iter(nx_graph.nodes(data=True)))[1]['fragment_id']
+                                data.fragment_id = fragment_id
 
-                            # 保存序列信息
-                            if residue_codes:
-                                sorted_residues = [(idx, code) for idx, code in zip(residue_indices, residue_codes)]
-                                sorted_residues.sort()
-                                sequence = ''.join([code for _, code in sorted_residues])
-                                data.sequence = sequence
+                            # 保存序列信息（如果可用）
+                            sequence = ""
+                            for node, attrs in sorted(nx_graph.nodes(data=True),
+                                                      key=lambda x: x[1].get('residue_idx', 0)):
+                                sequence += attrs.get('residue_code', 'X')
+                            data.sequence = sequence
 
                             graphs_data[pid] = data
 
@@ -1589,188 +1549,48 @@ def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_siz
                             index["total_edges"] += len(edge_attr)
                     except Exception as e:
                         logger.warning(f"转换蛋白质 {pid} 图谱时出错: {str(e)}")
-                        logger.error(traceback.format_exc())
                         index["error_count"] += 1
 
-                # 保存为PyTorch文件 - 即使数据很少也保存
+                # 保存为PyTorch文件
                 if graphs_data:
                     torch.save(graphs_data, output_file)
                     logger.info(f"已保存 {len(graphs_data)} 个PyG格式图谱到 {output_file}")
                 else:
-                    # 创建一个最小化的图谱数据保证文件存在
-                    dummy_data = {
-                        "dummy_protein": Data(
-                            x=torch.tensor([[0.0] * 34], dtype=torch.float),  # 34维特征
-                            edge_index=torch.tensor([[0], [0]], dtype=torch.long),
-                            edge_attr=torch.tensor([[1.0, 0.0, 0.0, 0.0, 8.0, 0.5, 0.0, 0.0]], dtype=torch.float),
-                            residue_codes=["X"],
-                            residue_indices=torch.tensor([0], dtype=torch.long),
-                            protein_id="dummy_protein",
-                            sequence="X"
-                        )
-                    }
-                    torch.save(dummy_data, output_file)
-                    logger.warning(f"块 {chunk_id + 1} 中没有有效的PyG图谱数据，已保存占位图谱")
+                    logger.warning(f"块 {chunk_id + 1} 中没有有效的PyG图谱数据")
 
             except Exception as e:
                 logger.error(f"保存PyG格式知识图谱时出错 (块 {chunk_id + 1}): {str(e)}")
                 logger.error(traceback.format_exc())
         else:
-            # JSON格式保存 - 优化数据处理
+            # JSON格式保存
             try:
-                # 准备当前块的数据，保留所有有效节点和边
-                chunk_data = {}
+                # 准备当前块的数据
+                chunk_data = {pid: kg_data[pid] for pid in chunk_ids}
 
+                # 保存JSON文件
+                with open(output_file, 'w') as f:
+                    json.dump(chunk_data, f)
+
+                # 更新统计信息
+                node_count = 0
+                edge_count = 0
                 for pid in chunk_ids:
-                    if pid not in kg_data:
-                        continue
+                    if isinstance(kg_data[pid], dict) and 'nodes' in kg_data[pid]:
+                        node_count += len(kg_data[pid].get('nodes', []))
+                        edge_count += len(kg_data[pid].get('links', []))
 
-                    graph_data = kg_data[pid]
+                index["total_nodes"] += node_count
+                index["total_edges"] += edge_count
 
-                    # 如果是NetworkX格式，转换为节点链接格式
-                    if not isinstance(graph_data, dict):
-                        graph_data = nx.node_link_data(graph_data)
-
-                    # 处理节点 - 保留所有节点，填充缺失属性
-                    if 'nodes' in graph_data:
-                        processed_nodes = []
-                        for node in graph_data['nodes']:
-                            # 创建新的节点字典，填充必要属性
-                            processed_node = {}
-
-                            # 确保基本属性存在
-                            processed_node['id'] = node.get('id', str(uuid.uuid4())[:8])
-                            processed_node['residue_code'] = node.get('residue_code', 'X')
-
-                            # 复制其他属性，转换NumPy类型为Python原生类型
-                            for key, value in node.items():
-                                if key not in processed_node:
-                                    if isinstance(value, (np.integer, np.int64, np.int32)):
-                                        processed_node[key] = int(value)
-                                    elif isinstance(value, (np.floating, np.float64, np.float32)):
-                                        processed_node[key] = float(value)
-                                    elif isinstance(value, np.ndarray):
-                                        processed_node[key] = value.tolist()
-                                    else:
-                                        processed_node[key] = value
-
-                            # 确保位置信息存在
-                            if 'position' not in processed_node:
-                                processed_node['position'] = [0.0, 0.0, 0.0]
-
-                            processed_nodes.append(processed_node)
-
-                        # 更新节点列表
-                        graph_data['nodes'] = processed_nodes
-
-                    # 处理边 - 保留所有有效边，填充缺失属性
-                    if 'links' in graph_data:
-                        processed_links = []
-                        for link in graph_data['links']:
-                            # 确保源节点和目标节点存在
-                            if 'source' not in link or 'target' not in link:
-                                continue  # 这个continue是必要的，边必须有源和目标
-
-                            # 创建新的边字典，填充必要属性
-                            processed_link = {}
-
-                            # 确保基本属性存在
-                            processed_link['source'] = link['source']
-                            processed_link['target'] = link['target']
-
-                            # 复制其他属性，转换NumPy类型为Python原生类型
-                            for key, value in link.items():
-                                if key not in processed_link:
-                                    if isinstance(value, (np.integer, np.int64, np.int32)):
-                                        processed_link[key] = int(value)
-                                    elif isinstance(value, (np.floating, np.float64, np.float32)):
-                                        processed_link[key] = float(value)
-                                    elif isinstance(value, np.ndarray):
-                                        processed_link[key] = value.tolist()
-                                    else:
-                                        processed_link[key] = value
-
-                            # 确保边类型和距离存在
-                            if 'edge_type' not in processed_link:
-                                processed_link['edge_type'] = 0
-                            if 'distance' not in processed_link:
-                                processed_link['distance'] = 8.0
-
-                            processed_links.append(processed_link)
-
-                        # 更新边列表
-                        graph_data['links'] = processed_links
-
-                    # 如果没有节点，添加一个默认节点
-                    if not graph_data.get('nodes'):
-                        graph_data['nodes'] = [{
-                            'id': '0',
-                            'residue_code': 'X',
-                            'residue_idx': 0,
-                            'position': [0.0, 0.0, 0.0]
-                        }]
-
-                    # 如果没有边，添加一个自环边
-                    if not graph_data.get('links') and graph_data.get('nodes'):
-                        first_node_id = graph_data['nodes'][0].get('id', '0')
-                        graph_data['links'] = [{
-                            'source': first_node_id,
-                            'target': first_node_id,
-                            'edge_type': 0,
-                            'distance': 0.0
-                        }]
-
-                    # 添加到结果中
-                    chunk_data[pid] = graph_data
-
-                # 保存JSON文件 - 即使数据很少也保存
-                if chunk_data:
-                    # 创建自定义JSON编码器
-                    class NumpyEncoder(json.JSONEncoder):
-                        def default(self, obj):
-                            if isinstance(obj, (np.integer, np.int64, np.int32)):
-                                return int(obj)
-                            elif isinstance(obj, (np.floating, np.float64, np.float32)):
-                                return float(obj)
-                            elif isinstance(obj, np.ndarray):
-                                return obj.tolist()
-                            return super(NumpyEncoder, self).default(obj)
-
-                    # 保存JSON文件
-                    with open(output_file, 'w') as f:
-                        json.dump(chunk_data, f, cls=NumpyEncoder)
-
-                    # 更新统计信息
-                    node_count = sum(len(data.get('nodes', [])) for data in chunk_data.values())
-                    edge_count = sum(len(data.get('links', [])) for data in chunk_data.values())
-
-                    index["total_nodes"] += node_count
-                    index["total_edges"] += edge_count
-
-                    logger.info(f"已保存 {len(chunk_data)} 个JSON格式图谱到 {output_file}")
-                else:
-                    # 创建一个最小化的图谱确保文件存在
-                    dummy_data = {
-                        "dummy_protein": {
-                            "nodes": [{"id": "0", "residue_code": "X", "residue_idx": 0, "position": [0.0, 0.0, 0.0]}],
-                            "links": [{"source": "0", "target": "0", "edge_type": 0, "distance": 0.0}]
-                        }
-                    }
-                    with open(output_file, 'w') as f:
-                        json.dump(dummy_data, f)
-                    logger.warning(f"块 {chunk_id + 1} 中没有有效的JSON图谱数据，已保存占位图谱")
-
+                logger.info(f"已保存 {len(chunk_data)} 个JSON格式图谱到 {output_file}")
             except Exception as e:
                 logger.error(f"保存JSON格式知识图谱时出错 (块 {chunk_id + 1}): {str(e)}")
                 logger.error(traceback.format_exc())
 
     # 保存索引文件
     index_file = os.path.join(kg_dir, f"{base_name}_index.json")
-    try:
-        with open(index_file, 'w') as f:
-            json.dump(index, f, indent=2)
-    except Exception as e:
-        logger.error(f"保存索引文件时出错: {str(e)}")
+    with open(index_file, 'w') as f:
+        json.dump(index, f, indent=2)
 
     return index
 
