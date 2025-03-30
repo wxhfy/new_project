@@ -25,6 +25,7 @@ import random
 from pathlib import Path
 import seaborn as sns
 from matplotlib import pyplot as plt
+from pandas.io.formats.style import subset_args
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -43,7 +44,7 @@ from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProteinTensor, LogitsConfig
 
 os.environ["INFRA_PROVIDER"] = "True"
-os.environ["ESM_CACHE_DIR"] = "/home/fyh0106/project/encoder/esm"  # 指定包含模型文件的目录
+os.environ["ESM_CACHE_DIR"] = "data/weight"  # 指定包含模型文件的目录
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -128,12 +129,21 @@ class ProteinMultiModalTrainer:
 
         # 2. 初始化ESM编码器
         logger.info(f"初始化ESM模型: {self.config.ESM_MODEL_NAME}")
-        os.environ["INFRA_PROVIDER"] = "True"
+
         try:
             self.esm_model = ESMC.from_pretrained(self.config.ESM_MODEL_NAME, device=self.device)
-            logger.info(f"ESM模型加载成功，嵌入维度: {self.config.ESM_EMBEDDING_DIM}")
+            logger.info(f"ESM模型成功加载: {self.config.ESM_MODEL_NAME}")
+
+            # 测试模型是否正常工作
+            test_input = torch.tensor([[0, 5, 2]], device=self.device)  # 简单的测试输入
+            with torch.no_grad():
+                test_tensor = ESMProteinTensor(sequence=test_input)
+                _ = self.esm_model.logits(test_tensor, LogitsConfig(sequence=True, return_embeddings=True))
+            logger.info(f"ESM模型测试通过，嵌入维度: {self.config.ESM_EMBEDDING_DIM}")
         except Exception as e:
-            logger.error(f"ESM模型加载失败: {e}")
+            logger.error(f"ESM模型加载或测试失败: {e}")
+            logger.error(f"尝试的环境变量: ESM_CACHE_DIR={os.environ.get('ESM_CACHE_DIR')}")
+            logger.error(f"模型名称: {self.config.ESM_MODEL_NAME}")
             raise
 
         # 3. 潜空间映射器
@@ -420,9 +430,68 @@ class ProteinMultiModalTrainer:
     def protein_fusion_loss(self, graph_embedding, seq_embedding, graph_latent, fused_embedding, batch=None):
         """
         简化高效的蛋白质多模态融合损失函数
-        [保持原函数实现不变]
+
+        参数:
+            graph_embedding: 原始图嵌入 [batch, dim]
+            seq_embedding: 序列嵌入 [batch, dim]
+            graph_latent: 图嵌入映射到序列空间后的表示 [batch, dim]
+            fused_embedding: 融合后的嵌入 [batch, dim]
+            batch: 批次数据，可能包含额外信息
+
+        返回:
+            tuple: (总损失, 损失字典)
         """
-        total_loss, loss_dict = self._get_fused_embedding(graph_embedding, seq_embedding, graph_latent, fused_embedding)
+        batch_size = graph_embedding.size(0)
+
+        # 1. InfoNCE对比损失 - 促进模态对齐
+        temperature = 0.1  # 温度参数
+        sim_matrix = torch.mm(graph_latent, seq_embedding.t()) / temperature
+        labels = torch.arange(batch_size, device=graph_latent.device)
+
+        # 双向对比损失
+        loss_g2s = F.cross_entropy(sim_matrix, labels)  # 图→序列方向
+        loss_s2g = F.cross_entropy(sim_matrix.t(), labels)  # 序列→图方向
+        contrast_loss = (loss_g2s + loss_s2g) / 2.0
+
+        # 2. 融合一致性损失 - 确保融合表示保留原始信息
+        fusion_g_sim = F.cosine_similarity(fused_embedding, graph_embedding).mean()
+        fusion_s_sim = F.cosine_similarity(fused_embedding, seq_embedding).mean()
+        consistency_loss = (2.0 - fusion_g_sim - fusion_s_sim) * 0.5
+
+        # 3. 结构感知的散度损失 - 保持样本间的结构关系
+        # 计算嵌入空间中样本对之间的距离关系
+        def pairwise_distances(x):
+            # 计算批次内所有样本对之间的欧氏距离
+            return torch.cdist(x, x, p=2)
+
+        # 获取原始模态的距离矩阵
+        g_dist = pairwise_distances(graph_embedding)
+        s_dist = pairwise_distances(seq_embedding)
+
+        # 获取融合表示的距离矩阵
+        f_dist = pairwise_distances(fused_embedding)
+
+        # 归一化距离矩阵
+        g_dist = g_dist / (g_dist.max() + 1e-8)
+        s_dist = s_dist / (s_dist.max() + 1e-8)
+        f_dist = f_dist / (f_dist.max() + 1e-8)
+
+        # 结构保持损失 - 融合空间应保持原始空间的距离关系
+        structure_loss = (F.mse_loss(f_dist, g_dist) + F.mse_loss(f_dist, s_dist)) * 0.5
+
+        # 总损失 - 加权组合
+        # 基于经验设置权重，对比损失权重最大
+        total_loss = contrast_loss + 0.5 * consistency_loss + 0.3 * structure_loss
+
+        # 创建损失字典用于记录
+        loss_dict = {
+            'total_loss': total_loss,
+            'contrast_loss': contrast_loss,
+            'consistency_loss': consistency_loss,
+            'structure_loss': structure_loss,
+            'similarity': sim_matrix.detach()  # 保存相似度矩阵用于可视化
+        }
+
         return total_loss, loss_dict
 
     def train_epoch(self, train_loader, epoch):
@@ -444,6 +513,8 @@ class ProteinMultiModalTrainer:
         epoch_stats = {
             'loss': 0.0,
             'contrast_loss': 0.0,
+            'consistency_loss': 0.0,
+            'structure_loss': 0.0,
             'graph_latent_norm': 0.0,
             'seq_emb_norm': 0.0,
             'batch_count': 0
@@ -466,26 +537,14 @@ class ProteinMultiModalTrainer:
                 # 获取图嵌入和序列嵌入
                 graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch)
 
-                # 替换原有的对比损失计算 ▼
-                total_loss, loss_dict = self.protein_fusion_loss(
+                # 计算融合损失
+                loss, loss_dict = self.protein_fusion_loss(
                     graph_embedding,
                     seq_embedding,
                     graph_latent,
                     fused_embedding,
                     batch
                 )
-
-            # 更新统计信息部分 ▼
-            epoch_stats['loss'] += total_loss.item()
-            epoch_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
-            epoch_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
-            epoch_stats['structure_loss'] += loss_dict['structure_loss'].item()
-
-            # 计算对比损失
-            contrast_loss, similarity = self.contrast_head(graph_latent, seq_embedding)
-
-            # 总损失 - 目前只有对比损失
-            loss = contrast_loss
 
             # 反向传播
             if self.fp16_training:
@@ -515,7 +574,9 @@ class ProteinMultiModalTrainer:
 
             # 累积统计信息
             epoch_stats['loss'] += loss.item()
-            epoch_stats['contrast_loss'] += contrast_loss.item()
+            epoch_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
+            epoch_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
+            epoch_stats['structure_loss'] += loss_dict['structure_loss'].item()
             epoch_stats['graph_latent_norm'] += torch.norm(graph_latent.detach(), dim=1).mean().item()
             epoch_stats['seq_emb_norm'] += torch.norm(seq_embedding.detach(), dim=1).mean().item()
             epoch_stats['batch_count'] += 1
@@ -534,13 +595,17 @@ class ProteinMultiModalTrainer:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     pbar.set_postfix({
                         'loss': f"{loss.item():.4f}",
-                        'c_loss': f"{contrast_loss.item():.4f}",
+                        'c_loss': f"{loss_dict['contrast_loss'].item():.4f}",
+                        'cons_loss': f"{loss_dict['consistency_loss'].item():.4f}",
                         'lr': f"{current_lr:.6f}"
                     })
 
                     # 记录到TensorBoard
                     self.writer.add_scalar('train/loss', loss.item(), self.global_step)
-                    self.writer.add_scalar('train/contrast_loss', contrast_loss.item(), self.global_step)
+                    self.writer.add_scalar('train/contrast_loss', loss_dict['contrast_loss'].item(), self.global_step)
+                    self.writer.add_scalar('train/consistency_loss', loss_dict['consistency_loss'].item(),
+                                           self.global_step)
+                    self.writer.add_scalar('train/structure_loss', loss_dict['structure_loss'].item(), self.global_step)
                     self.writer.add_scalar('train/lr', current_lr, self.global_step)
 
                     # 记录梯度范数
@@ -549,23 +614,23 @@ class ProteinMultiModalTrainer:
                             self.writer.add_histogram(f'grad/graph_encoder.{name}', param.grad, self.global_step)
 
                     # 记录相似度矩阵
-                    if batch_idx % (self.config.LOG_INTERVAL * 10) == 0:
+                    if batch_idx % (self.config.LOG_INTERVAL * 10) == 0 and 'similarity' in loss_dict:
                         self.writer.add_figure(
                             'train/similarity_matrix',
-                            self._plot_similarity_matrix(similarity.detach().cpu().numpy()),
+                            self._plot_similarity_matrix(loss_dict['similarity'].cpu().numpy()),
                             self.global_step
                         )
 
-        # 关闭进度条
-        if self.is_master:
-            pbar.close()
+                # 关闭进度条
+                if self.is_master:
+                    pbar.close()
 
-        # 计算平均统计信息
-        for key in epoch_stats:
-            if key != 'batch_count':
-                epoch_stats[key] /= epoch_stats['batch_count']
+                # 计算平均统计信息
+                for key in epoch_stats:
+                    if key != 'batch_count':
+                        epoch_stats[key] /= epoch_stats['batch_count']
 
-        return epoch_stats
+                return epoch_stats
 
     def validate(self, val_loader):
         """
@@ -585,42 +650,34 @@ class ProteinMultiModalTrainer:
         val_stats = {
             'loss': 0.0,
             'contrast_loss': 0.0,
+            'consistency_loss': 0.0,
+            'structure_loss': 0.0,
             'batch_count': 0
         }
 
         # 验证循环
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", disable=not self.is_master):
+            for batch in tqdm(val_loader, desc="验证中", disable=not self.is_master):
                 # 将数据移到设备上
                 batch = batch.to(self.device)
 
                 # 获取图嵌入和序列嵌入
                 graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch)
 
-                # 替换验证集的损失计算 ▼
-                total_loss, loss_dict = self.protein_fusion_loss(
+                # 计算融合损失
+                loss, loss_dict = self.protein_fusion_loss(
                     graph_embedding,
                     seq_embedding,
                     graph_latent,
                     fused_embedding
                 )
 
-            # 更新统计信息 ▼
-            val_stats['loss'] += total_loss.item()
-            val_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
-            val_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
-            val_stats['structure_loss'] += loss_dict['structure_loss'].item()
-
-            # 计算对比损失
-            contrast_loss, _ = self.contrast_head(graph_latent, seq_embedding)
-
-            # 总损失
-            loss = contrast_loss
-
-            # 累积统计信息
-            val_stats['loss'] += loss.item()
-            val_stats['contrast_loss'] += contrast_loss.item()
-            val_stats['batch_count'] += 1
+                # 累积统计信息
+                val_stats['loss'] += loss.item()
+                val_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
+                val_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
+                val_stats['structure_loss'] += loss_dict['structure_loss'].item()
+                val_stats['batch_count'] += 1
 
         # 计算平均统计信息
         for key in val_stats:
@@ -648,6 +705,8 @@ class ProteinMultiModalTrainer:
         test_stats = {
             'loss': 0.0,
             'contrast_loss': 0.0,
+            'consistency_loss': 0.0,
+            'structure_loss': 0.0,
             'batch_count': 0,
             'embeddings': [],
             'sequences': []
@@ -655,7 +714,7 @@ class ProteinMultiModalTrainer:
 
         # 测试循环
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Testing", disable=not self.is_master):
+            for batch in tqdm(test_loader, desc="测试中", disable=not self.is_master):
                 # 将数据移到设备上
                 batch = batch.to(self.device)
 
@@ -666,11 +725,13 @@ class ProteinMultiModalTrainer:
                 graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch,
                                                                                                           sequences)
 
-                # 计算对比损失
-                contrast_loss, _ = self.contrast_head(graph_latent, seq_embedding)
-
-                # 总损失
-                loss = contrast_loss
+                # 计算融合损失
+                loss, loss_dict = self.protein_fusion_loss(
+                    graph_embedding,
+                    seq_embedding,
+                    graph_latent,
+                    fused_embedding
+                )
 
                 # 保存嵌入和序列（仅在主进程上）
                 if self.is_master:
@@ -684,19 +745,21 @@ class ProteinMultiModalTrainer:
 
                 # 累积统计信息
                 test_stats['loss'] += loss.item()
-                test_stats['contrast_loss'] += contrast_loss.item()
+                test_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
+                test_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
+                test_stats['structure_loss'] += loss_dict['structure_loss'].item()
                 test_stats['batch_count'] += 1
 
-                # 计算平均统计信息
-            for key in test_stats:
-                if key not in ['batch_count', 'embeddings', 'sequences']:
-                    test_stats[key] /= test_stats['batch_count']
+        # 计算平均统计信息
+        for key in test_stats:
+            if key not in ['batch_count', 'embeddings', 'sequences']:
+                test_stats[key] /= test_stats['batch_count']
 
-            # 可视化测试结果（仅在主进程上）
-            if self.is_master:
-                self._visualize_test_results(test_stats)
+        # 可视化测试结果（仅在主进程上）
+        if self.is_master:
+            self._visualize_test_results(test_stats)
 
-            return test_stats
+        return test_stats
 
     def _analyze_embedding_correlations(self, embeddings, sequences):
         """
@@ -939,7 +1002,7 @@ class ProteinMultiModalTrainer:
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
-            'best_val_loss': self.best_val_loss,
+            'best_validation_score': self.best_validation_score,  # 更新为组合验证分数
             'patience_counter': self.patience_counter,
             'metrics': metrics,
             'graph_encoder': self.graph_encoder.state_dict() if not self.config.USE_DISTRIBUTED else self.graph_encoder.module.state_dict(),
@@ -992,7 +1055,14 @@ class ProteinMultiModalTrainer:
         # 恢复训练状态
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
+
+        # 恢复新的验证分数
+        if 'best_validation_score' in checkpoint:
+            self.best_validation_score = checkpoint['best_validation_score']
+        else:
+            # 向后兼容：如果没有组合验证分数，则使用旧的验证损失
+            self.best_validation_score = checkpoint.get('best_val_loss', float('inf'))
+
         self.patience_counter = checkpoint['patience_counter']
 
         logger.info(f"成功加载检查点，恢复于 epoch {self.current_epoch}")
@@ -1045,6 +1115,10 @@ class ProteinMultiModalTrainer:
         if resume_from:
             metrics = self.load_checkpoint(resume_from)
 
+        # 初始化最佳验证指标
+        if not hasattr(self, 'best_validation_score'):
+            self.best_validation_score = float('inf')
+
         # 训练循环
         for epoch in range(self.current_epoch, self.config.EPOCHS):
             self.current_epoch = epoch
@@ -1063,11 +1137,15 @@ class ProteinMultiModalTrainer:
                 logger.info(f"Epoch {epoch + 1}/{self.config.EPOCHS} - "
                             f"训练损失: {train_stats['loss']:.4f}, "
                             f"对比损失: {train_stats['contrast_loss']:.4f}, "
+                            f"一致性损失: {train_stats['consistency_loss']:.4f}, "
+                            f"结构损失: {train_stats['structure_loss']:.4f}, "
                             f"用时: {train_time:.2f}秒")
 
                 # 记录训练指标到TensorBoard
                 self.writer.add_scalar('epoch/train_loss', train_stats['loss'], epoch)
                 self.writer.add_scalar('epoch/train_contrast_loss', train_stats['contrast_loss'], epoch)
+                self.writer.add_scalar('epoch/train_consistency_loss', train_stats['consistency_loss'], epoch)
+                self.writer.add_scalar('epoch/train_structure_loss', train_stats['structure_loss'], epoch)
                 self.writer.add_scalar('epoch/graph_latent_norm', train_stats['graph_latent_norm'], epoch)
                 self.writer.add_scalar('epoch/seq_emb_norm', train_stats['seq_emb_norm'], epoch)
 
@@ -1080,16 +1158,23 @@ class ProteinMultiModalTrainer:
                 if self.is_master:
                     logger.info(f"验证 - 损失: {val_stats['loss']:.4f}, "
                                 f"对比损失: {val_stats['contrast_loss']:.4f}, "
+                                f"一致性损失: {val_stats['consistency_loss']:.4f}, "
+                                f"结构损失: {val_stats['structure_loss']:.4f}, "
                                 f"用时: {val_time:.2f}秒")
 
                     # 记录验证指标到TensorBoard
                     self.writer.add_scalar('epoch/val_loss', val_stats['loss'], epoch)
                     self.writer.add_scalar('epoch/val_contrast_loss', val_stats['contrast_loss'], epoch)
+                    self.writer.add_scalar('epoch/val_consistency_loss', val_stats['consistency_loss'], epoch)
+                    self.writer.add_scalar('epoch/val_structure_loss', val_stats['structure_loss'], epoch)
 
-                # 早停
-                is_best = val_stats['loss'] < self.best_val_loss
+                # 更新早停策略：使用加权组合的验证指标
+                validation_score = val_stats['loss'] * 0.6 - val_stats['consistency_loss'] * 0.2 - val_stats[
+                    'structure_loss'] * 0.2
+                is_best = validation_score < self.best_validation_score
+
                 if is_best:
-                    self.best_val_loss = val_stats['loss']
+                    self.best_validation_score = validation_score
                     self.patience_counter = 0
                 else:
                     self.patience_counter += 1
@@ -1119,7 +1204,9 @@ class ProteinMultiModalTrainer:
 
             test_stats = self.test(test_loader)
             logger.info(f"测试 - 损失: {test_stats['loss']:.4f}, "
-                        f"对比损失: {test_stats['contrast_loss']:.4f}")
+                        f"对比损失: {test_stats['contrast_loss']:.4f}, "
+                        f"一致性损失: {test_stats['consistency_loss']:.4f}, "
+                        f"结构损失: {test_stats['structure_loss']:.4f}")
 
         # 导出模型
         self.export_model()
@@ -1140,13 +1227,34 @@ def setup_data_loaders(config):
     """
     from torch_geometric.data import InMemoryDataset
     from torch_geometric.loader import DataLoader
-
-    # 加载数据
+    import random
+    # 提取数据
     try:
         logger.info(f"从 {config.CACHE_DIR} 加载数据...")
         train_data = torch.load(config.TRAIN_CACHE)
         val_data = torch.load(config.VAL_CACHE)
         test_data = torch.load(config.TEST_CACHE)
+
+
+        use_subset = config.USE_SUBSET
+        if use_subset:
+            random.seed(42)  # 保证采样可复现
+            subset_ratio = config.SUBSET_RATIO
+
+            # 采样数据
+            train_size = max(int(len(train_data) * subset_ratio), 100)
+            val_size = max(int(len(val_data) * subset_ratio), 50)
+            test_size = max(int(len(test_data) * subset_ratio), 50)
+
+            train_indices = random.sample(range(len(train_data)), train_size)
+            val_indices = random.sample(range(len(val_data)), val_size)
+            test_indices = random.sample(range(len(test_data)), test_size)
+
+            train_data = [train_data[i] for i in train_indices]
+            val_data = [val_data[i] for i in val_indices]
+            test_data = [test_data[i] for i in test_indices]
+
+            logger.info(f"使用数据子集 - 采样比例: {subset_ratio}")
 
         logger.info(f"数据加载成功 - 训练: {len(train_data)}, 验证: {len(val_data)}, 测试: {len(test_data)}")
     except Exception as e:
@@ -1187,7 +1295,7 @@ def setup_data_loaders(config):
         val_sampler = None
         test_sampler = None
 
-        # 创建数据加载器
+    # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
