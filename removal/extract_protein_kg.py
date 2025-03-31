@@ -848,6 +848,7 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
     4. 使用numpy高性能操作
     5. 坐标标准化处理
     6. 边类型转为one-hot编码
+    7. 增强错误处理，快速跳过问题结构
 
     参数:
         structure: MDTraj结构对象
@@ -858,7 +859,7 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
         plddt_threshold: pLDDT置信度阈值
 
     返回:
-        NetworkX图对象，表示残基知识图谱
+        NetworkX图对象或None (遇到关键错误时直接返回None)
     """
     start_idx, end_idx, fragment_id = fragment_range
 
@@ -871,29 +872,29 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
         'edges_created': 0
     }
 
-    # 使用高效图数据结构
-    graph = nx.Graph()
-
     # 快速检查片段有效性
     if start_idx < 0 or end_idx > structure.n_residues or start_idx >= end_idx:
-        logger.error(f"无效片段范围: {start_idx}-{end_idx}, 蛋白质残基数: {structure.n_residues}")
-        return create_default_graph(start_idx, fragment_id)
+        logger.warning(f"无效片段范围: {start_idx}-{end_idx}, 蛋白质残基数: {structure.n_residues}，跳过")
+        return None
+
+    # 使用高效图数据结构
+    graph = nx.Graph()
 
     try:
         # 1. 一次性获取所有所需数据，减少重复计算
         # 提取pLDDT值
         try:
             plddt_values = extract_plddt_from_bfactor(structure)
-        except Exception:
-            plddt_values = np.full(structure.n_residues, 70.0)  # 默认值
+        except Exception as e:
+            return None
 
         # 获取CA原子坐标 (使用向量化操作)
         try:
             ca_indices = np.array([atom.index for atom in structure.topology.atoms if atom.name == 'CA'])
-            if len(ca_indices) > 0:
-                ca_coords = structure.xyz[0, ca_indices]
-            else:
-                ca_coords = np.zeros((structure.n_residues, 3))
+            if len(ca_indices) == 0:
+                return None
+
+            ca_coords = structure.xyz[0, ca_indices]
 
             # 处理坐标长度不匹配问题
             if len(ca_coords) != structure.n_residues:
@@ -905,15 +906,14 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                 else:
                     # 截断多余坐标
                     ca_coords = ca_coords[:structure.n_residues]
-        except Exception:
-            # 创建默认坐标
-            ca_coords = np.zeros((structure.n_residues, 3))
+        except Exception as e:
+            return None
 
-        # 计算溶剂可及性(如果可能)
+        # 计算溶剂可及性
         try:
             sasa_values = compute_solvent_accessibility(structure)[0]
-        except Exception:
-            sasa_values = np.full(structure.n_residues, 0.5)  # 默认值
+        except Exception as e:
+            return None
 
         # 2. 高效节点构建 - 预先计算所有有效残基
         valid_residues = []
@@ -923,17 +923,29 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
         residue_codes = []
 
         # 提取片段CA原子坐标并进行标准化
-        fragment_ca_coords = np.array([ca_coords[res_idx] for res_idx in range(start_idx, end_idx)
-                                       if res_idx < len(ca_coords)])
+        try:
+            fragment_ca_coords = np.array([ca_coords[res_idx] for res_idx in range(start_idx, end_idx)
+                                           if res_idx < len(ca_coords)])
+
+            if len(fragment_ca_coords) == 0:
+                logger.warning(f"片段范围内无有效坐标: {fragment_id}，跳过该图谱")
+                return None
+        except Exception as e:
+            logger.warning(f"片段坐标提取失败: {str(e)[:100]}，跳过该图谱")
+            return None
 
         # 执行坐标标准化（中心化和归一化）
-        if len(fragment_ca_coords) > 0:
-            normalized_coords = normalize_coordinates(fragment_ca_coords)
-            # 创建残基索引到标准化坐标的映射
-            normalized_coords_map = {}
-            for i, res_idx in enumerate(range(start_idx, min(end_idx, start_idx + len(normalized_coords)))):
-                if i < len(normalized_coords):
-                    normalized_coords_map[res_idx] = normalized_coords[i]
+        normalized_coords_map = {}
+        try:
+            if len(fragment_ca_coords) > 0:
+                normalized_coords = normalize_coordinates(fragment_ca_coords)
+                # 创建残基索引到标准化坐标的映射
+                for i, res_idx in enumerate(range(start_idx, min(end_idx, start_idx + len(normalized_coords)))):
+                    if i < len(normalized_coords):
+                        normalized_coords_map[res_idx] = normalized_coords[i]
+        except Exception as e:
+            logger.warning(f"坐标标准化失败: {str(e)[:100]}，跳过该图谱")
+            return None
 
         # 一次处理片段内的所有残基，使用NumPy操作代替循环
         for res_idx in range(start_idx, end_idx):
@@ -955,8 +967,7 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                 if res_idx in normalized_coords_map:
                     normalized_position = normalized_coords_map[res_idx].tolist()
                 else:
-                    # 如果没有标准化坐标，则使用零向量
-                    normalized_position = [0.0, 0.0, 0.0]
+                    return None
 
                 # 保存有效残基信息
                 valid_residues.append(res)
@@ -969,7 +980,7 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                 # 二级结构编码 (向量化)
                 try:
                     ss_code = ss_array[0, res_idx] if ss_array.ndim > 1 else ss_array[res_idx]
-                except IndexError:
+                except (IndexError, TypeError):
                     ss_code = 'C'  # 默认卷曲
 
                 ss_onehot = [0, 0, 0]
@@ -984,8 +995,11 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                     ss_type = 'C'
 
                 # 预计算BLOSUM编码和氨基酸属性
-                blosum = get_blosum62_encoding(one_letter)
-                props = AA_PROPERTIES[one_letter]
+                try:
+                    blosum = get_blosum62_encoding(one_letter)
+                    props = AA_PROPERTIES.get(one_letter, AA_PROPERTIES['X'])
+                except Exception as e:
+                    return None
 
                 # 获取溶剂可及性
                 sasa = sasa_values[res_idx] if res_idx < len(sasa_values) else 0.5
@@ -1017,148 +1031,229 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                 debug_stats['valid_nodes'] += 1
 
             except Exception as e:
-                logger.debug(f"处理残基 {res_idx} 时出错: {str(e)[:100]}")
+                logger.debug(f"处理残基 {res_idx} 时出错: {str(e)[:100]}，跳过此残基")
                 continue
 
+        # 检查有效节点数量
+        if graph.number_of_nodes() < 2:
+            logger.warning(f"有效节点数量过少 ({graph.number_of_nodes()}): {fragment_id}，跳过该图谱")
+            return None
+
         # 3. 批量添加序列边 (大幅提高性能)
-        seq_edges = []
-        for i in range(len(valid_indices) - 1):
-            node1 = node_ids[i]
-            node2 = node_ids[i + 1]
-            idx1 = valid_indices[i]
-            idx2 = valid_indices[i + 1]
+        try:
+            seq_edges = []
+            for i in range(len(valid_indices) - 1):
+                node1 = node_ids[i]
+                node2 = node_ids[i + 1]
+                idx1 = valid_indices[i]
+                idx2 = valid_indices[i + 1]
 
-            # 只连接序列相邻的残基
-            if idx2 == idx1 + 1:
-                # 计算距离 (使用预先存储的位置)
-                try:
-                    pos1 = np.array(node_positions[i])
-                    pos2 = np.array(node_positions[i + 1])
-                    dist = np.linalg.norm(pos2 - pos1)
-                except:
-                    dist = 0.5  # 标准化后的默认距离
+                # 只连接序列相邻的残基
+                if idx2 == idx1 + 1:
+                    # 计算距离 (使用预先存储的位置)
+                    try:
+                        pos1 = np.array(node_positions[i])
+                        pos2 = np.array(node_positions[i + 1])
+                        dist = np.linalg.norm(pos2 - pos1)
+                    except:
+                        dist = 0.5  # 标准化后的默认距离
 
-                # 添加到边列表 - 使用one-hot编码表示边类型
-                seq_edges.append((node1, node2, {
-                    'edge_type_onehot': [0, 1, 0, 0],  # 序列连接的one-hot编码
-                    'type_name': 'peptide',
-                    'distance': float(dist),
-                    'interaction_strength': 1.0,
-                    'direction': [1.0, 0.0]  # N->C方向
-                }))
+                    # 添加到边列表 - 使用one-hot编码表示边类型
+                    seq_edges.append((node1, node2, {
+                        'edge_type_onehot': [0, 1, 0, 0],  # 序列连接的one-hot编码
+                        'type_name': 'peptide',
+                        'distance': float(dist),
+                        'interaction_strength': 1.0,
+                        'direction': [1.0, 0.0]  # N->C方向
+                    }))
 
-                # 批量添加序列边
+            # 批量添加序列边
             if seq_edges:
                 graph.add_edges_from(seq_edges)
                 debug_stats['edges_created'] += len(seq_edges)
+        except Exception as e:
+            logger.warning(f"序列边创建失败: {str(e)[:100]}")
+            return None
 
-                # 4. 高效空间边构建 - 使用NumPy向量化操作替代循环
-                # 确保有足够节点构建KD树
-            if len(valid_indices) >= 2:
-                # 转换位置列表为NumPy数组，提高性能
+        # 4. 高效空间边构建 - 使用NumPy向量化操作替代循环
+        # 确保有足够节点构建KD树
+        if len(valid_indices) >= 2:
+            # 转换位置列表为NumPy数组，提高性能
+            try:
                 positions_array = np.array(node_positions)
+            except Exception as e:
+                logger.warning(f"位置数组转换失败: {str(e)[:100]}，跳过空间边构建")
+                # 如果序列边已经创建，则可以返回图谱，否则跳过
+                if debug_stats['edges_created'] > 0:
+                    return graph
+                else:
+                    return None
 
-                try:
-                    # 构建KD树 (避免重复计算)
-                    kd_tree = KDTree(positions_array)
+            try:
+                # 构建KD树 (避免重复计算)
+                kd_tree = KDTree(positions_array)
 
-                    # 高效查询k近邻 (一次性查询所有点)
-                    k = min(k_neighbors + 1, len(positions_array))
-                    distances, indices = kd_tree.query(positions_array, k=k)
+                # 高效查询k近邻 (一次性查询所有点)
+                k = min(k_neighbors + 1, len(positions_array))
+                distances, indices = kd_tree.query(positions_array, k=k)
 
-                    # 预分配边批次
-                    edge_batch = []
+                # 预分配边批次
+                edge_batch = []
 
-                    # 用NumPy操作批量处理边构建
-                    for i in range(len(valid_indices)):
-                        node_i = node_ids[i]
-                        res_i = valid_indices[i]
-                        res_code_i = residue_codes[i]
+                # 用NumPy操作批量处理边构建
+                for i in range(len(valid_indices)):
+                    node_i = node_ids[i]
+                    res_i = valid_indices[i]
+                    res_code_i = residue_codes[i]
 
-                        # 跳过第一个结果(自身)
-                        for j_idx, dist in zip(indices[i, 1:], distances[i, 1:]):
-                            # 仅处理有效范围内的邻居
-                            if j_idx >= len(node_ids) or dist > distance_threshold:
+                    # 跳过第一个结果(自身)
+                    for j_idx, dist in zip(indices[i, 1:], distances[i, 1:]):
+                        # 仅处理有效范围内的邻居
+                        if j_idx >= len(node_ids) or dist > distance_threshold:
+                            continue
+
+                        node_j = node_ids[j_idx]
+                        res_j = valid_indices[j_idx]
+
+                        # 跳过序列相邻残基
+                        if abs(res_j - res_i) <= 1:
+                            continue
+
+                        # 已有该边则跳过
+                        if graph.has_edge(node_i, node_j):
+                            continue
+
+                        # 获取氨基酸类型
+                        res_code_j = residue_codes[j_idx]
+
+                        # 使用classify_interaction分类相互作用，获取one-hot编码
+                        try:
+                            edge_type_onehot, type_name, interaction_strength = classify_interaction(
+                                res_code_i, res_code_j, float(dist))
+                        except Exception:
+                            return None
+
+                        # 高效计算方向向量
+                        try:
+                            pos_i = positions_array[i]
+                            pos_j = positions_array[j_idx]
+                            direction = pos_j - pos_i
+                            norm = np.linalg.norm(direction)
+
+                            if norm > 0:
+                                dir_vec_2d = (direction[:2] / norm).tolist()
+                            else:
+                                dir_vec_2d = [0.0, 0.0]
+                        except:
+                            return None
+
+                        # 添加边到批次
+                        edge_batch.append((node_i, node_j, {
+                            'edge_type_onehot': edge_type_onehot,  # 使用one-hot编码
+                            'type_name': type_name,
+                            'distance': float(dist),
+                            'interaction_strength': interaction_strength,
+                            'direction': dir_vec_2d
+                        }))
+
+                # 批量添加所有边 (一次性操作，大幅提高性能)
+                if edge_batch:
+                    graph.add_edges_from(edge_batch)
+                    debug_stats['edges_created'] += len(edge_batch)
+
+            except Exception as e:
+                logger.warning(f"KD树构建失败: {str(e)[:100]}, 尝试备用方案")
+
+                # 备用方案: 针对小图直接计算距离矩阵
+                if len(valid_indices) <= 100:  # 小图使用完全计算
+                    try:
+                        edge_batch = []
+                        positions_array = np.array(node_positions)
+
+                        # 计算完整距离矩阵 (向量化操作，避免嵌套循环)
+                        dist_matrix = np.zeros((len(positions_array), len(positions_array)))
+                        for i in range(len(positions_array)):
+                            # 计算当前点与所有其他点之间的距离 (一次性计算)
+                            diffs = positions_array - positions_array[i]
+                            dists = np.sqrt(np.sum(diffs ** 2, axis=1))
+                            dist_matrix[i] = dists
+
+                        # 筛选符合条件的边
+                        for i in range(len(valid_indices)):
+                            res_i = valid_indices[i]
+                            res_code_i = residue_codes[i]
+
+                            # 只处理距离在阈值内且非序列相邻的残基对
+                            for j in range(i + 1, len(valid_indices)):
+                                res_j = valid_indices[j]
+
+                                # 跳过序列相邻残基
+                                if abs(res_j - res_i) <= 1:
+                                    continue
+
+                                dist = dist_matrix[i, j]
+                                if dist <= distance_threshold:
+                                    res_code_j = residue_codes[j]
+
+                                    # 使用classify_interaction分类相互作用，获取one-hot编码
+                                    edge_type_onehot, type_name, interaction_strength = classify_interaction(
+                                        res_code_i, res_code_j, float(dist))
+
+                                    # 方向向量
+                                    try:
+                                        direction = positions_array[j] - positions_array[i]
+                                        norm = np.linalg.norm(direction)
+                                        dir_vec_2d = (direction[:2] / norm).tolist() if norm > 0 else [0.0, 0.0]
+                                    except:
+                                        dir_vec_2d = [0.0, 0.0]
+
+                                    # 添加边
+                                    edge_batch.append((node_ids[i], node_ids[j], {
+                                        'edge_type_onehot': edge_type_onehot,  # 使用one-hot编码
+                                        'type_name': type_name + "_backup",
+                                        'distance': float(dist),
+                                        'interaction_strength': interaction_strength,
+                                        'direction': dir_vec_2d
+                                    }))
+
+                        # 批量添加边
+                        if edge_batch:
+                            graph.add_edges_from(edge_batch)
+                            debug_stats['edges_created'] += len(edge_batch)
+                    except Exception as backup_e:
+                        logger.warning(f"备用方案也失败: {str(backup_e)[:100]}")
+
+                # 大图使用随机采样备用方案
+                else:
+                    try:
+                        edge_batch = []
+
+                        # 随机采样边 (避免O(n²)复杂度)
+                        max_samples = min(5000, len(valid_indices) * 10)  # 限制最大采样数
+                        for _ in range(max_samples):
+                            # 随机选择两个不同的节点
+                            i = random.randint(0, len(valid_indices) - 1)
+                            j = random.randint(0, len(valid_indices) - 1)
+
+                            if i == j:
                                 continue
 
-                            node_j = node_ids[j_idx]
-                            res_j = valid_indices[j_idx]
+                            node_i = node_ids[i]
+                            node_j = node_ids[j]
+                            res_i = valid_indices[i]
+                            res_j = valid_indices[j]
 
                             # 跳过序列相邻残基
                             if abs(res_j - res_i) <= 1:
                                 continue
 
-                            # 已有该边则跳过
-                            if graph.has_edge(node_i, node_j):
-                                continue
-
-                            # 获取氨基酸类型
-                            res_code_j = residue_codes[j_idx]
-
-                            # 使用classify_interaction分类相互作用，获取one-hot编码
-                            edge_type_onehot, type_name, interaction_strength = classify_interaction(
-                                res_code_i, res_code_j, float(dist))
-
-                            # 高效计算方向向量
+                            # 计算距离
                             try:
-                                pos_i = positions_array[i]
-                                pos_j = positions_array[j_idx]
-                                direction = pos_j - pos_i
-                                norm = np.linalg.norm(direction)
+                                dist = np.linalg.norm(np.array(node_positions[j]) - np.array(node_positions[i]))
 
-                                if norm > 0:
-                                    dir_vec_2d = (direction[:2] / norm).tolist()
-                                else:
-                                    dir_vec_2d = [0.0, 0.0]
-                            except:
-                                dir_vec_2d = [0.0, 0.0]
-
-                            # 添加边到批次
-                            edge_batch.append((node_i, node_j, {
-                                'edge_type_onehot': edge_type_onehot,  # 使用one-hot编码
-                                'type_name': type_name,
-                                'distance': float(dist),
-                                'interaction_strength': interaction_strength,
-                                'direction': dir_vec_2d
-                            }))
-
-                    # 批量添加所有边 (一次性操作，大幅提高性能)
-                    if edge_batch:
-                        graph.add_edges_from(edge_batch)
-                        debug_stats['edges_created'] += len(edge_batch)
-
-                except Exception as e:
-                    logger.warning(f"KD树构建失败: {str(e)[:100]}, 尝试备用方案")
-
-                    # 备用方案: 针对小图直接计算距离矩阵
-                    if len(valid_indices) <= 100:  # 小图使用完全计算
-                        try:
-                            edge_batch = []
-                            positions_array = np.array(node_positions)
-
-                            # 计算完整距离矩阵 (向量化操作，避免嵌套循环)
-                            dist_matrix = np.zeros((len(positions_array), len(positions_array)))
-                            for i in range(len(positions_array)):
-                                # 计算当前点与所有其他点之间的距离 (一次性计算)
-                                diffs = positions_array - positions_array[i]
-                                dists = np.sqrt(np.sum(diffs ** 2, axis=1))
-                                dist_matrix[i] = dists
-
-                            # 筛选符合条件的边
-                            for i in range(len(valid_indices)):
-                                res_i = valid_indices[i]
-                                res_code_i = residue_codes[i]
-
-                                # 只处理距离在阈值内且非序列相邻的残基对
-                                for j in range(i + 1, len(valid_indices)):
-                                    res_j = valid_indices[j]
-
-                                    # 跳过序列相邻残基
-                                    if abs(res_j - res_i) <= 1:
-                                        continue
-
-                                    dist = dist_matrix[i, j]
-                                    if dist <= distance_threshold:
+                                if dist <= distance_threshold:
+                                    if not graph.has_edge(node_i, node_j):
+                                        res_code_i = residue_codes[i]
                                         res_code_j = residue_codes[j]
 
                                         # 使用classify_interaction分类相互作用，获取one-hot编码
@@ -1166,120 +1261,56 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                                             res_code_i, res_code_j, float(dist))
 
                                         # 方向向量
-                                        try:
-                                            direction = positions_array[j] - positions_array[i]
-                                            norm = np.linalg.norm(direction)
-                                            dir_vec_2d = (direction[:2] / norm).tolist() if norm > 0 else [0.0, 0.0]
-                                        except:
-                                            dir_vec_2d = [0.0, 0.0]
+                                        direction = np.array(node_positions[j]) - np.array(node_positions[i])
+                                        norm = np.linalg.norm(direction)
+                                        dir_vec_2d = (direction[:2] / norm).tolist() if norm > 0 else [0.0, 0.0]
 
-                                        # 添加边
-                                        edge_batch.append((node_ids[i], node_ids[j], {
+                                        # 添加边到批次
+                                        edge_batch.append((node_i, node_j, {
                                             'edge_type_onehot': edge_type_onehot,  # 使用one-hot编码
-                                            'type_name': type_name + "_backup",
+                                            'type_name': type_name + "_random",
                                             'distance': float(dist),
                                             'interaction_strength': interaction_strength,
                                             'direction': dir_vec_2d
                                         }))
+                            except:
+                                continue
 
-                            # 批量添加边
-                            if edge_batch:
-                                graph.add_edges_from(edge_batch)
-                                debug_stats['edges_created'] += len(edge_batch)
-                        except Exception as backup_e:
-                            logger.warning(f"备用方案也失败: {str(backup_e)[:100]}")
+                        # 批量添加边
+                        if edge_batch:
+                            graph.add_edges_from(edge_batch)
+                            debug_stats['edges_created'] += len(edge_batch)
+                    except Exception as random_e:
+                        logger.warning(f"随机采样备用方案也失败: {str(random_e)[:100]}")
 
-                    # 大图使用随机采样备用方案
-                    else:
-                        try:
-                            edge_batch = []
+        # 5. 单节点图处理: 如果只有一个节点，添加自环
+        elif len(valid_indices) == 1:
+            node_id = node_ids[0]
+            graph.add_edge(node_id, node_id,
+                           edge_type_onehot=[1, 0, 0, 0],  # 空间类型的one-hot编码
+                           type_name='self_loop',
+                           distance=0.0,
+                           interaction_strength=1.0,
+                           direction=[0.0, 0.0])
+            debug_stats['edges_created'] += 1
 
-                            # 随机采样边 (避免O(n²)复杂度)
-                            max_samples = min(5000, len(valid_indices) * 10)  # 限制最大采样数
-                            for _ in range(max_samples):
-                                # 随机选择两个不同的节点
-                                i = random.randint(0, len(valid_indices) - 1)
-                                j = random.randint(0, len(valid_indices) - 1)
+        # 6. 空图处理: 创建默认节点和边
+        if graph.number_of_nodes() == 0:
+            return None
 
-                                if i == j:
-                                    continue
+        # 记录最终统计
+        debug_stats['edges_created'] = graph.number_of_edges()
+        debug_stats['valid_nodes'] = graph.number_of_nodes()
 
-                                node_i = node_ids[i]
-                                node_j = node_ids[j]
-                                res_i = valid_indices[i]
-                                res_j = valid_indices[j]
+        # 输出调试信息
+        logger.debug(f"图谱构建完成 - 片段ID: {fragment_id}, 节点: {debug_stats['valid_nodes']}, "
+                     f"边: {debug_stats['edges_created']}, 过滤残基: {debug_stats['filtered_by_plddt'] + debug_stats['filtered_by_nonstandard']}")
 
-                                # 跳过序列相邻残基
-                                if abs(res_j - res_i) <= 1:
-                                    continue
-
-                                # 计算距离
-                                try:
-                                    dist = np.linalg.norm(np.array(node_positions[j]) - np.array(node_positions[i]))
-
-                                    if dist <= distance_threshold:
-                                        if not graph.has_edge(node_i, node_j):
-                                            res_code_i = residue_codes[i]
-                                            res_code_j = residue_codes[j]
-
-                                            # 使用classify_interaction分类相互作用，获取one-hot编码
-                                            edge_type_onehot, type_name, interaction_strength = classify_interaction(
-                                                res_code_i, res_code_j, float(dist))
-
-                                            # 方向向量
-                                            direction = np.array(node_positions[j]) - np.array(node_positions[i])
-                                            norm = np.linalg.norm(direction)
-                                            dir_vec_2d = (direction[:2] / norm).tolist() if norm > 0 else [0.0, 0.0]
-
-                                            # 添加边到批次
-                                            edge_batch.append((node_i, node_j, {
-                                                'edge_type_onehot': edge_type_onehot,  # 使用one-hot编码
-                                                'type_name': type_name + "_random",
-                                                'distance': float(dist),
-                                                'interaction_strength': interaction_strength,
-                                                'direction': dir_vec_2d
-                                            }))
-                                except:
-                                    continue
-
-                            # 批量添加边
-                            if edge_batch:
-                                graph.add_edges_from(edge_batch)
-                                debug_stats['edges_created'] += len(edge_batch)
-                        except Exception as random_e:
-                            logger.warning(f"随机采样备用方案也失败: {str(random_e)[:100]}")
-
-                # 5. 单节点图处理: 如果只有一个节点，添加自环
-            elif len(valid_indices) == 1:
-                node_id = node_ids[0]
-                graph.add_edge(node_id, node_id,
-                               edge_type_onehot=[1, 0, 0, 0],  # 空间类型的one-hot编码
-                               type_name='self_loop',
-                               distance=0.0,
-                               interaction_strength=1.0,
-                               direction=[0.0, 0.0])
-                debug_stats['edges_created'] += 1
-
-                # 6. 空图处理: 创建默认节点和边
-            if graph.number_of_nodes() == 0:
-                # 创建最小图，确保有一个节点和自环边
-                default_graph = create_default_graph(start_idx, fragment_id)
-                return default_graph
-
-                # 记录最终统计
-            debug_stats['edges_created'] = graph.number_of_edges()
-            debug_stats['valid_nodes'] = graph.number_of_nodes()
-
-            # 输出调试信息
-            logger.debug(f"图谱构建完成 - 片段ID: {fragment_id}, 节点: {debug_stats['valid_nodes']}, "
-                         f"边: {debug_stats['edges_created']}, 过滤残基: {debug_stats['filtered_by_plddt'] + debug_stats['filtered_by_nonstandard']}")
-
-            return graph
-
+        return graph
     except Exception as e:
-        logger.error(f"构建残基图出错: {str(e)}")
-        logger.error(traceback.format_exc())
-        return create_default_graph(start_idx, fragment_id)
+        logger.error(f"构建图谱失败: {str(e)[:100]}, 尝试创建默认图谱")
+        # 构建失败时返回默认图谱
+        return None
 
 
 def classify_interaction(res_code_i, res_code_j, distance):
@@ -1397,7 +1428,8 @@ def process_structure_file(file_path, min_length=5, max_length=50, k_neighbors=8
         "protein_id": protein_id,
         "fragments": 0,
         "valid_residues": 0,
-        "edges": 0
+        "edges": 0,
+        "failed_fragments": 0
     }
 
     try:
@@ -1407,22 +1439,44 @@ def process_structure_file(file_path, min_length=5, max_length=50, k_neighbors=8
             logger.error(f"无法加载结构: {file_path}")
             return {}, {}, fragment_stats
 
-        # 2. 计算二级结构
-        ss_array = compute_secondary_structure(structure)
+        # 预先检查结构是否有效
+        if structure.n_residues <= 0 or structure.n_atoms <= 0:
+            logger.error(f"结构无效 (残基数: {structure.n_residues}, 原子数: {structure.n_atoms}): {file_path}")
+            return {}, {}, fragment_stats
 
-        # 3. 计算接触图
-        contact_map, residue_pairs = compute_contacts(structure)
+        # 2. 计算二级结构 - 使用异常处理
+        try:
+            ss_array = compute_secondary_structure(structure)
+        except Exception as e:
+            logger.warning(f"二级结构计算失败: {str(e)[:100]}，使用默认值")
+            ss_array = np.full((1, structure.n_residues), 'C')  # 默认全部为卷曲结构
 
-        # 4. 计算有效残基数量
+        # 3. 计算接触图 - 使用异常处理
+        try:
+            contact_map, residue_pairs = compute_contacts(structure)
+        except Exception as e:
+            logger.warning(f"接触图计算失败: {str(e)[:100]}，使用空列表")
+            contact_map, residue_pairs = [], []
+
+        # 4. 计算有效残基数量 - 使用向量化操作提高效率
         valid_residues = 0
-        for res_idx in range(structure.n_residues):
-            try:
-                res = structure.topology.residue(res_idx)
-                one_letter = three_to_one(res.name)
-                if one_letter != 'X':
-                    valid_residues += 1
-            except:
-                continue
+        try:
+            # 批量提取残基名称
+            residue_names = [res.name for res in structure.topology.residues]
+            # 批量转换为单字母代码
+            one_letters = [three_to_one(name) for name in residue_names]
+            # 计算有效残基数
+            valid_residues = sum(1 for aa in one_letters if aa != 'X')
+        except Exception as e:
+            logger.warning(f"有效残基计算失败: {str(e)[:100]}")
+            for res_idx in range(structure.n_residues):
+                try:
+                    res = structure.topology.residue(res_idx)
+                    one_letter = three_to_one(res.name)
+                    if one_letter != 'X':
+                        valid_residues += 1
+                except:
+                    continue
 
         fragment_stats["valid_residues"] = valid_residues
 
@@ -1431,54 +1485,95 @@ def process_structure_file(file_path, min_length=5, max_length=50, k_neighbors=8
             logger.info(f"结构 {protein_id} 残基数量 ({valid_residues}) 小于最小长度 {min_length}，跳过")
             return {}, {}, fragment_stats
 
-        # 6. 创建智能片段
-        fragments = create_intelligent_fragments(
-            structure, ss_array, contact_map, residue_pairs,
-            min_length, max_length, respect_ss, respect_domains
-        )
+        # 6. 创建智能片段 - 使用异常处理
+        try:
+            fragments = create_intelligent_fragments(
+                structure, ss_array, contact_map, residue_pairs,
+                min_length, max_length, respect_ss, respect_domains
+            )
+        except Exception as e:
+            logger.warning(f"智能片段创建失败: {str(e)[:100]}，使用简单分段")
+            # 回退到简单分段策略
+            fragments = []
+            for i in range(0, structure.n_residues, max(min_length, max_length // 2)):
+                end = min(i + max_length, structure.n_residues)
+                if end - i >= min_length:
+                    frag_id = f"{i + 1}-{end}"
+                    fragments.append((i, end, frag_id))
 
         fragment_stats["fragments"] = len(fragments)
+        successful_fragments = 0
 
-        # 7. 处理每个片段
+        # 7. 处理每个片段 - 改为容错模式
         for start_idx, end_idx, frag_id in fragments:
-            fragment_id = f"{protein_id}_{frag_id}"
+            try:
+                fragment_id = f"{protein_id}_{frag_id}"
 
-            # 提取序列
-            sequence = ""
-            for res_idx in range(start_idx, end_idx):
+                # 提取序列
+                sequence = ""
                 try:
-                    res = structure.topology.residue(res_idx)
-                    aa = three_to_one(res.name)
-                    if aa != "X":
-                        sequence += aa
-                except:
+                    for res_idx in range(start_idx, end_idx):
+                        try:
+                            res = structure.topology.residue(res_idx)
+                            aa = three_to_one(res.name)
+                            if aa != "X":
+                                sequence += aa
+                        except:
+                            continue
+                except Exception as e:
+                    logger.debug(f"序列提取失败 {fragment_id}: {str(e)[:100]}")
+                    continue  # 跳过此片段
+
+                # 如果序列太短，跳过
+                if len(sequence) < min_length:
+                    logger.debug(f"序列长度不足 {len(sequence)} < {min_length}: {fragment_id}")
                     continue
 
-            # 如果序列太短，跳过
-            if len(sequence) < min_length:
-                continue
+                # 保存片段信息
+                fragment_data = {
+                    "protein_id": protein_id,
+                    "fragment_id": frag_id,
+                    "sequence": sequence,
+                    "length": len(sequence),
+                    "start_idx": start_idx,
+                    "end_idx": end_idx
+                }
 
-            # 保存片段信息
-            extracted_fragments[fragment_id] = {
-                "protein_id": protein_id,
-                "fragment_id": frag_id,
-                "sequence": sequence,
-                "length": len(sequence),
-                "start_idx": start_idx,
-                "end_idx": end_idx
-            }
+                # 构建知识图谱 - 关键改动: 如果构建失败跳过此片段而不是整个蛋白质
+                try:
+                    kg = build_enhanced_residue_graph(
+                        structure, ss_array,
+                        (start_idx, end_idx, fragment_id),
+                        k_neighbors, distance_threshold, plddt_threshold
+                    )
 
-            # 构建知识图谱
-            kg = build_enhanced_residue_graph(
-                structure, ss_array,
-                (start_idx, end_idx, fragment_id),
-                k_neighbors, distance_threshold, plddt_threshold
-            )
+                    # 只保存非空图且节点数>=2的图
+                    if kg is not None and kg.number_of_nodes() >= 2:
+                        # 保存片段和图谱
+                        extracted_fragments[fragment_id] = fragment_data
+                        knowledge_graphs[fragment_id] = nx.node_link_data(kg, edges="links")
+                        fragment_stats["edges"] += kg.number_of_edges()
+                        successful_fragments += 1
+                    else:
+                        logger.debug(f"知识图谱无效或节点数量不足: {fragment_id}")
+                        fragment_stats["failed_fragments"] += 1
+                except Exception as e:
+                    logger.debug(f"构建知识图谱失败 {fragment_id}: {str(e)[:100]}")
+                    fragment_stats["failed_fragments"] += 1
+                    continue  # 跳过此片段但继续处理其他片段
+            except Exception as e:
+                logger.debug(f"片段处理失败 {frag_id}: {str(e)[:100]}")
+                fragment_stats["failed_fragments"] += 1
+                continue  # 继续处理下一个片段
 
-            # 只保存非空图
-            if kg.number_of_nodes() > 0:
-                fragment_stats["edges"] += kg.number_of_edges()
-                knowledge_graphs[fragment_id] = nx.node_link_data(kg, edges="links")
+        # 如果至少有一个片段成功，则返回结果
+        fragment_stats["successful_fragments"] = successful_fragments
+
+        # 内存管理 - 在返回前释放大对象
+        del structure
+        if 'ss_array' in locals(): del ss_array
+        if 'contact_map' in locals(): del contact_map
+        if 'residue_pairs' in locals(): del residue_pairs
 
         return extracted_fragments, knowledge_graphs, fragment_stats
 
@@ -1486,7 +1581,6 @@ def process_structure_file(file_path, min_length=5, max_length=50, k_neighbors=8
         logger.error(f"处理文件 {file_path} 时出错: {str(e)}")
         logger.error(traceback.format_exc())
         return {}, {}, fragment_stats
-
 
 def find_pdb_files(root_dir):
     """递归搜索所有PDB和CIF文件，并去重"""
@@ -1544,7 +1638,7 @@ def process_file_chunk(file_list, min_length=5, max_length=50, k_neighbors=8,
     return results
 
 def process_file_parallel(file_list, output_dir, min_length=5, max_length=50,
-                                 n_workers=None, batch_size=100000, memory_limit_gb=800,
+                                 n_workers=None, batch_size=50000, memory_limit_gb=800,
                                  k_neighbors=8, distance_threshold=8.0, plddt_threshold=70.0,
                                  respect_ss=True, respect_domains=True, format_type="pyg"):
     """
@@ -1553,7 +1647,7 @@ def process_file_parallel(file_list, output_dir, min_length=5, max_length=50,
     参数:
         file_list: 待处理文件列表
         output_dir: 输出目录
-        batch_size: 每批处理的文件数量 (默认: 100000，适合TB级内存)
+        batch_size: 每批处理的文件数量 (默认: 50000，适合TB级内存)
         memory_limit_gb: 内存使用上限(GB) (默认: 800GB，预留200GB系统使用)
         n_workers: 并行工作进程数 (默认: None, 使用CPU核心数-1)
     """
@@ -1688,14 +1782,14 @@ def process_file_parallel(file_list, output_dir, min_length=5, max_length=50,
             # 并行保存蛋白质数据
             protein_future = save_executor.submit(
                 save_results_chunked, batch_proteins, batch_output_dir,
-                base_name="protein_data", chunk_size=100000
+                base_name="protein_data", chunk_size=50000
             )
 
             # 并行保存图谱数据
             if batch_graphs:
                 graph_future = save_executor.submit(
                     save_knowledge_graphs, batch_graphs, batch_output_dir,
-                    base_name="protein_kg", chunk_size=100000, format_type=format_type
+                    base_name="protein_kg", chunk_size=50000, format_type=format_type
                 )
 
         # 等待保存完成
@@ -1998,8 +2092,8 @@ def main():
                         help="最小序列长度 (默认: 5)")
     parser.add_argument("--max_length", "-M", type=int, default=50,
                         help="最大序列长度 (默认: 50)")
-    parser.add_argument("--batch_size", "-b", type=int, default=100000,
-                        help="大规模批处理大小 (默认: 100000，适合TB级内存)")
+    parser.add_argument("--batch_size", "-b", type=int, default=50000,
+                        help="大规模批处理大小 (默认: 50000，适合TB级内存)")
     parser.add_argument("--memory_limit", type=int, default=800,
                         help="内存使用上限GB (默认: 800)")
     parser.add_argument("--workers", "-w", type=int, default=100,
