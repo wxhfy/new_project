@@ -552,15 +552,23 @@ def compute_ionic_interactions(structure, cutoff=0.4):
 
 
 def extract_plddt_from_bfactor(structure):
-    """从B因子中提取pLDDT值（适用于AlphaFold模型）"""
     try:
-        # 对每个残基，获取其B因子的平均值
-        # 在AlphaFold模型中，B因子被用来存储pLDDT值
+        # 正确获取B因子
         b_factors = []
+
+        # 尝试从结构直接获取B因子
+        has_b_factors = hasattr(structure, 'b_factors')
 
         for atom in structure.topology.atoms:
             res_idx = atom.residue.index
-            b_factor = structure.xyz[0, atom.index, 0]  # 仅使用第一个坐标作为索引
+
+            # 正确获取B因子
+            if has_b_factors:
+                b_factor = structure.b_factors[atom.index]
+            else:
+                # 如果没有B因子，可以使用默认值
+                b_factor = 70.0
+
             if len(b_factors) <= res_idx:
                 b_factors.extend([0] * (res_idx - len(b_factors) + 1))
             b_factors[res_idx] += b_factor / atom.residue.n_atoms
@@ -569,7 +577,6 @@ def extract_plddt_from_bfactor(structure):
     except Exception as e:
         logger.error(f"从B因子提取pLDDT失败: {str(e)}")
         return np.full(structure.n_residues, 70.0)  # 默认中等置信度
-
 
 # ======================= 蛋白质切割策略 =======================
 
@@ -777,7 +784,19 @@ def create_intelligent_fragments(structure, ss_array, contact_map, residue_pairs
 
 def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                                  k_neighbors=8, distance_threshold=8.0, plddt_threshold=70):
-    """构建残基级增强知识图谱，包含丰富的节点特征和边特征"""
+    """构建残基级增强知识图谱，包含丰富的节点特征和边特征
+
+    参数:
+        structure: MDTraj结构对象
+        ss_array: 二级结构数组
+        fragment_range: 片段范围元组 (start_idx, end_idx, fragment_id)
+        k_neighbors: K近邻数
+        distance_threshold: 空间邻接距离阈值（埃）
+        plddt_threshold: AlphaFold pLDDT质量得分阈值
+
+    返回:
+        NetworkX图对象
+    """
     start_idx, end_idx, fragment_id = fragment_range
     graph = nx.Graph()
 
@@ -786,149 +805,260 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
         logger.error(f"无效的片段范围: {start_idx}-{end_idx}，蛋白质残基数: {structure.n_residues}")
         return graph
 
+    # 调试统计信息初始化
+    debug_stats = {
+        'total_residues': end_idx - start_idx,
+        'filtered_by_plddt': 0,
+        'filtered_by_nonstandard': 0,
+        'valid_nodes': 0,
+        'edges_created': 0
+    }
+
     try:
         # 1. 计算所需的特征
-        # 溶剂可及性
-        sasa = compute_solvent_accessibility(structure)[0]
+        try:
+            # 溶剂可及性
+            sasa = compute_solvent_accessibility(structure)[0]
+        except Exception as e:
+            logger.warning(f"计算溶剂可及性失败: {str(e)}")
+            sasa = np.full(structure.n_residues, 0.5)  # 默认值
 
-        # 接触图和残基对
-        contact_map, residue_pairs = compute_contacts(structure)
+        try:
+            # 接触图和残基对
+            contact_map, residue_pairs = compute_contacts(structure)
+        except Exception as e:
+            logger.warning(f"计算接触图失败: {str(e)}")
+            contact_map, residue_pairs = [], []
 
-        # 氢键
-        hbonds = compute_hydrogen_bonds(structure)
+        try:
+            # 氢键
+            hbonds = compute_hydrogen_bonds(structure)
+        except Exception as e:
+            logger.warning(f"计算氢键失败: {str(e)}")
+            hbonds = []
 
-        # 疏水接触
-        hydrophobic_contacts = compute_hydrophobic_contacts(structure)
+        try:
+            # 疏水接触
+            hydrophobic_contacts = compute_hydrophobic_contacts(structure)
+        except Exception as e:
+            logger.warning(f"计算疏水接触失败: {str(e)}")
+            hydrophobic_contacts = []
 
-        # 离子相互作用
-        ionic_interactions = compute_ionic_interactions(structure)
+        try:
+            # 离子相互作用
+            ionic_interactions = compute_ionic_interactions(structure)
+        except Exception as e:
+            logger.warning(f"计算离子相互作用失败: {str(e)}")
+            ionic_interactions = []
 
-        # pLDDT值（如果可用，否则使用默认值）
-        plddt_values = extract_plddt_from_bfactor(structure)
+        # pLDDT值（修复的实现）
+        try:
+            plddt_values = extract_plddt_from_bfactor(structure)
+        except Exception as e:
+            logger.warning(f"提取pLDDT值失败，使用默认值: {str(e)}")
+            plddt_values = np.full(structure.n_residues, 70.0)  # 默认中等置信度
 
         # 2. 提取CA原子坐标用于后续操作
-        ca_indices = [atom.index for atom in structure.topology.atoms if atom.name == 'CA']
-        ca_coords = structure.xyz[0, ca_indices]  # 使用第一帧
+        ca_indices = []
+        ca_coords = []
 
-        # 确保坐标数量与残基数量匹配
-        if len(ca_coords) != structure.n_residues:
-            logger.warning(f"CA原子数量 ({len(ca_coords)}) 与残基数量 ({structure.n_residues}) 不匹配")
-            # 根据实际情况调整
-            ca_coords = ca_coords[:structure.n_residues] if len(ca_coords) > structure.n_residues else \
-                np.vstack([ca_coords, np.zeros((structure.n_residues - len(ca_coords), 3))])
+        try:
+            ca_indices = [atom.index for atom in structure.topology.atoms if atom.name == 'CA']
+            ca_coords = structure.xyz[0, ca_indices]  # 使用第一帧
+
+            # 确保坐标数量与残基数量匹配
+            if len(ca_coords) != structure.n_residues:
+                logger.warning(f"CA原子数量 ({len(ca_coords)}) 与残基数量 ({structure.n_residues}) 不匹配，进行调整")
+                # 如果CA原子数量小于残基数量，添加默认坐标
+                if len(ca_coords) < structure.n_residues:
+                    missing_count = structure.n_residues - len(ca_coords)
+                    # 使用已有坐标的平均值作为默认值，或[0,0,0]
+                    default_coord = np.mean(ca_coords, axis=0) if len(ca_coords) > 0 else np.zeros(3)
+                    default_coords = np.tile(default_coord, (missing_count, 1))
+                    ca_coords = np.vstack([ca_coords, default_coords])
+                # 如果CA原子数量大于残基数量，截取
+                else:
+                    ca_coords = ca_coords[:structure.n_residues]
+        except Exception as e:
+            logger.warning(f"提取CA原子坐标失败: {str(e)}")
+            # 创建默认坐标
+            ca_coords = np.zeros((structure.n_residues, 3))
 
         # 3. 添加节点（仅处理指定范围内的残基）
         for res_idx in range(start_idx, end_idx):
-            # 跳过pLDDT低于阈值的残基
-            if plddt_values[res_idx] < plddt_threshold:
-                continue
+            try:
+                # 跳过pLDDT低于阈值的残基
+                if res_idx < len(plddt_values) and plddt_values[res_idx] < plddt_threshold:
+                    debug_stats['filtered_by_plddt'] += 1
+                    continue
 
-            # 获取残基信息
-            res = structure.topology.residue(res_idx)
-            res_name = res.name
-            one_letter = three_to_one(res_name)
+                # 获取残基信息
+                res = structure.topology.residue(res_idx)
+                res_name = res.name
+                one_letter = three_to_one(res_name)
 
-            # 跳过非标准氨基酸
-            if one_letter == 'X':
-                continue
+                # 跳过非标准氨基酸
+                if one_letter == 'X':
+                    debug_stats['filtered_by_nonstandard'] += 1
+                    continue
 
-            # 计算节点特征
-            # BLOSUM62编码
-            blosum_encoding = get_blosum62_encoding(one_letter)
+                # 计算节点特征
+                # BLOSUM62编码
+                blosum_encoding = get_blosum62_encoding(one_letter)
 
-            # 相对空间坐标
-            ca_coord = ca_coords[res_idx].tolist() if res_idx < len(ca_coords) else [0, 0, 0]
+                # 相对空间坐标 - 安全获取
+                if res_idx < len(ca_coords):
+                    ca_coord = ca_coords[res_idx].tolist()
+                else:
+                    ca_coord = [0.0, 0.0, 0.0]  # 默认坐标
 
-            # 二级结构（确保使用一致的索引）
-            ss_code = ss_array[0, res_idx] if ss_array.ndim > 1 else ss_array[res_idx]
+                # 二级结构（确保使用一致的索引）
+                try:
+                    ss_code = ss_array[0, res_idx] if ss_array.ndim > 1 else ss_array[res_idx]
+                except IndexError:
+                    logger.warning(f"二级结构索引超出范围: {res_idx}，使用默认值")
+                    ss_code = 'C'  # 默认为卷曲
 
-            # 二级结构独热编码
-            ss_onehot = [0, 0, 0]  # [alpha, beta, coil/other]
-            if ss_code in ['H', 'G', 'I']:
-                ss_onehot[0] = 1  # alpha
-            elif ss_code in ['E', 'B']:
-                ss_onehot[1] = 1  # beta
-            else:
-                ss_onehot[2] = 1  # coil/other
+                # 二级结构独热编码
+                ss_onehot = [0, 0, 0]  # [alpha, beta, coil/other]
+                if ss_code in ['H', 'G', 'I']:
+                    ss_onehot[0] = 1  # alpha
+                elif ss_code in ['E', 'B']:
+                    ss_onehot[1] = 1  # beta
+                else:
+                    ss_onehot[2] = 1  # coil/other
 
-            # 添加节点属性
-            node_attrs = {
-                # 基本信息
-                'residue_name': res_name,
-                'residue_code': one_letter,
-                'residue_idx': res_idx,
-                'position': ca_coord,
-                'plddt': float(plddt_values[res_idx]),
+                # 安全获取溶剂可及性
+                sasa_value = float(sasa[res_idx]) if res_idx < len(sasa) else 0.5
 
-                # 氨基酸理化属性
-                'hydropathy': AA_PROPERTIES[one_letter]['hydropathy'],
-                'charge': AA_PROPERTIES[one_letter]['charge'],
-                'molecular_weight': AA_PROPERTIES[one_letter]['mw'],
-                'volume': AA_PROPERTIES[one_letter]['volume'],
-                'flexibility': AA_PROPERTIES[one_letter]['flexibility'],
-                'is_aromatic': AA_PROPERTIES[one_letter]['aromatic'],
+                # 添加节点属性
+                node_attrs = {
+                    # 基本信息
+                    'residue_name': res_name,
+                    'residue_code': one_letter,
+                    'residue_idx': res_idx,
+                    'position': ca_coord,
+                    'plddt': float(plddt_values[res_idx]) if res_idx < len(plddt_values) else 70.0,
 
-                # 结构信息
-                'secondary_structure': ss_code,
-                'ss_alpha': ss_onehot[0],
-                'ss_beta': ss_onehot[1],
-                'ss_coil': ss_onehot[2],
-                'sasa': float(sasa[res_idx]),
+                    # 氨基酸理化属性
+                    'hydropathy': AA_PROPERTIES[one_letter]['hydropathy'],
+                    'charge': AA_PROPERTIES[one_letter]['charge'],
+                    'molecular_weight': AA_PROPERTIES[one_letter]['mw'],
+                    'volume': AA_PROPERTIES[one_letter]['volume'],
+                    'flexibility': AA_PROPERTIES[one_letter]['flexibility'],
+                    'is_aromatic': AA_PROPERTIES[one_letter]['aromatic'],
 
-                # 高级特征
-                'blosum62': blosum_encoding,
-                'fragment_id': fragment_id
-            }
+                    # 结构信息
+                    'secondary_structure': ss_code,
+                    'ss_alpha': ss_onehot[0],
+                    'ss_beta': ss_onehot[1],
+                    'ss_coil': ss_onehot[2],
+                    'sasa': sasa_value,
 
-            # 添加节点
-            node_id = f"res_{res_idx}"
-            graph.add_node(node_id, **node_attrs)
+                    # 高级特征
+                    'blosum62': blosum_encoding,
+                    'fragment_id': fragment_id
+                }
+
+                # 添加节点
+                node_id = f"res_{res_idx}"
+                graph.add_node(node_id, **node_attrs)
+                debug_stats['valid_nodes'] += 1
+
+            except Exception as e:
+                logger.warning(f"处理残基 {res_idx} 时出错: {str(e)}")
+                continue  # 跳过这个残基，继续处理其他残基
 
         # 4. 添加序列连接边
         all_nodes = list(graph.nodes())
         for i in range(len(all_nodes) - 1):
-            node1 = all_nodes[i]
-            node2 = all_nodes[i + 1]
+            try:
+                node1 = all_nodes[i]
+                node2 = all_nodes[i + 1]
 
-            # 确保是序列上相邻的残基
-            res_idx1 = graph.nodes[node1]['residue_idx']
-            res_idx2 = graph.nodes[node2]['residue_idx']
+                # 确保是序列上相邻的残基
+                res_idx1 = graph.nodes[node1]['residue_idx']
+                res_idx2 = graph.nodes[node2]['residue_idx']
 
-            if res_idx2 == res_idx1 + 1:
-                # 计算CA原子间的实际距离
-                pos1 = graph.nodes[node1]['position']
-                pos2 = graph.nodes[node2]['position']
-                distance = float(np.sqrt(np.sum((np.array(pos1) - np.array(pos2)) ** 2)))
+                if res_idx2 == res_idx1 + 1:
+                    # 计算CA原子间的实际距离
+                    pos1 = graph.nodes[node1]['position']
+                    pos2 = graph.nodes[node2]['position']
 
-                # 序列相邻边 - 类型1
-                graph.add_edge(node1, node2,
-                               edge_type=1,
-                               type_name='peptide',
-                               distance=distance,
-                               interaction_strength=1.0,
-                               direction=[1.0, 0.0])  # N->C方向
+                    # 安全计算距离
+                    try:
+                        distance = float(np.sqrt(np.sum((np.array(pos1) - np.array(pos2)) ** 2)))
+                    except:
+                        distance = 3.8  # 默认CA-CA距离约为3.8埃
+
+                    # 序列相邻边 - 类型1
+                    graph.add_edge(node1, node2,
+                                   edge_type=1,
+                                   type_name='peptide',
+                                   distance=distance,
+                                   interaction_strength=1.0,
+                                   direction=[1.0, 0.0])  # N->C方向
+                    debug_stats['edges_created'] += 1
+            except Exception as e:
+                logger.warning(f"添加序列边时出错: {str(e)}")
+                continue
 
         # 5. 添加空间相互作用边
         # 构建KD树用于空间查询
         node_ids = list(graph.nodes())
-        node_positions = np.array([graph.nodes[n]['position'] for n in node_ids])
 
-        if len(node_positions) > 1:
+        # 初始化调试统计
+        if 'edges_created' not in debug_stats:
+            debug_stats['edges_created'] = 0
+
+        # 收集有效节点位置
+        node_positions = []
+        valid_node_ids = []
+
+        for node_id in node_ids:
+            pos = graph.nodes[node_id].get('position', None)
+            if isinstance(pos, list) and len(pos) == 3:  # 确保是有效的3D坐标
+                node_positions.append(pos)
+                valid_node_ids.append(node_id)
+
+        # 检查是否有足够的节点构建空间关系
+        if len(valid_node_ids) < 2:
+            # 处理节点不足的情况
+            logger.info(f"节点数量不足({len(valid_node_ids)})，无法构建空间边，跳过KD树构建")
+
+            # 如果只有一个节点，添加自环边确保图的连通性
+            if len(valid_node_ids) == 1:
+                node_id = valid_node_ids[0]
+                graph.add_edge(node_id, node_id,
+                               edge_type=0,
+                               type_name='self_loop',
+                               distance=0.0,
+                               interaction_strength=0.5,
+                               direction=[0.0, 0.0])
+                debug_stats['edges_created'] += 1
+                logger.info(f"为单节点图添加了自环边")
+        else:
+            # 有足够节点，继续构建KD树
             try:
+                node_positions = np.array(node_positions)
                 kd_tree = KDTree(node_positions)
 
                 # 查询k个最近邻
                 k = min(k_neighbors + 1, len(node_positions))
                 distances, indices = kd_tree.query(node_positions, k=k)
 
-                # 处理查询结果
-                for i, neighbors in enumerate(indices):
-                    node_i = node_ids[i]
-                    res_i = graph.nodes[node_i]['residue_idx']
+                # 添加空间边（跳过自身，所以从索引1开始）
+                edges_added = 0
+                edge_batch = []  # 批量添加边提高性能
 
-                    for j_idx, dist in zip(neighbors[1:], distances[i, 1:]):
-                        if j_idx < len(node_ids):  # 确保索引有效
-                            node_j = node_ids[j_idx]
+                for i, neighbors in enumerate(indices):
+                    node_i = valid_node_ids[i]
+                    res_i = graph.nodes[node_i]['residue_idx']
+                    res_code_i = graph.nodes[node_i].get('residue_code', 'X')
+
+                    for j_idx, dist in zip(neighbors[1:], distances[i, 1:]):  # 跳过第一个（自身）
+                        if j_idx < len(valid_node_ids):  # 确保索引有效
+                            node_j = valid_node_ids[j_idx]
                             res_j = graph.nodes[node_j]['residue_idx']
 
                             # 跳过序列相邻的残基（已添加序列边）
@@ -939,12 +1069,31 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                             if dist <= distance_threshold:
                                 # 检查是否已有边
                                 if not graph.has_edge(node_i, node_j):
-                                    # 确定相互作用类型和强度
-                                    is_hbond = any((res_i, res_j) in hbonds or (res_j, res_i) in hbonds)
-                                    is_hydrophobic = any((res_i, res_j) in hydrophobic_contacts or
-                                                         (res_j, res_i) in hydrophobic_contacts)
-                                    is_ionic = any((res_i, res_j) in ionic_interactions or
-                                                   (res_j, res_i) in ionic_interactions)
+                                    # 获取氨基酸类型
+                                    res_code_j = graph.nodes[node_j].get('residue_code', 'X')
+
+                                    # 确定相互作用类型
+                                    # 1. 检测氢键 - 根据氨基酸类型和距离启发式判断
+                                    is_hbond = False
+                                    hbond_donors = set('NQRKWST')
+                                    hbond_acceptors = set('DEQNSTYHW')
+                                    # 如果两个氨基酸中一个是供体一个是受体，且距离小于5.0Å
+                                    if ((res_code_i in hbond_donors and res_code_j in hbond_acceptors) or
+                                        (res_code_j in hbond_donors and res_code_i in hbond_acceptors)) and dist < 5.0:
+                                        is_hbond = True
+
+                                    # 2. 检测疏水相互作用 - 两个疏水氨基酸在距离阈值内
+                                    hydrophobic_aa = set('AVILMFYW')  # 疏水氨基酸
+                                    is_hydrophobic = (res_code_i in hydrophobic_aa and
+                                                      res_code_j in hydrophobic_aa and
+                                                      dist < 6.0)
+
+                                    # 3. 检测离子相互作用 - 带正电荷和负电荷的氨基酸对
+                                    positive_aa = set('KRH')  # 正电荷
+                                    negative_aa = set('DE')  # 负电荷
+                                    is_ionic = ((res_code_i in positive_aa and res_code_j in negative_aa) or
+                                                (
+                                                            res_code_j in positive_aa and res_code_i in negative_aa)) and dist < 6.0
 
                                     # 基本边类型：空间邻近 - 类型0
                                     edge_type = 0
@@ -966,32 +1115,230 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                                     else:
                                         interaction_strength = 0.3
 
-                                    # 计算方向向量
-                                    pos_i = np.array(graph.nodes[node_i]['position'])
-                                    pos_j = np.array(graph.nodes[node_j]['position'])
-                                    direction_vector = pos_j - pos_i
-                                    norm = np.linalg.norm(direction_vector)
+                                    # 获取坐标并安全计算方向向量
+                                    try:
+                                        pos_i = np.array(graph.nodes[node_i]['position'])
+                                        pos_j = np.array(graph.nodes[node_j]['position'])
+                                        direction_vector = pos_j - pos_i
+                                        norm = np.linalg.norm(direction_vector)
 
-                                    if norm > 0:
-                                        direction_vector = direction_vector / norm
-                                    else:
-                                        direction_vector = np.array([0, 0])
+                                        if norm > 0:
+                                            direction_vector = direction_vector / norm
+                                            # 安全获取前两维度
+                                            dir_vec_2d = direction_vector[:2].tolist()
+                                        else:
+                                            dir_vec_2d = [0.0, 0.0]
+                                    except Exception as e:
+                                        logger.debug(f"方向向量计算失败: {str(e)}")
+                                        dir_vec_2d = [0.0, 0.0]
 
-                                    # 添加边
-                                    graph.add_edge(node_i, node_j,
-                                                   edge_type=edge_type,
-                                                   type_name=type_name,
-                                                   distance=float(dist),
-                                                   interaction_strength=interaction_strength,
-                                                   direction=direction_vector[:2].tolist())
+                                    # 添加到边批次
+                                    edge_batch.append((node_i, node_j, {
+                                        'edge_type': edge_type,
+                                        'type_name': type_name,
+                                        'distance': float(dist),
+                                        'interaction_strength': interaction_strength,
+                                        'direction': dir_vec_2d
+                                    }))
+
+                                    edges_added += 1
+
+                # 批量添加边以提高性能
+                if edge_batch:
+                    graph.add_edges_from(edge_batch)
+                    debug_stats['edges_created'] += len(edge_batch)
+
+                logger.info(f"KD树空间边构建成功，添加了 {edges_added} 条空间边")
 
             except Exception as e:
-                logger.warning(f"空间边构建失败: {str(e)}")
+                logger.warning(f"构建KD树或添加空间边时出错: {str(e)}")
+                logger.info("尝试添加完全连接边作为备用")
+
+                # 添加完全连接边作为备用方案 - 优化版，使用批处理
+                try:
+                    edge_batch = []
+                    edges_added = 0
+
+                    for i, node_i in enumerate(valid_node_ids):
+                        res_i = graph.nodes[node_i].get('residue_idx', -1)
+                        pos_i = np.array(graph.nodes[node_i].get('position', [0, 0, 0]))
+                        res_code_i = graph.nodes[node_i].get('residue_code', 'X')
+
+                        for j, node_j in enumerate(valid_node_ids[i + 1:], i + 1):
+                            if j >= len(valid_node_ids):
+                                continue
+
+                            res_j = graph.nodes[node_j].get('residue_idx', -1)
+
+                            # 跳过序列相邻的残基（已添加序列边）
+                            if abs(res_j - res_i) <= 1:
+                                continue
+
+                            # 计算欧氏距离
+                            try:
+                                pos_j = np.array(graph.nodes[node_j].get('position', [0, 0, 0]))
+                                dist = np.linalg.norm(pos_j - pos_i)
+
+                                # 只添加在阈值内的边
+                                if dist <= distance_threshold:
+                                    res_code_j = graph.nodes[node_j].get('residue_code', 'X')
+
+                                    # 简化版相互作用判断
+                                    # 1. 氢键
+                                    hbond_donors = set('NQRKWST')
+                                    hbond_acceptors = set('DEQNSTYHW')
+                                    is_hbond = ((res_code_i in hbond_donors and res_code_j in hbond_acceptors) or
+                                                (
+                                                            res_code_j in hbond_donors and res_code_i in hbond_acceptors)) and dist < 5.0
+
+                                    # 2. 疏水作用
+                                    hydrophobic_aa = set('AVILMFYW')
+                                    is_hydrophobic = (res_code_i in hydrophobic_aa and
+                                                      res_code_j in hydrophobic_aa and
+                                                      dist < 6.0)
+
+                                    # 3. 离子作用
+                                    positive_aa = set('KRH')
+                                    negative_aa = set('DE')
+                                    is_ionic = ((res_code_i in positive_aa and res_code_j in negative_aa) or
+                                                (
+                                                            res_code_j in positive_aa and res_code_i in negative_aa)) and dist < 6.0
+
+                                    # 确定边类型
+                                    edge_type = 0  # 默认空间
+                                    type_name = 'spatial_backup'
+                                    interaction_strength = 0.3
+
+                                    if is_hbond:
+                                        edge_type = 2
+                                        type_name = 'hbond_backup'
+                                        interaction_strength = 0.8
+                                    elif is_ionic:
+                                        edge_type = 3
+                                        type_name = 'ionic_backup'
+                                        interaction_strength = 0.7
+                                    elif is_hydrophobic:
+                                        edge_type = 4
+                                        type_name = 'hydrophobic_backup'
+                                        interaction_strength = 0.5
+
+                                    # 简化方向向量计算
+                                    direction_vector = pos_j - pos_i
+                                    norm = np.linalg.norm(direction_vector)
+                                    if norm > 0:
+                                        dir_vec_2d = direction_vector[:2] / norm
+                                        dir_vec_2d = dir_vec_2d.tolist()
+                                    else:
+                                        dir_vec_2d = [0.0, 0.0]
+
+                                    # 添加到边批次
+                                    edge_batch.append((node_i, node_j, {
+                                        'edge_type': edge_type,
+                                        'type_name': type_name,
+                                        'distance': float(dist),
+                                        'interaction_strength': interaction_strength,
+                                        'direction': dir_vec_2d
+                                    }))
+
+                                    edges_added += 1
+                            except Exception as inner_e:
+                                logger.debug(f"计算边失败: {str(inner_e)}")
+                                continue
+
+                    # 批量添加边
+                    if edge_batch:
+                        graph.add_edges_from(edge_batch)
+                        debug_stats['edges_created'] += edges_added
+                        logger.info(f"备用边构建完成，添加了 {edges_added} 条边")
+                    else:
+                        logger.warning("无法添加任何备用边")
+
+                        # 如果图中有节点但没有边，添加自环确保连通性
+                        if len(valid_node_ids) > 0:
+                            for node_id in valid_node_ids:
+                                graph.add_edge(node_id, node_id,
+                                               edge_type=0,
+                                               type_name='self_loop_backup',
+                                               distance=0.0,
+                                               interaction_strength=0.5,
+                                               direction=[0.0, 0.0])
+                            logger.info(f"为 {len(valid_node_ids)} 个节点添加了自环")
+                            debug_stats['edges_created'] += len(valid_node_ids)
+
+                except Exception as backup_error:
+                    logger.error(f"备用方案也失败: {str(backup_error)}")
+                    logger.error(traceback.format_exc())
+
+        # 添加到debug_stats
+        debug_stats['edges_created'] = graph.number_of_edges()
+
+        # 6. 如果图为空，添加默认节点和自环边
+        if graph.number_of_nodes() == 0:
+            logger.info(f"片段 {fragment_id} 没有有效节点，添加默认节点")
+            # 添加默认节点
+            node_attrs = {
+                'residue_name': 'ALA',
+                'residue_code': 'A',
+                'residue_idx': start_idx,
+                'position': [0.0, 0.0, 0.0],
+                                'plddt': 70.0,
+                'hydropathy': 1.8,
+                'charge': 0,
+                'molecular_weight': 89.09,
+                'volume': 88.6,
+                'flexibility': 0.36,
+                'is_aromatic': False,
+                'secondary_structure': 'C',
+                'ss_alpha': 0,
+                'ss_beta': 0,
+                'ss_coil': 1,
+                'blosum62': [0] * 20,  # 空BLOSUM编码
+                'fragment_id': fragment_id
+            }
+
+            # 添加默认节点
+            default_node_id = f"res_default"
+            graph.add_node(default_node_id, **node_attrs)
+            debug_stats['valid_nodes'] += 1
+
+            # 添加自环边确保图的连通性
+            graph.add_edge(default_node_id, default_node_id,
+                          edge_type=0,
+                          type_name='self',
+                          distance=0.0,
+                          interaction_strength=1.0,
+                          direction=[0.0, 0.0])
+            debug_stats['edges_created'] += 1
+
 
         return graph
+
     except Exception as e:
         logger.error(f"构建残基图时出错: {str(e)}")
         logger.error(traceback.format_exc())
+
+        # 返回空图或最小图
+        if graph.number_of_nodes() == 0:
+            # 创建最小图，确保有一个节点和自环边
+            min_node_id = f"res_min"
+            graph.add_node(min_node_id,
+                          residue_name='GLY',
+                          residue_code='G',
+                          residue_idx=start_idx,
+                          position=[0.0, 0.0, 0.0],
+                          plddt=70.0,
+                          secondary_structure='C',
+                          fragment_id=fragment_id)
+
+            graph.add_edge(min_node_id, min_node_id,
+                          edge_type=0,
+                          type_name='error_recovery',
+                          distance=0.0,
+                          interaction_strength=0.5,
+                          direction=[0.0, 0.0])
+
+            logger.info(f"片段 {fragment_id} 图构建失败，创建了最小恢复图")
+
         return graph
 
 
@@ -1124,208 +1471,213 @@ def find_pdb_files(root_dir):
     return pdb_files
 
 
-def process_file_parallel(file_path, min_length=5, max_length=50, k_neighbors=8,
-                          distance_threshold=8.0, plddt_threshold=70.0, respect_ss=True, respect_domains=True):
-    """并行处理单个文件的函数"""
-    try:
-        start_time = time.time()
 
-        # 处理文件
-        proteins, kg, fragment_stats = process_structure_file(
-            file_path, min_length, max_length, k_neighbors,
-            distance_threshold, plddt_threshold, respect_ss, respect_domains
-        )
+def process_file_chunk(file_list, min_length=5, max_length=50, k_neighbors=8,
+                       distance_threshold=8.0, plddt_threshold=70.0,
+                       respect_ss=True, respect_domains=True):
+    """优化的文件块处理函数 - 一次处理多个文件，减少进程创建开销"""
+    results = []
 
-        elapsed = time.time() - start_time
-        file_name = os.path.basename(file_path)
+    for file_path in file_list:
+        try:
+            start_time = time.time()
+            # 处理文件
+            proteins, kg, fragment_stats = process_structure_file(
+                file_path, min_length, max_length, k_neighbors,
+                distance_threshold, plddt_threshold, respect_ss, respect_domains
+            )
 
-        # 结果统计
-        fragment_count = len(proteins)
-        kg_count = len(kg)
+            elapsed = time.time() - start_time
+            result_info = {
+                "file_path": file_path,
+                "elapsed": elapsed,
+                "fragment_count": len(proteins),
+                "kg_count": len(kg),
+                "success": True
+            }
+            results.append((result_info, proteins, kg, fragment_stats))
+        except Exception as e:
+            error_info = {"error": str(e), "file_path": file_path}
+            results.append((error_info, {}, {}, None))
 
-        result_info = {
-            "file_path": file_path,
-            "elapsed": elapsed,
-            "fragment_count": fragment_count,
-            "kg_count": kg_count,
-            "success": True
-        }
-        return result_info, proteins, kg, fragment_stats
-    except Exception as e:
-        logger.error(f"处理文件失败: {file_path} - {str(e)}")
-        logger.error(traceback.format_exc())
-        return {"error": str(e), "file_path": file_path}, {}, {}, None
+    return results
 
+def process_file_parallel(file_list, output_dir, min_length=5, max_length=50,
+                                 n_workers=None, batch_size=50000, memory_limit_gb=800,
+                                 k_neighbors=8, distance_threshold=8.0, plddt_threshold=70.0,
+                                 respect_ss=True, respect_domains=True, format_type="pyg"):
+    """
+    高性能蛋白质结构批处理系统 - 适用于TB级内存和百核处理器
 
-def process_file_batch_parallel(file_list, output_dir, min_length=5, max_length=50, n_workers=None,
-                                k_neighbors=8, distance_threshold=8.0, plddt_threshold=70.0,
-                                respect_ss=True, respect_domains=True, format_type="pyg"):
-    """并行处理多个文件，每batch_size个文件保存一次结果"""
+    参数:
+        file_list: 待处理文件列表
+        output_dir: 输出目录
+        batch_size: 每批处理的文件数量 (默认: 50000，适合TB级内存)
+        memory_limit_gb: 内存使用上限(GB) (默认: 800GB，预留200GB系统使用)
+        n_workers: 并行工作进程数 (默认: None, 使用CPU核心数-1)
+    """
     if n_workers is None:
         n_workers = max(1, multiprocessing.cpu_count() - 1)
 
-    logger.info(f"使用 {n_workers} 个CPU核心并行处理...")
-    logger.info(f"处理参数: 最小长度={min_length}, 最大长度={max_length}, "
-                f"k近邻={k_neighbors}, 距离阈值={distance_threshold}埃, "
-                f"pLDDT阈值={plddt_threshold}, 结构划分方式: 基于二级结构={respect_ss}, 基于结构域={respect_domains}")
+    # 为大规模处理创建更高效的目录结构
+    base_data_dir = os.path.join(output_dir, "ALL")
+    temp_dir = os.path.join(output_dir, "TEMP")
+    os.makedirs(base_data_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
-    # 创建ALL子文件夹用于存储中间结果
-    all_data_dir = os.path.join(output_dir, "ALL")
-    os.makedirs(all_data_dir, exist_ok=True)
+    # 预计算总处理批次
+    total_files = len(file_list)
+    total_batches = (total_files + batch_size - 1) // batch_size
+    logger.info(f"总文件数: {total_files}, 划分为 {total_batches} 批次处理，每批次 {batch_size} 文件")
+    logger.info(f"使用 {n_workers} 个CPU核心并行处理 (共112核)")
+    logger.info(f"内存限制设置为 {memory_limit_gb}GB (总内存约1TB)")
 
-    # 将日志文件保存在输出目录中
+    # 日志文件初始化
     sequences_log_path = os.path.join(output_dir, "sequences.log")
     fragments_log_path = os.path.join(output_dir, "fragments_stats.log")
     processing_log_path = os.path.join(output_dir, "processing.log")
 
-    all_proteins = {}
-    all_knowledge_graphs = {}
-    all_fragment_stats = []
-    stats = defaultdict(int)
-    batch_size = 1000
+    # 划分批次
+    batches = [file_list[i:i + batch_size] for i in range(0, total_files, batch_size)]
 
-    # 初始化统计数据键
-    stats["processed_files"] = 0
-    stats["extracted_fragments"] = 0
-    stats["knowledge_graphs"] = 0
-    stats["failed_files"] = 0
-    stats["total_edges"] = 0
+    # 全局统计
+    global_stats = {
+        "processed_files": 0,
+        "extracted_fragments": 0,
+        "knowledge_graphs": 0,
+        "failed_files": 0,
+        "total_edges": 0
+    }
 
-    # 初始化文件计数器和批次ID
-    file_counter = 0
-    batch_id = 1
-
+    # 初始化日志文件
     with open(sequences_log_path, 'w', buffering=1) as s_log:
         s_log.write("fragment_id,protein_id,length,sequence\n")
-
     with open(fragments_log_path, 'w') as f_log:
         f_log.write("file_name,protein_id,valid_residues,fragments,edges\n")
-
     with open(processing_log_path, 'w') as p_log:
         p_log.write("timestamp,file_path,status,elapsed,fragments,knowledge_graphs,error\n")
 
-    # 使用进程池进行并行处理
-    with tqdm(total=len(file_list), desc="处理结构文件") as pbar:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = [
-                executor.submit(
-                    process_file_parallel, file_path, min_length, max_length,
-                    k_neighbors, distance_threshold, plddt_threshold, respect_ss, respect_domains
-                ) for file_path in file_list
-            ]
+    # 处理每个批次
+    for batch_id, batch_files in enumerate(batches):
+        logger.info(f"开始处理批次 {batch_id + 1}/{len(batches)} ({len(batch_files)} 文件)")
+        batch_output_dir = os.path.join(base_data_dir, f"batch_{batch_id + 1}")
+        os.makedirs(batch_output_dir, exist_ok=True)
 
-            for future in concurrent.futures.as_completed(futures):
-                result, proteins, kg, fragment_stats = future.result()
-                pbar.update(1)
+        # 批次级缓存
+        batch_proteins = {}
+        batch_graphs = {}
 
-                file_counter += 1
+        # 每批处理开始前，确保内存充足
+        check_memory_usage(threshold_gb=memory_limit_gb, force_gc=True)
 
-                if "error" in result:
-                    stats["failed_files"] += 1
-                    logger.error(f"处理文件失败: {result['file_path']} - {result['error']}")
-                    # 记录失败日志
-                    with open(processing_log_path, 'a') as p_log:
-                        p_log.write(
-                            f"{time.strftime('%Y-%m-%d %H:%M:%S')},{result['file_path']},FAILED,0,0,0,{result['error']}\n")
-                    continue
+        # 使用优化的进程池和共享内存处理单个批次
+        with tqdm(total=len(batch_files), desc=f"批次 {batch_id + 1} 处理进度") as pbar:
+            # 采用更高效的并行策略 - 使用更大的任务块，减少进程间通信
+            chunk_size = max(1, len(batch_files) // (n_workers * 4))  # 动态计算分块大小
 
-                # 更新统计数据
-                stats["processed_files"] += 1
-                stats["extracted_fragments"] += len(proteins)
-                stats["knowledge_graphs"] += len(kg)
-                if fragment_stats:
-                    stats["total_edges"] += fragment_stats.get('edges', 0)
-
-                # 记录处理日志
-                with open(processing_log_path, 'a') as p_log:
-                    elapsed = result.get('elapsed', 0)
-                    status = "SUCCESS" if "success" in result and result["success"] else "FAILED"
-                    error = result.get('error', '')
-                    p_log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{result['file_path']},{status},"
-                                f"{elapsed:.2f},{len(proteins)},{len(kg)},{error}\n")
-
-                # 记录片段统计
-                if fragment_stats:
-                    all_fragment_stats.append(fragment_stats)
-                    with open(fragments_log_path, 'a') as f_log:
-                        f_log.write(f"{fragment_stats['file_name']},{fragment_stats['protein_id']},"
-                                    f"{fragment_stats.get('valid_residues', 0)},{fragment_stats.get('fragments', 0)},"
-                                    f"{fragment_stats.get('edges', 0)}\n")
-
-                # 更新序列日志
-                with open(sequences_log_path, 'a', buffering=1) as s_log:
-                    for fragment_id, data in proteins.items():
-                        s_log.write(
-                            f"{fragment_id},{data['protein_id']},{len(data['sequence'])},{data['sequence']}\n")
-
-                # 累积数据
-                all_proteins.update(proteins)
-                all_knowledge_graphs.update(kg)
-
-                # 每处理指定数量文件保存一次中间结果
-                if file_counter % batch_size == 0:
-                    logger.info(f"已处理 {file_counter}/{len(file_list)} 个文件，保存当前批次结果...")
-
-                    batch_output_dir = os.path.join(all_data_dir, f"batch_{batch_id}")
-                    os.makedirs(batch_output_dir, exist_ok=True)
-
-                    # 保存蛋白质数据
-                    save_results_chunked(
-                        all_proteins, batch_output_dir,
-                        base_name="protein_data",
-                        chunk_size=batch_size
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    mp_context=multiprocessing.get_context('spawn')  # 更稳定的进程创建方式
+            ) as executor:
+                futures = []
+                for i in range(0, len(batch_files), chunk_size):
+                    chunk_files = batch_files[i:i + chunk_size]
+                    future = executor.submit(
+                        process_file_chunk, chunk_files, min_length, max_length,
+                        k_neighbors, distance_threshold, plddt_threshold, respect_ss, respect_domains
                     )
+                    futures.append(future)
 
-                    # 保存知识图谱
-                    if all_knowledge_graphs:
-                        save_knowledge_graphs(
-                            all_knowledge_graphs, batch_output_dir,
-                            base_name="protein_kg",
-                            chunk_size=batch_size,
-                            format_type=format_type
-                        )
+                # 收集结果，更新进度条
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        results = future.result()
+                        for result, proteins, kg, fragment_stats in results:
+                            pbar.update(1)
 
-                    # 重置集合并增加批次ID
-                    all_proteins = {}
-                    all_knowledge_graphs = {}
-                    batch_id += 1
+                            if "error" in result:
+                                global_stats["failed_files"] += 1
+                                with open(processing_log_path, 'a') as p_log:
+                                    p_log.write(
+                                        f"{time.strftime('%Y-%m-%d %H:%M:%S')},{result['file_path']},FAILED,0,0,0,{result['error']}\n")
+                                continue
 
-                    # 执行垃圾回收
-                    check_memory_usage(force_gc=True)
+                            # 更新统计信息
+                            global_stats["processed_files"] += 1
+                            global_stats["extracted_fragments"] += len(proteins)
+                            global_stats["knowledge_graphs"] += len(kg)
 
-                    # 更新统计信息
-                    logger.info(f"当前处理统计: 成功={stats['processed_files']}, 失败={stats['failed_files']}, "
-                                f"片段={stats['extracted_fragments']}, 知识图谱={stats['knowledge_graphs']}")
+                            if fragment_stats:
+                                global_stats["total_edges"] += fragment_stats.get('edges', 0)
 
-    # 保存最后一批数据
-    if all_proteins:
-        logger.info(f"保存最后一批结果 (剩余 {len(all_proteins)} 个蛋白质片段)...")
+                                # 记录片段统计
+                                with open(fragments_log_path, 'a') as f_log:
+                                    f_log.write(f"{fragment_stats['file_name']},{fragment_stats['protein_id']},"
+                                                f"{fragment_stats.get('valid_residues', 0)},"
+                                                f"{fragment_stats.get('fragments', 0)},"
+                                                f"{fragment_stats.get('edges', 0)}\n")
 
-        final_batch_dir = os.path.join(all_data_dir, f"batch_{batch_id}")
-        os.makedirs(final_batch_dir, exist_ok=True)
+                            # 更新序列日志
+                            with open(sequences_log_path, 'a', buffering=1) as s_log:
+                                for fragment_id, data in proteins.items():
+                                    s_log.write(f"{fragment_id},{data['protein_id']},"
+                                                f"{len(data['sequence'])},{data['sequence']}\n")
 
-        # 保存蛋白质数据
-        save_results_chunked(
-            all_proteins, final_batch_dir,
-            base_name="protein_data",
-            chunk_size=batch_size
-        )
+                            # 累积数据
+                            batch_proteins.update(proteins)
+                            batch_graphs.update(kg)
 
-        # 保存知识图谱
-        if all_knowledge_graphs:
-            save_knowledge_graphs(
-                all_knowledge_graphs, final_batch_dir,
-                base_name="protein_kg",
-                chunk_size=batch_size,
-                format_type=format_type
+                            # 记录处理日志
+                            with open(processing_log_path, 'a') as p_log:
+                                elapsed = result.get('elapsed', 0)
+                                p_log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},"
+                                            f"{result['file_path']},SUCCESS,{elapsed:.2f},"
+                                            f"{len(proteins)},{len(kg)},\n")
+                    except Exception as e:
+                        logger.error(f"处理批次时出错: {str(e)}")
+                        logger.error(traceback.format_exc())
+
+        # 保存批次结果
+        logger.info(
+            f"批次 {batch_id + 1} 处理完成，保存 {len(batch_proteins)} 个蛋白质片段和 {len(batch_graphs)} 个图谱")
+
+        # 优化保存过程 - 使用多线程并行保存
+        save_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as save_executor:
+            # 并行保存蛋白质数据
+            protein_future = save_executor.submit(
+                save_results_chunked, batch_proteins, batch_output_dir,
+                base_name="protein_data", chunk_size=10000
             )
 
-    logger.info(f"片段统计数据已写入: {fragments_log_path}")
-    logger.info(f"处理日志已写入: {processing_log_path}")
-    logger.info(f"序列信息已写入: {sequences_log_path}")
-    logger.info(f"创建的片段总数: {stats['extracted_fragments']}")
+            # 并行保存图谱数据
+            if batch_graphs:
+                graph_future = save_executor.submit(
+                    save_knowledge_graphs, batch_graphs, batch_output_dir,
+                    base_name="protein_kg", chunk_size=10000, format_type=format_type
+                )
 
-    return stats, all_data_dir
+        # 等待保存完成
+        protein_future.result()
+        if batch_graphs:
+            graph_future.result()
+
+        logger.info(f"批次 {batch_id + 1} 数据保存完成，耗时 {time.time() - save_start:.2f} 秒")
+
+        # 清理此批次数据并执行垃圾回收
+        batch_proteins.clear()
+        batch_graphs.clear()
+        check_memory_usage(force_gc=True)
+
+        # 当前进度报告
+        logger.info(f"当前总体进度: {global_stats['processed_files']}/{total_files} 文件 "
+                    f"({global_stats['processed_files'] / total_files * 100:.1f}%), "
+                    f"提取片段数: {global_stats['extracted_fragments']}, "
+                    f"知识图谱数: {global_stats['knowledge_graphs']}, "
+                    f"边总数: {global_stats['total_edges']}")
+
+    # 处理完成，返回统计信息
+    return global_stats, base_data_dir
 
 
 def save_results_chunked(all_proteins, output_dir, base_name="protein_data", chunk_size=10000):
@@ -1598,19 +1950,21 @@ def save_knowledge_graphs(kg_data, output_dir, base_name="protein_kg", chunk_siz
 # ======================= 主程序和命令行接口 =======================
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description="从PDB/CIF文件中提取蛋白质结构数据并构建知识图谱（MDTraj增强版）")
+    """优化的主函数 - 支持大规模处理"""
+    parser = argparse.ArgumentParser(description="大规模蛋白质结构数据处理与知识图谱构建系统")
     parser.add_argument("input", help="输入PDB/CIF文件或包含这些文件的目录")
-    parser.add_argument("--output_dir", "-o", default="./kg",
-                        help="输出目录 (默认: ./kg)")
+    parser.add_argument("--output_dir", "-o", default="./kg_large",
+                        help="输出目录 (默认: ./kg_large)")
     parser.add_argument("--min_length", "-m", type=int, default=5,
                         help="最小序列长度 (默认: 5)")
     parser.add_argument("--max_length", "-M", type=int, default=50,
                         help="最大序列长度 (默认: 50)")
-    parser.add_argument("--batch_size", "-b", type=int, default=10000,
-                        help="保存批次大小 (默认: 10000)")
-    parser.add_argument("--workers", "-w", type=int,
-                        help="并行工作进程数 (默认: CPU核心数-1)")
+    parser.add_argument("--batch_size", "-b", type=int, default=50000,
+                        help="大规模批处理大小 (默认: 50000，适合TB级内存)")
+    parser.add_argument("--memory_limit", type=int, default=800,
+                        help="内存使用上限GB (默认: 800)")
+    parser.add_argument("--workers", "-w", type=int, default=100,
+                        help="并行工作进程数 (默认: 100，适合112核CPU)")
     parser.add_argument("--k_neighbors", type=int, default=8,
                         help="空间邻接的K近邻数 (默认: 8)")
     parser.add_argument("--distance_threshold", type=float, default=8.0,
@@ -1632,13 +1986,17 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 设置日志
-    global logger  # 使用全局logger变量
+    global logger
     logger, log_file_path = setup_logging(args.output_dir)
     logger.info(f"日志将写入文件: {log_file_path}")
+    logger.info(f"大规模处理模式: 使用最大 {args.memory_limit}GB 内存和 {args.workers} 个CPU核心")
 
     # 查找输入文件
     if os.path.isdir(args.input):
+        start_time = time.time()
+        logger.info(f"开始扫描目录: {args.input}")
         pdb_files = find_pdb_files(args.input)
+        logger.info(f"扫描完成，耗时: {time.time() - start_time:.1f}秒，找到 {len(pdb_files)} 个PDB/CIF文件")
     else:
         pdb_files = [args.input] if os.path.isfile(args.input) else []
 
@@ -1651,14 +2009,17 @@ def main():
         return
 
     logger.info(f"开始处理 {len(pdb_files)} 个PDB/CIF文件...")
+    start_proc_time = time.time()
 
-    # 处理文件 - 返回统计信息和中间数据目录
-    stats, all_data_dir = process_file_batch_parallel(
+    # 使用大规模处理函数
+    stats, all_data_dir = process_file_parallel(
         pdb_files,
         args.output_dir,
         min_length=args.min_length,
         max_length=args.max_length,
         n_workers=args.workers,
+        batch_size=args.batch_size,
+        memory_limit_gb=args.memory_limit,
         k_neighbors=args.k_neighbors,
         distance_threshold=args.distance_threshold,
         plddt_threshold=args.plddt_threshold,
@@ -1667,8 +2028,14 @@ def main():
         format_type=args.format
     )
 
+    total_time = time.time() - start_proc_time
+    avg_time_per_file = total_time / (stats['processed_files'] + 0.001)
+
     # 处理结果统计
     logger.info("\n处理完成:")
+    logger.info(f"- 总耗时: {total_time / 3600:.2f}小时 ({total_time:.1f}秒)")
+    logger.info(f"- 平均每文件: {avg_time_per_file:.3f}秒")
+    logger.info(f"- 处理速度: {stats['processed_files'] / total_time:.1f}文件/秒")
     logger.info(f"- 处理的文件总数: {stats['processed_files']}")
     logger.info(f"- 提取的蛋白质片段总数: {stats['extracted_fragments']}")
     logger.info(f"- 生成的知识图谱总数: {stats['knowledge_graphs']}")
@@ -1682,6 +2049,9 @@ def main():
     with open(summary_file, 'w') as f:
         summary = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "execution_time_seconds": total_time,
+            "execution_time_hours": total_time / 3600,
+            "files_per_second": stats['processed_files'] / total_time,
             "processed_files": stats['processed_files'],
             "failed_files": stats.get('failed_files', 0),
             "extracted_fragments": stats['extracted_fragments'],
@@ -1695,7 +2065,10 @@ def main():
                 "plddt_threshold": args.plddt_threshold,
                 "respect_ss": args.respect_ss,
                 "respect_domains": args.respect_domains,
-                "format": args.format
+                "format": args.format,
+                "batch_size": args.batch_size,
+                "workers": args.workers,
+                "memory_limit_gb": args.memory_limit
             },
             "output_dir": os.path.abspath(args.output_dir),
             "all_data_dir": os.path.abspath(all_data_dir)
@@ -1703,8 +2076,7 @@ def main():
         json.dump(summary, f, indent=2)
 
     logger.info(f"摘要信息已保存到: {summary_file}")
-    logger.info("蛋白质结构提取与知识图谱构建流程完成！")
-
+    logger.info("大规模蛋白质结构提取与知识图谱构建流程完成！")
 
 if __name__ == "__main__":
     main()
