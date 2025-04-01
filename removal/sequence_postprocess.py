@@ -27,7 +27,7 @@ import random
 import sys
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 import psutil
@@ -35,6 +35,7 @@ import torch
 from datasketch import MinHash, MinHashLSH
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 from tqdm import tqdm
@@ -691,150 +692,384 @@ def parallel_generate_amp_features(sequences, num_workers=32, batch_size=5000):
     return all_features
 
 
-def amp_optimized_clustering(sequences, features, n_clusters=None,
-                             sample_ratio=0.6, num_workers=32, output_dir=None):
+def amp_optimized_clustering(sequences, features, select_features=None, feature_weights=None,
+                             n_clusters=None, sample_ratio=0.6, diversity_ratio=0.7,
+                             num_workers=32, output_dir=None, pca_vis=False):
     """
-    针对AMPs优化的聚类算法，使用MiniBatchKMeans进行聚类
+    针对AMPs优化的聚类算法，使用特征选择和优化的多样性采样
 
     参数:
         sequences: 序列字典 {id: {'sequence': seq}}
         features: 序列特征字典 {id: 特征字典}
+        select_features: 用于聚类的特征列表，例如 ['charge', 'hydrophobicity', 'amphipathicity']
+                        如果为None，则使用所有特征
+        feature_weights: 特征权重字典 {特征名: 权重}，用于强调特定特征的重要性
         n_clusters: 簇的数量，如果为None则自动估计
         sample_ratio: 从每个簇中采样的比例
+        diversity_ratio: 多样性样本与中心样本的比例 (0-1)，越高越多样
         num_workers: 并行工作进程数
         output_dir: 输出目录，用于保存可视化结果
+        pca_vis: 是否生成PCA可视化图
 
     返回:
-        保留的序列ID列表
+        保留的序列ID列表和聚类结果统计
     """
     if len(sequences) < 5:
         logger.warning(f"序列数量过少 ({len(sequences)}个)，跳过聚类")
-        return list(sequences.keys())
+        return list(sequences.keys()), {"clusters": 0, "selected": len(sequences)}
 
     logger.info(f"开始进行针对AMPs优化的聚类分析 (序列数量: {len(sequences)})...")
     start_time = time.time()
+
+    # 定义AMPs功能相关特征及其默认权重
+    amp_key_features = {
+        'charge': 2.0,  # 电荷 - 抗菌活性关键因素
+        'hydrophobicity': 1.5,  # 疏水性 - 影响膜结合
+        'amphipathicity': 1.8,  # 两亲性 - 影响膜渗透
+        'helix_propensity': 1.2,  # 螺旋倾向 - 结构特征
+        'flex': 0.8,  # 柔性 - 结构适应性
+        'mw': 0.5,  # 分子量 - 物理特性
+        'length': 1.0,  # 长度 - 基本特征
+        'net_charge': 1.5,  # 净电荷 - 电荷分布
+        'isoelectric': 0.7,  # 等电点 - 电荷特性
+        'aromaticity': 0.6,  # 芳香性 - 结构稳定性
+        'instability': 0.4,  # 不稳定性指数
+        'boman': 1.0,  # Boman指数 - 蛋白质相互作用
+        'hydrophobic_moment': 1.3  # 疏水矩 - 两亲性关键指标
+    }
+
+    # 使用用户提供的特征选择，否则使用所有可用特征
+    if select_features is not None:
+        used_features = [f for f in select_features if f in amp_key_features]
+        if not used_features:
+            logger.warning(f"提供的特征选择无效，将使用所有有效特征")
+            used_features = list(amp_key_features.keys())
+    else:
+        used_features = list(amp_key_features.keys())
+
+    # 合并用户提供的权重
+    weights = amp_key_features.copy()
+    if feature_weights:
+        for feature, weight in feature_weights.items():
+            if feature in weights:
+                weights[feature] = weight
+
+    # 记录使用的特征
+    logger.info(f"选择的特征维度 ({len(used_features)}): {', '.join(used_features)}")
+    logger.info(f"特征权重配置: {', '.join([f'{f}:{weights[f]:.1f}' for f in used_features])}")
 
     # 转换特征为向量表示
     logger.info("将AMPs特征转换为向量...")
     seq_ids = []
     feature_vectors = []
+    feature_names = []  # 记录特征名称，用于后续分析
 
-    for seq_id, feature_dict in tqdm(features.items(), desc="创建特征向量"):
-        if seq_id in sequences:
-            seq_ids.append(seq_id)
-            feature_vectors.append(create_amp_feature_vector(feature_dict))
+    # 搜集所有可用特征名称
+    all_feature_keys = set()
+    for feature_dict in features.values():
+        all_feature_keys.update(feature_dict.keys())
+
+    # 过滤出我们要使用的特征
+    valid_features = [f for f in used_features if f in all_feature_keys]
+    if not valid_features:
+        logger.warning("没有找到有效的特征，将使用所有数值型特征")
+        # 备选方案：使用所有数值型特征
+        for seq_id, feature_dict in features.items():
+            if seq_id in sequences:
+                vector = []
+                names = []
+                for key, value in feature_dict.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        vector.append(value)
+                        names.append(key)
+                if vector:
+                    seq_ids.append(seq_id)
+                    feature_vectors.append(vector)
+                    if not feature_names and names:
+                        feature_names = names
+    else:
+        # 使用指定的特征
+        for seq_id, feature_dict in tqdm(features.items(), desc="创建特征向量"):
+            if seq_id in sequences:
+                vector = []
+                for feature in valid_features:
+                    if feature in feature_dict and isinstance(feature_dict[feature], (int, float)):
+                        # 应用特征权重
+                        value = feature_dict[feature] * weights.get(feature, 1.0)
+                        vector.append(value)
+                    else:
+                        vector.append(0.0)  # 缺失特征填充为0
+
+                if len(vector) == len(valid_features):  # 确保向量维度一致
+                    seq_ids.append(seq_id)
+                    feature_vectors.append(vector)
+
+        feature_names = valid_features
 
     if not feature_vectors:
         logger.warning("没有有效的特征向量，无法进行聚类")
-        return list(sequences.keys())
+        return list(sequences.keys()), {"clusters": 0, "selected": len(sequences), "features_used": []}
 
     # 转换为numpy数组并标准化
     X = np.array(feature_vectors)
-    X = StandardScaler().fit_transform(X)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    logger.info(f"特征向量形状: {X.shape}")
+    logger.info(f"最终特征向量形状: {X.shape}, 特征名: {feature_names}")
+
+    # 特征相关性分析
+    if X.shape[0] > 5 and X.shape[1] > 1:
+        logger.info("计算特征相关性矩阵...")
+        corr_matrix = np.corrcoef(X_scaled.T)
+        high_corr_pairs = []
+        for i in range(len(feature_names)):
+            for j in range(i + 1, len(feature_names)):
+                if abs(corr_matrix[i, j]) > 0.8:  # 高相关阈值
+                    high_corr_pairs.append((feature_names[i], feature_names[j], corr_matrix[i, j]))
+
+        if high_corr_pairs:
+            logger.info("发现高相关特征对:")
+            for f1, f2, corr in high_corr_pairs:
+                logger.info(f"  - {f1} 和 {f2}: {corr:.3f}")
 
     # 自动确定簇的数量
     if n_clusters is None:
-        n_clusters = max(3, int(np.sqrt(len(sequences)) / 2))
-        logger.info(f"自动确定簇数: {n_clusters}")
+        # 使用轮廓系数寻找最优簇数
+        range_clusters = range(2, min(20, int(np.sqrt(len(sequences)) / 2) + 1))
+        silhouette_scores = []
+
+        logger.info("自动评估最佳簇数...")
+        for n in range_clusters:
+            # 为了效率，在小样本上评估
+            sample_size = min(5000, X_scaled.shape[0])
+            if X_scaled.shape[0] > sample_size:
+                indices = np.random.choice(X_scaled.shape[0], sample_size, replace=False)
+                X_sample = X_scaled[indices]
+            else:
+                X_sample = X_scaled
+
+            kmeans = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=min(1024, X_sample.shape[0]))
+            cluster_labels = kmeans.fit_predict(X_sample)
+
+            if len(np.unique(cluster_labels)) <= 1:
+                continue
+
+            score = silhouette_score(X_sample, cluster_labels)
+            silhouette_scores.append((n, score))
+
+        if silhouette_scores:
+            # 选择轮廓系数最高的簇数
+            n_clusters = max(silhouette_scores, key=lambda x: x[1])[0]
+            logger.info(f"基于轮廓系数选择的最佳簇数: {n_clusters}")
+        else:
+            n_clusters = max(3, int(np.sqrt(len(sequences)) / 2))
+            logger.info(f"未能确定最佳簇数，使用默认公式: {n_clusters}")
 
     # 使用MiniBatchKMeans进行聚类
     logger.info(f"使用MiniBatchKMeans进行聚类，簇数 = {n_clusters}...")
-    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=min(1024, len(X)))
-    labels = kmeans.fit_predict(X)
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=min(1024, X_scaled.shape[0]))
+    labels = kmeans.fit_predict(X_scaled)
 
     # 统计每个簇的样本数
     unique_labels = np.unique(labels)
+    cluster_counts = Counter(labels)
     logger.info(f"聚类完成，共形成 {len(unique_labels)} 个簇")
 
     # 计算每个簇的大小并排序
-    cluster_sizes = []
-    for label in unique_labels:
-        count = np.sum(labels == label)
-        cluster_sizes.append((label, count))
-
-    # 按大小排序簇
+    cluster_sizes = [(label, count) for label, count in cluster_counts.items()]
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+
+    # 显示簇的分布情况
+    logger.info("簇分布情况:")
+    total_seqs = sum(count for _, count in cluster_sizes)
     for rank, (label, count) in enumerate(cluster_sizes[:10]):  # 只显示前10个最大的簇
-        logger.info(f"簇 {label} (排名 {rank + 1}): {count} 个序列")
+        percentage = count * 100 / total_seqs
+        logger.info(f"  簇 {label} (排名 {rank + 1}): {count} 个序列 ({percentage:.1f}%)")
+
+    # 计算特征重要性 - 使用簇中心间的方差
+    feature_importance = np.std(kmeans.cluster_centers_, axis=0)
+    feature_ranks = np.argsort(feature_importance)[::-1]  # 降序排序
+
+    logger.info("特征重要性排名:")
+    for i, idx in enumerate(feature_ranks[:min(5, len(feature_names))]):
+        if idx < len(feature_names):
+            importance = feature_importance[idx]
+            logger.info(f"  {i + 1}. {feature_names[idx]}: {importance:.4f}")
 
     # 从每个簇中选择代表性样本
     retained_ids = []
+    retained_info = {}  # 记录选择信息
 
     logger.info("从每个簇中选择代表性样本...")
     with tqdm(total=len(unique_labels), desc="处理簇") as pbar:
-        for label in unique_labels:
+        for cluster_idx, (label, cluster_size) in enumerate(cluster_sizes):
             # 获取当前簇的索引
             cluster_indices = np.where(labels == label)[0]
             cluster_seq_ids = [seq_ids[i] for i in cluster_indices]
 
-            # 计算簇的大小和采样数量
-            cluster_size = len(cluster_indices)
+            # 计算采样数量
             sample_count = max(1, int(cluster_size * sample_ratio))
 
             # 对于小簇，保留所有样本
             if cluster_size <= 5:
                 retained_ids.extend(cluster_seq_ids)
+                retained_info[f"cluster_{label}"] = {
+                    "size": cluster_size,
+                    "selected": cluster_size,
+                    "method": "all_kept"
+                }
                 pbar.update(1)
                 continue
 
+            # 获取簇的特征向量
+            cluster_vectors = X_scaled[cluster_indices]
+
             # 计算簇的中心
-            cluster_vectors = X[cluster_indices]
             cluster_center = np.mean(cluster_vectors, axis=0)
 
             # 计算到中心的距离
             distances_to_center = np.linalg.norm(cluster_vectors - cluster_center, axis=1)
 
-            # 先选择最接近中心的样本
-            center_samples = max(1, int(sample_count * 0.3))  # 30%的样本从中心选择
+            # 分配中心样本和多样性样本的数量
+            center_samples = max(1, int(sample_count * (1 - diversity_ratio)))
+            diverse_samples = sample_count - center_samples
+
+            # 选择最接近中心的样本
             center_indices = np.argsort(distances_to_center)[:center_samples]
+            center_ids = [cluster_seq_ids[i] for i in center_indices]
+            retained_ids.extend(center_ids)
 
-            # 从剩余样本中选择功能多样的样本
-            remaining_indices = np.setdiff1d(np.arange(cluster_size), center_indices)
-            remaining_vectors = cluster_vectors[remaining_indices]
-            remaining_seq_ids = [cluster_seq_ids[i] for i in remaining_indices]
+            # 如果还需要选择多样性样本
+            if diverse_samples > 0:
+                # 排除已选的中心样本
+                remaining_indices = np.setdiff1d(np.arange(len(cluster_indices)), center_indices)
 
-            # 分析剩余样本的功能多样性
-            if len(remaining_vectors) > 0 and len(remaining_indices) > 0:
-                # 提取关键AMPs功能维度(电荷、疏水性、两亲性等)
-                key_features = [1, 2, 3, 4]  # 疏水性、电荷、两亲性、螺旋倾向
+                if len(remaining_indices) > 0:
+                    remaining_local_indices = [cluster_indices[i] for i in remaining_indices]
+                    remaining_vectors = X_scaled[remaining_local_indices]
+                    remaining_seq_ids = [cluster_seq_ids[i] for i in remaining_indices]
 
-                # 计算多样性得分
-                diversity_scores = np.zeros(len(remaining_indices))
+                    # 使用最大化距离(MaxMin)策略选择多样性样本
+                    selected_diverse = []
+                    selected_indices = []
 
-                for f_idx in key_features:
-                    if f_idx < remaining_vectors.shape[1]:
-                        # 归一化特征值
-                        feature_values = remaining_vectors[:, f_idx]
-                        if np.std(feature_values) > 0:
-                            feature_values = (feature_values - np.mean(feature_values)) / np.std(feature_values)
+                    # 从已选的中心样本开始
+                    selected_vectors = X_scaled[[cluster_indices[i] for i in center_indices]]
 
-                        # 计算特征贡献分数 - 根据特征的绝对值大小排序
-                        feature_ranks = np.argsort(np.abs(feature_values))[::-1]  # 降序
-                        for rank, idx in enumerate(feature_ranks):
-                            # 反向排名作为得分
-                            diversity_scores[idx] += (len(feature_ranks) - rank)
+                    # 迭代选择最远的样本
+                    for _ in range(diverse_samples):
+                        if not remaining_vectors.size or not remaining_seq_ids:
+                            break
 
-                # 选择得分最高的样本
-                diverse_sample_count = sample_count - center_samples
-                if diverse_sample_count > 0:
-                    diverse_indices = np.argsort(diversity_scores)[::-1][:diverse_sample_count]
-                    for idx in diverse_indices:
-                        if idx < len(remaining_seq_ids):
-                            retained_ids.append(remaining_seq_ids[idx])
+                        # 计算每个剩余点到已选点集的最小距离
+                        min_distances = np.full(len(remaining_vectors), np.inf)
 
-            # 添加中心样本
-            for idx in center_indices:
-                retained_ids.append(cluster_seq_ids[idx])
+                        for i, vec in enumerate(remaining_vectors):
+                            # 计算到所有已选点的距离
+                            dists = np.linalg.norm(selected_vectors - vec, axis=1)
+                            # 取最小距离
+                            if dists.size > 0:
+                                min_distances[i] = np.min(dists)
+
+                        # 选择具有最大最小距离的点
+                        if min_distances.size > 0 and not np.all(np.isinf(min_distances)):
+                            best_idx = np.argmax(min_distances)
+                            selected_diverse.append(remaining_seq_ids[best_idx])
+                            selected_indices.append(best_idx)
+                            selected_vectors = np.vstack([selected_vectors, remaining_vectors[best_idx]])
+
+                            # 移除已选的点
+                            remaining_vectors = np.delete(remaining_vectors, best_idx, axis=0)
+                            remaining_seq_ids.pop(best_idx)
+                        else:
+                            break
+
+                    retained_ids.extend(selected_diverse)
+
+            # 记录选择结果
+            retained_info[f"cluster_{label}"] = {
+                "size": cluster_size,
+                "selected": center_samples + diverse_samples,
+                "center_samples": center_samples,
+                "diverse_samples": diverse_samples,
+                "method": "hybrid"
+            }
 
             pbar.update(1)
 
-    elapsed = time.time() - start_time
-    logger.info(f"AMPs优化聚类完成: 从 {len(sequences)} 个序列中选择了 {len(retained_ids)} 个代表性序列 "
-                f"({len(retained_ids) * 100 / len(sequences):.1f}%)，耗时: {elapsed / 60:.1f}分钟")
+    # 生成聚类可视化 (如果需要)
+    if pca_vis and output_dir:
+        try:
+            logger.info("生成PCA可视化...")
+            from sklearn.decomposition import PCA
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
 
-    return retained_ids
+            # 使用PCA降维到2D
+            pca = PCA(n_components=2)
+            X_pca = pca.fit_transform(X_scaled)
+
+            # 创建散点图
+            plt.figure(figsize=(12, 10))
+            colors = cm.rainbow(np.linspace(0, 1, len(unique_labels)))
+
+            # 绘制所有点
+            for label, color in zip(unique_labels, colors):
+                idx = np.where(labels == label)[0]
+                plt.scatter(X_pca[idx, 0], X_pca[idx, 1], c=[color], label=f'Cluster {label}',
+                            alpha=0.5, s=20, edgecolors='none')
+
+            # 标记所选样本
+            retained_indices = [i for i, seq_id in enumerate(seq_ids) if seq_id in retained_ids]
+            plt.scatter(X_pca[retained_indices, 0], X_pca[retained_indices, 1],
+                        marker='*', s=100, c='red', label='Selected')
+
+            # 添加图例与说明
+            plt.xlabel(f'PCA1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+            plt.ylabel(f'PCA2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+            plt.title(f'AMPs Clustering Result (n_clusters={n_clusters}, kept={len(retained_ids)})')
+            plt.legend(loc='upper right')
+
+            # 保存图片
+            vis_path = os.path.join(output_dir, 'amp_clustering_pca.png')
+            plt.savefig(vis_path, dpi=300, bbox_inches='tight')
+            logger.info(f"PCA可视化保存至: {vis_path}")
+
+            # 生成每个维度重要性的条形图
+            plt.figure(figsize=(12, 6))
+            sorted_idx = np.argsort(feature_importance)
+            plt.barh(range(len(feature_names)), feature_importance[sorted_idx])
+            plt.yticks(range(len(feature_names)), [feature_names[i] for i in sorted_idx])
+            plt.xlabel('Feature Importance')
+            plt.title('Feature Importance for AMPs Clustering')
+
+            # 保存特征重要性图
+            feat_path = os.path.join(output_dir, 'amp_feature_importance.png')
+            plt.savefig(feat_path, dpi=300, bbox_inches='tight')
+            logger.info(f"特征重要性图保存至: {feat_path}")
+
+        except Exception as e:
+            logger.error(f"生成可视化时出错: {str(e)}")
+
+    # 去重，确保没有重复ID
+    retained_ids = list(set(retained_ids))
+
+    elapsed = time.time() - start_time
+    reduction_ratio = (len(sequences) - len(retained_ids)) * 100 / len(sequences)
+    logger.info(f"AMPs优化聚类完成: 从 {len(sequences)} 个序列中选择了 {len(retained_ids)} 个代表性序列 "
+                f"(占 {len(retained_ids) * 100 / len(sequences):.1f}%, 减少率 {reduction_ratio:.1f}%)，"
+                f"耗时: {elapsed / 60:.1f}分钟")
+
+    # 返回结果及统计信息
+    return retained_ids, {
+        "total": len(sequences),
+        "selected": len(retained_ids),
+        "clusters": len(unique_labels),
+        "reduction_ratio": reduction_ratio,
+        "features_used": feature_names,
+        "cluster_info": retained_info,
+        "elapsed_minutes": elapsed / 60
+    }
 
 
 def check_graph_files_exist(batch_dirs):
@@ -1601,7 +1836,7 @@ def main():
                         help="图谱缓存目录，默认为输入目录下的graph_cache")
 
     # GPU参数
-    parser.add_argument("--gpu_device", "-g", type=str, default=None, help="指定GPU设备ID，例如'0,1'，默认使用所有可用GPU")
+    parser.add_argument("--gpu_device", "-g", type=str, default=3, help="指定GPU设备ID，例如'0,1'，默认使用所有可用GPU")
 
     args = parser.parse_args()
 
