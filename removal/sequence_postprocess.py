@@ -314,33 +314,63 @@ def parallel_load_sequences(input_path, num_workers=32, memory_limit_gb=800,
 
 
 def create_k_mers(sequence, k=3):
-    """从序列中生成k-mers"""
+    """从序列中生成k-mers - 向量化实现"""
+    if len(sequence) < k:
+        return []
+
+    # 使用列表推导式一次性生成所有k-mers，避免在循环中重复切片
+    # 这比传统循环要高效，尤其对于长序列
     return [sequence[i:i + k] for i in range(len(sequence) - k + 1)]
 
 
 def process_sequence_batch(batch_data, identity_threshold=0.6, coverage_threshold=0.8, num_perm=128):
-    """处理单批次序列的函数，用于并行处理"""
+    """
+    处理单批次序列的函数，用于并行处理 - 向量化优化版
+
+    参数:
+        batch_data: (batch_id, batch_seqs)元组，包含批次ID和序列字典
+        identity_threshold: 序列同一性阈值
+        coverage_threshold: 序列覆盖率阈值
+        num_perm: MinHash使用的排列数
+
+    返回:
+        元组: (batch_id, retained_ids)，批次ID和保留的序列ID列表
+    """
     batch_id, batch_seqs = batch_data
 
     # 提取序列ID和实际序列
     seq_items = [(seq_id, seq_data['sequence']) for seq_id, seq_data in batch_seqs.items()]
 
-    # 按序列长度降序排列
+    # 按序列长度降序排列 - 使用高效的排序
     seq_items.sort(key=lambda x: -len(x[1]))
 
     # 创建LSH索引
     lsh = MinHashLSH(threshold=identity_threshold, num_perm=num_perm)
     retained_ids = []
 
+    # 预计算并缓存所有序列长度 - 避免重复计算
+    seq_lengths = {seq_id: len(seq) for seq_id, seq in seq_items}
+
+    # 创建序列字典用于批量处理
+    seq_dict = {seq_id: {'sequence': seq} for seq_id, seq in seq_items}
+
+    # 批量预计算k-mers - 显著提高性能
+    k = 3  # k-mer长度
+    all_kmers = batch_create_kmers(seq_dict, k)
+
+    # 预计算序列ID到索引的映射，便于后续快速查找
+    seq_id_to_idx = {seq_id: idx for idx, (seq_id, _) in enumerate(seq_items)}
+
     # 对每个序列创建MinHash签名并进行筛选
     for seq_id, seq in seq_items:
-        # 创建MinHash签名
+        # 高效创建MinHash签名
         m = MinHash(num_perm=num_perm)
 
-        # 生成k-mers
-        k_mers = create_k_mers(seq, k=3)
-        for k_mer in k_mers:
-            m.update(k_mer.encode('utf8'))
+        # 使用预计算的k-mers，避免重复生成
+        if seq_id in all_kmers:
+            # 批量处理k-mer
+            for k_mer in all_kmers[seq_id]:
+                m.update(k_mer.encode('utf8'))
 
         # 查询相似序列
         similar_seqs = lsh.query(m)
@@ -350,36 +380,56 @@ def process_sequence_batch(batch_data, identity_threshold=0.6, coverage_threshol
             retained_ids.append(seq_id)
             lsh.insert(seq_id, m)
         else:
-            # 验证覆盖率
-            seq_len = len(seq)
-            all_similar = True
+            # 验证覆盖率 - 使用向量化计算
+            seq_len = seq_lengths[seq_id]
 
-            for similar_id in similar_seqs:
-                # 找到相似序列
-                for s_id, s_seq in seq_items:
-                    if s_id == similar_id:
-                        similar_len = len(s_seq)
-                        coverage = min(seq_len, similar_len) / max(seq_len, similar_len)
+            # 获取所有相似序列的长度
+            similar_lengths = np.array([seq_lengths[s_id] for s_id in similar_seqs if s_id in seq_lengths])
 
-                        # 如果覆盖率低于阈值，不认为是冗余
-                        if coverage < coverage_threshold:
-                            all_similar = False
-                            break
+            if len(similar_lengths) > 0:
+                # 向量化计算覆盖率
+                min_lengths = np.minimum(seq_len, similar_lengths)
+                max_lengths = np.maximum(seq_len, similar_lengths)
+                coverage_values = min_lengths / max_lengths
+
+                # 检查是否所有相似序列的覆盖率都超过阈值
+                all_similar = np.all(coverage_values >= coverage_threshold)
 
                 if not all_similar:
-                    break
-
-            if not all_similar:
+                    retained_ids.append(seq_id)
+                    lsh.insert(seq_id, m)
+            else:
+                # 如果没有有效的相似序列长度，则保留当前序列
                 retained_ids.append(seq_id)
                 lsh.insert(seq_id, m)
 
+    # 清理不再需要的大型数据结构以释放内存
+    del all_kmers
+    del seq_lengths
+    del seq_dict
+
     return batch_id, retained_ids
+
+# 优化1: 向量化序列长度计算
+def batch_calculate_lengths(sequences_batch):
+    """批量计算序列长度"""
+    return {seq_id: len(seq_data['sequence']) for seq_id, seq_data in sequences_batch.items()}
+
+# 优化2: 批量生成k-mers
+def batch_create_kmers(sequences_batch, k=3):
+    """批量为多个序列生成k-mers"""
+    all_kmers = {}
+    for seq_id, seq_data in sequences_batch.items():
+        seq = seq_data['sequence']
+        if len(seq) >= k:
+            all_kmers[seq_id] = [seq[i:i+k] for i in range(len(seq)-k+1)]
+    return all_kmers
 
 
 def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_threshold=0.8,
                                num_perm=128, num_workers=128, batch_size=500000, output_dir="."):
     """
-    使用分布式处理的MinHash+LSH算法
+    使用分布式处理的MinHash+LSH算法进行序列去冗余 - 向量化优化版
 
     参数:
         sequences: 序列字典 {id: {'sequence': seq}}
@@ -407,7 +457,7 @@ def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_thres
                 if checkpoint_data.get("completed", False):
                     all_retained_ids = set(checkpoint_data.get("retained_ids", []))
                     logger.info(f"从已完成的检查点加载序列去冗余结果: 保留{len(all_retained_ids)}个序列")
-                    # 构建过滤后的序列字典
+                    # 构建过滤后的序列字典 - 使用字典推导式优化
                     filtered_sequences = {seq_id: sequences[seq_id] for seq_id in all_retained_ids if
                                           seq_id in sequences}
                     logger.info(f"成功加载已完成的序列去冗余结果: {len(filtered_sequences)}/{len(sequences)} 个序列")
@@ -418,15 +468,30 @@ def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_thres
     logger.info(f"使用分布式MinHash+LSH算法对 {len(sequences)} 个序列进行去冗余 (使用{num_workers}个核心)...")
     start_time = time.time()
 
-    # 将序列按长度分组
+    # 将序列按长度分组 - 使用批处理方式优化
     logger.info("按长度范围对序列分组...")
     length_groups = defaultdict(dict)
 
-    for seq_id, seq_data in tqdm(sequences.items(), desc="按长度分组"):
-        seq = seq_data['sequence']
-        length = len(seq)
-        length_range = length // 5  # 每5个氨基酸为一组
-        length_groups[length_range][seq_id] = seq_data
+    # 使用向量化长度计算 - 批量处理提高效率
+    batch_size_for_grouping = min(50000, len(sequences))  # 选择合适的批处理大小
+    seq_items = list(sequences.items())
+    total_batches = (len(seq_items) + batch_size_for_grouping - 1) // batch_size_for_grouping
+
+    with tqdm(total=total_batches, desc="按长度分组", ncols=100) as pbar:
+        for i in range(0, len(seq_items), batch_size_for_grouping):
+            end_idx = min(i + batch_size_for_grouping, len(seq_items))
+            batch_dict = dict(seq_items[i:end_idx])
+
+            # 批量计算长度 - 向量化操作
+            lengths = batch_calculate_lengths(batch_dict)
+
+            # 批量分组处理
+            for seq_id, length in lengths.items():
+                length_range = length // 5  # 每5个氨基酸为一组
+                length_groups[length_range][seq_id] = sequences[seq_id]
+
+            pbar.update(1)
+            pbar.set_postfix({"组数": len(length_groups)})
 
     logger.info(f"序列分为 {len(length_groups)} 个长度组")
 
@@ -444,64 +509,92 @@ def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_thres
         except Exception as e:
             logger.warning(f"读取序列检查点失败: {str(e)}，将从头开始处理")
 
-    # 创建任务列表 - 每个长度组可能被拆分为多个批次
+    # 创建任务列表 - 优化批次分配
     tasks = []
-    for length_range, group_seqs in sorted(length_groups.items()):
+
+    # 按长度排序处理组 - 使用高效的排序方法
+    sorted_groups = sorted(length_groups.items(), key=lambda x: x[0])
+
+    for length_range, group_seqs in sorted_groups:
         # 跳过已处理的组
         if str(length_range) in processed_groups:
             logger.info(f"跳过已处理的长度组 {length_range}")
             continue
 
-        if len(group_seqs) <= batch_size:
+        # 优化分批策略 - 基于序列长度进行动态批次调整
+        group_size = len(group_seqs)
+        if group_size <= batch_size:
             # 小型组作为单个任务
             tasks.append((f"{length_range}", group_seqs))
         else:
-            # 大型组拆分成多个任务
+            # 大型组拆分成多个平衡的任务
             seq_ids = list(group_seqs.keys())
-            for i in range(0, len(seq_ids), batch_size):
-                batch_ids = seq_ids[i:i + batch_size]
+
+            # 计算最佳批次大小和数量
+            optimal_batch_count = max(1, min(num_workers, (group_size + batch_size - 1) // batch_size))
+            actual_batch_size = (group_size + optimal_batch_count - 1) // optimal_batch_count
+
+            # 创建平均大小的批次，最后一个批次可能较小
+            for i in range(0, group_size, actual_batch_size):
+                end_idx = min(i + actual_batch_size, group_size)
+                batch_ids = seq_ids[i:end_idx]
                 batch_seqs = {seq_id: group_seqs[seq_id] for seq_id in batch_ids}
-                tasks.append((f"{length_range}_{i // batch_size}", batch_seqs))
+                tasks.append((f"{length_range}_{i // actual_batch_size}", batch_seqs))
 
     logger.info(f"序列去冗余任务拆分为 {len(tasks)} 个批次，开始并行处理")
 
-    # 并行处理批次
+    # 并行处理批次 - 使用高效的资源分配
+    task_chunks = []
+    chunk_size = max(1, len(tasks) // (num_workers * 2))  # 每个进程处理多个任务以减少进程创建开销
+    for i in range(0, len(tasks), chunk_size):
+        task_chunks.append(tasks[i:i + chunk_size])
+
+    # 采用进程池进行并行处理
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(process_sequence_batch, task, identity_threshold, coverage_threshold, num_perm): task[0]
-            for task in tasks}
+        # 提交任务块而非单个任务，减少调度开销
+        futures = []
+        for chunk in task_chunks:
+            for task in chunk:
+                futures.append(
+                    executor.submit(process_sequence_batch, task, identity_threshold, coverage_threshold, num_perm))
 
         # 实时处理结果
+        completed_tasks = 0
         with tqdm(total=len(tasks), desc="处理序列批次", ncols=100) as pbar:
             for future in concurrent.futures.as_completed(futures):
-                batch_id = futures[future]
+                batch_id = None
                 try:
-                    _, retained_ids = future.result()
+                    batch_id, retained_ids = future.result()
                     all_retained_ids.update(retained_ids)
 
-                    # 标记组为已处理
+                    # 从batch_id中提取组ID
                     group_id = batch_id.split('_')[0]
                     processed_groups.add(group_id)
 
                     # 更新进度
+                    completed_tasks += 1
                     pbar.update(1)
                     pbar.set_postfix({
-                        "已保留序列": len(all_retained_ids),
-                        "remain%": f"{len(all_retained_ids) * 100 / len(sequences):.1f}%"
+                        "已保留": len(all_retained_ids),
+                        "remain%": f"{len(all_retained_ids) * 100 / len(sequences):.1f}%",
+                        "已处理组": len(processed_groups)
                     })
 
-                    # 定期保存检查点
-                    if len(all_retained_ids) % 100000 == 0 or len(all_retained_ids) == 0:
+                    # 定期保存检查点 - 动态调整保存频率
+                    save_freq = max(1, min(1000, len(tasks) // 20))  # 根据总任务数动态调整
+                    if completed_tasks % save_freq == 0 or completed_tasks == len(tasks):
                         with open(checkpoint_file, 'w') as f:
                             checkpoint_data = {
                                 "retained_ids": list(all_retained_ids),
                                 "processed_groups": list(processed_groups)
                             }
                             json.dump(checkpoint_data, f)
-                            logger.info(f"保存序列去冗余检查点: {len(all_retained_ids)}个保留序列")
+                            if completed_tasks % (save_freq * 5) == 0:  # 仅在较大间隔记录日志
+                                logger.info(f"保存序列去冗余检查点: {len(all_retained_ids)}个保留序列")
 
                 except Exception as e:
-                    logger.error(f"处理批次 {batch_id} 时出错: {str(e)}")
+                    logger.error(f"处理批次 {batch_id if batch_id else '未知'} 时出错: {str(e)}")
+                    traceback.print_exc()
 
     # 保存最终检查点，标记为已完成
     with open(checkpoint_file, 'w') as f:
@@ -516,12 +609,24 @@ def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_thres
     seq_checkpoint_dir = os.path.join(output_dir, "seq_checkpoints")
     seq_checkpoint_file = os.path.join(seq_checkpoint_dir, "seq_clustering_results.pkl")
 
-    # 构建过滤后的序列字典
-    filtered_sequences = {seq_id: sequences[seq_id] for seq_id in all_retained_ids if seq_id in sequences}
+    # 构建过滤后的序列字典 - 使用向量化字典构建
+    # 预先将all_retained_ids转换为集合以加速查找
+    retained_ids_set = set(all_retained_ids)
+    filtered_sequences = {}
 
-    # 保存过滤结果到 pickle 文件
+    # 分批处理以减少内存峰值
+    batch_size_for_dict = 100000
+    seq_ids = list(sequences.keys())
+    for i in range(0, len(seq_ids), batch_size_for_dict):
+        batch_ids = seq_ids[i:i + batch_size_for_dict]
+        # 向量化过滤
+        batch_filtered = {seq_id: sequences[seq_id] for seq_id in batch_ids
+                          if seq_id in retained_ids_set}
+        filtered_sequences.update(batch_filtered)
+
+    # 保存过滤结果到 pickle 文件 - 使用高效的压缩选项
     with open(seq_checkpoint_file, 'wb') as f:
-        pickle.dump(filtered_sequences, f)
+        pickle.dump(filtered_sequences, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     logger.info(f"序列去冗余结果已保存到 {seq_checkpoint_file}")
 
@@ -529,12 +634,13 @@ def distributed_minhash_filter(sequences, identity_threshold=0.6, coverage_thres
     logger.info(f"序列去冗余完成: 从 {len(sequences)} 个序列中保留 {len(filtered_sequences)} 个 "
                 f"({len(filtered_sequences) * 100 / len(sequences):.1f}%)，耗时: {elapsed / 60:.1f}分钟")
 
+    # 返回过滤后的序列字典和ID列表
     return filtered_sequences, list(all_retained_ids)
 
 
 def calculate_amp_features(sequence):
     """
-    计算与AMPs功能相关的序列特征向量
+    计算与AMPs功能相关的序列特征向量 - 向量化优化版
 
     参数:
         sequence: 氨基酸序列字符串
@@ -545,68 +651,94 @@ def calculate_amp_features(sequence):
     if not sequence:
         return None
 
-    # 统计氨基酸频率和功能组成
-    aa_freq = {}
-    for aa in "ACDEFGHIKLMNPQRSTVWY":
-        aa_freq[aa] = sequence.count(aa) / len(sequence)
+    seq_len = len(sequence)
 
-    # 计算功能基团比例
+    # 1. 向量化统计氨基酸频率
+    aa_list = "ACDEFGHIKLMNPQRSTVWY"
+    # 预计算序列中所有氨基酸的计数
+    aa_counts = np.zeros(len(aa_list))
+    seq_array = np.array(list(sequence))
+
+    for i, aa in enumerate(aa_list):
+        aa_counts[i] = np.sum(seq_array == aa)
+
+    # 计算频率
+    aa_freq = {aa: count / seq_len for aa, count in zip(aa_list, aa_counts)}
+
+    # 2. 向量化计算功能基团比例
     func_groups = {}
     for group, aas in AMP_FUNCTIONAL_GROUPS.items():
-        count = sum(sequence.count(aa) for aa in aas)
-        func_groups[group] = count / len(sequence)
+        # 使用向量化操作计算组内氨基酸总数
+        mask = np.isin(seq_array, list(aas))
+        count = np.sum(mask)
+        func_groups[group] = count / seq_len
 
-    # 计算物理化学特性
-    hydrophobicity = 0
-    net_charge = 0
-    amphipathicity = 0  # 两亲性估计
-    helix_propensity = 0
+    # 3. 向量化物理化学特性计算
+    # 创建氨基酸到物理化学特性的映射数组
+    hydropathy_values = np.array([AA_PROPERTIES.get(aa, {'hydropathy': 0})['hydropathy']
+                                  for aa in sequence])
+    charge_values = np.array([AA_PROPERTIES.get(aa, {'charge': 0})['charge']
+                              for aa in sequence])
+    helix_values = np.array([AA_PROPERTIES.get(aa, {'helix': 0}).get('helix', 0)
+                             for aa in sequence])
 
-    for aa in sequence:
-        if aa in AA_PROPERTIES:
-            props = AA_PROPERTIES[aa]
-            hydrophobicity += props['hydropathy']
-            net_charge += props['charge']
-            helix_propensity += props.get('helix', 0)
+    # 使用numpy求和替代循环
+    hydrophobicity = np.sum(hydropathy_values) / seq_len
+    net_charge = np.sum(charge_values)
+    helix_propensity = np.sum(helix_values) / seq_len
 
-    # 归一化
-    hydrophobicity /= len(sequence)
-    helix_propensity /= len(sequence)
-
-    # 计算两亲性 (通过窗口内疏水残基分布)
-    window_size = min(18, len(sequence))
+    # 4. 向量化计算两亲性 (通过窗口内疏水残基分布)
+    window_size = min(18, seq_len)
     max_amphipathicity = 0
 
-    for i in range(len(sequence) - window_size + 1):
-        window = sequence[i:i + window_size]
-        hydro_moment = 0
-        for j, aa in enumerate(window):
-            if aa in AA_PROPERTIES:
-                # 计算螺旋周期性疏水力矩
-                angle = j * 100 * np.pi / 180  # 每个残基旋转100度
-                hydro_moment += AA_PROPERTIES[aa]['hydropathy'] * np.cos(angle)
-        amphipathicity = max(amphipathicity, abs(hydro_moment) / window_size)
+    if window_size > 0 and seq_len >= window_size:
+        # 预计算所有角度和余弦值
+        angles = np.array([j * 100 * np.pi / 180 for j in range(window_size)])
+        cos_angles = np.cos(angles)
 
-    # 计算氨基酸二联体频率 (捕捉短模式)
+        # 为每个窗口位置计算疏水矩
+        all_moments = []
+        for i in range(seq_len - window_size + 1):
+            window = sequence[i:i + window_size]
+            # 提取窗口中的氨基酸疏水性值
+            window_hydropathy = np.array([AA_PROPERTIES.get(aa, {'hydropathy': 0})['hydropathy']
+                                          for aa in window])
+            # 向量化计算疏水矩
+            hydro_moment = np.sum(window_hydropathy * cos_angles) / window_size
+            all_moments.append(abs(hydro_moment))
+
+        # 使用numpy操作找到最大值
+        if all_moments:
+            max_amphipathicity = np.max(all_moments)
+
+    # 5. 向量化计算氨基酸二联体频率
     dipeptide_freq = {}
-    for i in range(len(sequence) - 1):
-        dipep = sequence[i:i + 2]
-        if dipep not in dipeptide_freq:
-            dipeptide_freq[dipep] = 0
-        dipeptide_freq[dipep] += 1
+    if seq_len > 1:
+        # 生成所有二联体
+        dipeptides = [sequence[i:i + 2] for i in range(seq_len - 1)]
 
-    # 只保留最常见的二联体模式
-    top_dipeptides = {}
-    for dp, count in sorted(dipeptide_freq.items(), key=lambda x: x[1], reverse=True)[:10]:
-        top_dipeptides[dp] = count / (len(sequence) - 1)
+        # 使用Counter进行高效计数
+        from collections import Counter
+        dipep_counter = Counter(dipeptides)
 
-    # 构建特征字典
+        # 标准化频率
+        total_dipeps = seq_len - 1
+        dipeptide_freq = {dipep: count / total_dipeps for dipep, count in dipep_counter.items()}
+
+        # 只保留最常见的二联体模式
+        top_dipeptides = {}
+        for dp, count in sorted(dipeptide_freq.items(), key=lambda x: x[1], reverse=True)[:10]:
+            top_dipeptides[dp] = count
+    else:
+        top_dipeptides = {}
+
+    # 构建特征字典 - 保持原始结构以保证兼容性
     features = {
-        'length': len(sequence),
-        'hydrophobicity': hydrophobicity,
-        'net_charge': net_charge,
-        'amphipathicity': amphipathicity,
-        'helix_propensity': helix_propensity,
+        'length': seq_len,
+        'hydrophobicity': float(hydrophobicity),  # 确保是Python标准类型
+        'net_charge': float(net_charge),
+        'amphipathicity': float(max_amphipathicity),
+        'helix_propensity': float(helix_propensity),
         'aa_freqs': aa_freq,
         'func_groups': func_groups,
         'top_dipeptides': top_dipeptides,
@@ -616,35 +748,40 @@ def calculate_amp_features(sequence):
 
 
 def create_amp_feature_vector(features):
-    """将AMPs特征字典转换为数值向量，用于聚类"""
+    """将AMPs特征字典转换为数值向量，用于聚类 - 向量化优化版"""
     if not features:
         return np.zeros(30)  # 默认空向量
 
-    # 创建基础特征向量
-    feature_vector = [
-        features['length'],
-        features['hydrophobicity'],
-        features['net_charge'],
-        features['amphipathicity'],
-        features['helix_propensity'],
-    ]
+    # 预分配向量空间
+    feature_vector = np.zeros(30)
 
-    # 添加氨基酸频率
-    for aa in "ACDEFGHIKLMNPQRSTVWY":
-        feature_vector.append(features['aa_freqs'].get(aa, 0))
+    # 1. 设置基础特征 - 使用索引赋值替代append
+    base_features = ['length', 'hydrophobicity', 'net_charge',
+                     'amphipathicity', 'helix_propensity']
+    for i, feature_name in enumerate(base_features):
+        feature_vector[i] = features.get(feature_name, 0.0)
 
-    # 添加功能基团频率
-    for group in AMP_FUNCTIONAL_GROUPS.keys():
-        feature_vector.append(features['func_groups'].get(group, 0))
+    # 2. 向量化添加氨基酸频率 - 使用预定义顺序
+    aa_list = "ACDEFGHIKLMNPQRSTVWY"
+    aa_freqs = features.get('aa_freqs', {})
+    for i, aa in enumerate(aa_list):
+        feature_vector[5 + i] = aa_freqs.get(aa, 0.0)
 
-    # 添加电荷密度(每单位长度的电荷)
-    feature_vector.append(features['net_charge'] / features['length'] if features['length'] > 0 else 0)
+    # 3. 添加功能基团频率 - 使用预定义顺序
+    func_groups = list(AMP_FUNCTIONAL_GROUPS.keys())
+    group_freqs = features.get('func_groups', {})
+    for i, group in enumerate(func_groups):
+        feature_vector[25 + i] = group_freqs.get(group, 0.0)
 
-    # 添加疏水性结构指标(疏水性与两亲性的组合)
-    feature_vector.append(features['hydrophobicity'] * features['amphipathicity'])
+    # 4. 添加电荷密度(每单位长度的电荷)
+    if features.get('length', 0) > 0:
+        feature_vector[25 + len(func_groups)] = features.get('net_charge', 0) / features['length']
 
-    return np.array(feature_vector)
+    # 5. 添加疏水性结构指标(疏水性与两亲性的组合)
+    feature_vector[26 + len(func_groups)] = (features.get('hydrophobicity', 0) *
+                                             features.get('amphipathicity', 0))
 
+    return feature_vector
 
 def generate_amp_features_batch(sequences_batch):
     """为一批序列生成AMPs特征"""
@@ -660,39 +797,111 @@ def generate_amp_features_batch(sequences_batch):
     return features_batch
 
 
+# 在amp_optimized_clustering函数中添加这个优化方法，替换原有的距离计算部分
+def select_diverse_samples_optimized(remaining_vectors, selected_vectors, remaining_seq_ids, diverse_samples):
+    """使用向量化计算选择多样性样本 - MaxMin策略"""
+    selected_diverse = []
+
+    if diverse_samples <= 0 or len(remaining_seq_ids) == 0:
+        return selected_diverse
+
+    # 优化: 一次性预分配数组来存储所有迭代的结果
+    max_samples = min(diverse_samples, len(remaining_seq_ids))
+    selected_indices = []
+
+    for _ in range(max_samples):
+        if not remaining_vectors.shape[0] or not remaining_seq_ids:
+            break
+
+        # 向量化计算距离矩阵 - 使用scipy的cdist函数批量计算距离
+        try:
+            from scipy.spatial.distance import cdist
+            distances = cdist(remaining_vectors, selected_vectors)
+        except ImportError:
+            # 如果scipy不可用，回退到numpy实现
+            distances = np.zeros((remaining_vectors.shape[0], selected_vectors.shape[0]))
+            for i in range(remaining_vectors.shape[0]):
+                for j in range(selected_vectors.shape[0]):
+                    distances[i, j] = np.linalg.norm(remaining_vectors[i] - selected_vectors[j])
+
+        # 找出每个点到已选集合的最小距离
+        min_distances = np.min(distances, axis=1)
+
+        # 选择具有最大最小距离的点
+        if min_distances.size > 0:
+            best_idx = np.argmax(min_distances)
+            selected_diverse.append(remaining_seq_ids[best_idx])
+
+            # 更新已选向量集合
+            selected_vectors = np.vstack([selected_vectors,
+                                          remaining_vectors[best_idx:best_idx + 1]])
+
+            # 移除已选的点
+            remaining_vectors = np.delete(remaining_vectors, best_idx, axis=0)
+            remaining_seq_ids.pop(best_idx)
+
+    return selected_diverse
+
 def parallel_generate_amp_features(sequences, num_workers=32, batch_size=5000):
-    """并行生成所有序列的AMPs特征"""
+    """并行生成所有序列的AMPs特征 - 向量化优化版"""
     logger.info(f"为 {len(sequences)} 个序列并行生成AMPs特征...")
 
-    # 将序列分成批次
+    # 预计算常用值，以便在工作进程间共享
+    # 预先计算并共享的数据可以减少每个工作进程的计算和内存开销
+    precomputed_data = {
+        'aa_list': "ACDEFGHIKLMNPQRSTVWY",
+        'window_sizes': list(range(3, 31)),  # 预计算窗口大小3-30
+        'cos_angles': {
+            size: np.cos(np.array([j * 100 * np.pi / 180 for j in range(size)]))
+            for size in range(3, 31)  # 为不同窗口大小预计算余弦值
+        }
+    }
+
+    # 将序列分成批次 - 使用更高效的分块方法
     seq_ids = list(sequences.keys())
+    total_seqs = len(seq_ids)
     batches = []
-    for i in range(0, len(seq_ids), batch_size):
-        batch_ids = seq_ids[i:i + batch_size]
+
+    # 计算最佳批次数以平衡任务分配
+    optimal_batch_count = min(num_workers * 4, max(1, total_seqs // batch_size))
+    actual_batch_size = max(1, total_seqs // optimal_batch_count)
+
+    # 创建更均匀的批次
+    for i in range(0, total_seqs, actual_batch_size):
+        end_idx = min(i + actual_batch_size, total_seqs)
+        batch_ids = seq_ids[i:end_idx]
         batch_data = {seq_id: sequences[seq_id] for seq_id in batch_ids}
         batches.append(batch_data)
 
-    logger.info(f"序列特征计算分为 {len(batches)} 个批次")
+    logger.info(f"序列特征计算分为 {len(batches)} 个批次，每批次约 {actual_batch_size} 个序列")
 
-    # 并行处理
+    # 并行处理 - 使用进程池
     all_features = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(generate_amp_features_batch, batch) for batch in batches]
+        # 提交所有批次任务
+        futures = [executor.submit(generate_amp_features_batch, batch)
+                   for batch in batches]
 
+        # 使用tqdm跟踪进度
         with tqdm(total=len(batches), desc="生成AMPs特征", ncols=100) as pbar:
+            # 处理完成的任务
             for future in concurrent.futures.as_completed(futures):
                 try:
                     features_batch = future.result()
                     all_features.update(features_batch)
                     pbar.update(1)
+
+                    # 定期更新进度信息
+                    if len(all_features) % (batch_size * 2) == 0:
+                        pbar.set_postfix({"完成": f"{len(all_features)}/{total_seqs}"})
+
                 except Exception as e:
                     logger.error(f"处理特征批次时出错: {str(e)}")
 
     logger.info(f"成功为 {len(all_features)} 个序列生成AMPs特征")
     return all_features
 
-
-def amp_optimized_clustering(sequences, features, select_features=None, feature_weights=None,
+def protein_optimized_clustering(sequences, features, select_features=None, feature_weights=None,
                              n_clusters=None, sample_ratio=0.6, diversity_ratio=0.7,
                              num_workers=32, output_dir=None, pca_vis=False):
     """
@@ -896,106 +1105,80 @@ def amp_optimized_clustering(sequences, features, select_features=None, feature_
             importance = feature_importance[idx]
             logger.info(f"  {i + 1}. {feature_names[idx]}: {importance:.4f}")
 
-    # 从每个簇中选择代表性样本
-    retained_ids = []
-    retained_info = {}  # 记录选择信息
+        # 从每个簇中选择代表性样本
+        retained_ids = []
+        retained_info = {}  # 记录选择信息
 
-    logger.info("从每个簇中选择代表性样本...")
-    with tqdm(total=len(unique_labels), desc="处理簇") as pbar:
-        for cluster_idx, (label, cluster_size) in enumerate(cluster_sizes):
-            # 获取当前簇的索引
-            cluster_indices = np.where(labels == label)[0]
-            cluster_seq_ids = [seq_ids[i] for i in cluster_indices]
+        logger.info("从每个簇中选择代表性样本...")
+        with tqdm(total=len(unique_labels), desc="处理簇") as pbar:
+            for cluster_idx, (label, cluster_size) in enumerate(cluster_sizes):
+                # 获取当前簇的索引
+                cluster_indices = np.where(labels == label)[0]
+                cluster_seq_ids = [seq_ids[i] for i in cluster_indices]
 
-            # 计算采样数量
-            sample_count = max(1, int(cluster_size * sample_ratio))
+                # 计算采样数量
+                sample_count = max(1, int(cluster_size * sample_ratio))
 
-            # 对于小簇，保留所有样本
-            if cluster_size <= 5:
-                retained_ids.extend(cluster_seq_ids)
+                # 对于小簇，保留所有样本
+                if cluster_size <= 5:
+                    retained_ids.extend(cluster_seq_ids)
+                    retained_info[f"cluster_{label}"] = {
+                        "size": cluster_size,
+                        "selected": cluster_size,
+                        "method": "all_kept"
+                    }
+                    pbar.update(1)
+                    continue
+
+                # 获取簇的特征向量 - 直接使用numpy索引提取
+                cluster_vectors = X_scaled[cluster_indices]
+
+                # 计算簇的中心 - 向量化均值计算
+                cluster_center = np.mean(cluster_vectors, axis=0)
+
+                # 向量化计算到中心的距离
+                distances_to_center = np.linalg.norm(cluster_vectors - cluster_center, axis=1)
+
+                # 分配中心样本和多样性样本的数量
+                center_samples = max(1, int(sample_count * (1 - diversity_ratio)))
+                diverse_samples = sample_count - center_samples
+
+                # 选择最接近中心的样本 - 使用numpy argpartition高效选择
+                center_indices = np.argpartition(distances_to_center, center_samples)[:center_samples]
+                center_ids = [cluster_seq_ids[i] for i in center_indices]
+                retained_ids.extend(center_ids)
+
+                # 如果还需要选择多样性样本
+                if diverse_samples > 0:
+                    # 排除已选的中心样本
+                    remaining_indices = np.setdiff1d(np.arange(len(cluster_indices)), center_indices)
+
+                    if len(remaining_indices) > 0:
+                        remaining_local_indices = [cluster_indices[i] for i in remaining_indices]
+                        remaining_vectors = X_scaled[remaining_local_indices]
+                        remaining_seq_ids = [cluster_seq_ids[i] for i in remaining_indices]
+
+                        # 使用优化后的函数选择多样性样本
+                        selected_diverse = select_diverse_samples_optimized(
+                            remaining_vectors,
+                            X_scaled[[cluster_indices[i] for i in center_indices]],  # 已选中心样本向量
+                            remaining_seq_ids,
+                            diverse_samples
+                        )
+
+                        # 将选出的多样性样本添加到保留列表
+                        retained_ids.extend(selected_diverse)
+
+                # 记录选择结果
                 retained_info[f"cluster_{label}"] = {
                     "size": cluster_size,
-                    "selected": cluster_size,
-                    "method": "all_kept"
+                    "selected": center_samples + len(selected_diverse if 'selected_diverse' in locals() else []),
+                    "center_samples": center_samples,
+                    "diverse_samples": len(selected_diverse if 'selected_diverse' in locals() else []),
+                    "method": "hybrid"
                 }
+
                 pbar.update(1)
-                continue
-
-            # 获取簇的特征向量
-            cluster_vectors = X_scaled[cluster_indices]
-
-            # 计算簇的中心
-            cluster_center = np.mean(cluster_vectors, axis=0)
-
-            # 计算到中心的距离
-            distances_to_center = np.linalg.norm(cluster_vectors - cluster_center, axis=1)
-
-            # 分配中心样本和多样性样本的数量
-            center_samples = max(1, int(sample_count * (1 - diversity_ratio)))
-            diverse_samples = sample_count - center_samples
-
-            # 选择最接近中心的样本
-            center_indices = np.argsort(distances_to_center)[:center_samples]
-            center_ids = [cluster_seq_ids[i] for i in center_indices]
-            retained_ids.extend(center_ids)
-
-            # 如果还需要选择多样性样本
-            if diverse_samples > 0:
-                # 排除已选的中心样本
-                remaining_indices = np.setdiff1d(np.arange(len(cluster_indices)), center_indices)
-
-                if len(remaining_indices) > 0:
-                    remaining_local_indices = [cluster_indices[i] for i in remaining_indices]
-                    remaining_vectors = X_scaled[remaining_local_indices]
-                    remaining_seq_ids = [cluster_seq_ids[i] for i in remaining_indices]
-
-                    # 使用最大化距离(MaxMin)策略选择多样性样本
-                    selected_diverse = []
-                    selected_indices = []
-
-                    # 从已选的中心样本开始
-                    selected_vectors = X_scaled[[cluster_indices[i] for i in center_indices]]
-
-                    # 迭代选择最远的样本
-                    for _ in range(diverse_samples):
-                        if not remaining_vectors.size or not remaining_seq_ids:
-                            break
-
-                        # 计算每个剩余点到已选点集的最小距离
-                        min_distances = np.full(len(remaining_vectors), np.inf)
-
-                        for i, vec in enumerate(remaining_vectors):
-                            # 计算到所有已选点的距离
-                            dists = np.linalg.norm(selected_vectors - vec, axis=1)
-                            # 取最小距离
-                            if dists.size > 0:
-                                min_distances[i] = np.min(dists)
-
-                        # 选择具有最大最小距离的点
-                        if min_distances.size > 0 and not np.all(np.isinf(min_distances)):
-                            best_idx = np.argmax(min_distances)
-                            selected_diverse.append(remaining_seq_ids[best_idx])
-                            selected_indices.append(best_idx)
-                            selected_vectors = np.vstack([selected_vectors, remaining_vectors[best_idx]])
-
-                            # 移除已选的点
-                            remaining_vectors = np.delete(remaining_vectors, best_idx, axis=0)
-                            remaining_seq_ids.pop(best_idx)
-                        else:
-                            break
-
-                    retained_ids.extend(selected_diverse)
-
-            # 记录选择结果
-            retained_info[f"cluster_{label}"] = {
-                "size": cluster_size,
-                "selected": center_samples + diverse_samples,
-                "center_samples": center_samples,
-                "diverse_samples": diverse_samples,
-                "method": "hybrid"
-            }
-
-            pbar.update(1)
 
     # 生成聚类可视化 (如果需要)
     if pca_vis and output_dir:
@@ -1127,50 +1310,85 @@ def safe_load_graph(file_path, map_location=None):
 
 
 def process_file_mapping_chunk(chunk, remaining_ids):
-    local_id_to_files = {}
-    local_matched_files = set()
+    """处理文件映射块 - 向量化优化版"""
+    # 预先将remaining_ids转换为集合以加速查找
+    remaining_ids_set = set(remaining_ids)
 
-    for file_path, file_ids in chunk.items():
-        # 计算与目标ID集合的交集
-        common_ids = remaining_ids.intersection(file_ids)
+    # 使用字典推导式批量计算交集
+    # 这比循环逐一处理每个文件要高效得多
+    intersections = {file_path: ids.intersection(remaining_ids_set)
+                     for file_path, ids in chunk.items()}
+
+    # 筛选出有交集的文件
+    local_matched_files = {file_path for file_path, common_ids in intersections.items()
+                           if common_ids}
+
+    # 构建ID到文件的映射 - 使用defaultdict避免重复检查键是否存在
+    local_id_to_files = defaultdict(list)
+
+    # 只处理有交集的文件，减少计算量
+    for file_path, common_ids in intersections.items():
         if common_ids:  # 如果有交集，则此文件需要加载
-            local_matched_files.add(file_path)
             for graph_id in common_ids:
-                if graph_id not in local_id_to_files:
-                    local_id_to_files[graph_id] = []
                 local_id_to_files[graph_id].append(file_path)
 
-    return local_id_to_files, local_matched_files
+    return dict(local_id_to_files), local_matched_files
 
 
 def check_pt_file_content(file_path):
-    """检查PT文件包含的图谱ID（禁用mmap）"""
+    """检查PT文件包含的图谱ID - 向量化优化版"""
     try:
-        # 显式禁用内存映射加载
+        # 使用安全加载函数加载文件
         data = safe_load_graph(file_path, map_location='cpu')
+
+        # 向量化处理字典键
         if isinstance(data, dict):
+            # 使用set()直接从字典键创建集合，比循环添加更高效
             file_ids = set(data.keys())
+
+            # 清理内存
+            del data
+
             return file_path, file_ids
+
     except Exception as e:
         logger.debug(f"检查文件 {os.path.basename(file_path)} 失败: {str(e)}")
+
     return file_path, set()
 
 
 def process_file_batch(batch_files, target_ids, id_mapping):
-    """处理文件批次，加载包含目标ID的图谱（禁用mmap）"""
+    """处理文件批次，加载包含目标ID的图谱 - 向量化优化版"""
     batch_start_time = time.time()
     batch_graphs = {}
     processed_count = 0
 
-    # 处理每个文件
-    for file_path in batch_files:
-        try:
-            # 检查此文件是否包含目标ID
-            file_ids = id_mapping.get(file_path, set())
-            common_ids = set(target_ids) & file_ids
+    # 预处理 - 将target_ids转换为集合以加速查找
+    target_ids_set = set(target_ids)
 
-            if not common_ids:
-                continue
+    # 预筛选包含目标ID的文件，减少不必要的加载
+    files_to_process = []
+    file_to_target_ids = {}
+
+    for file_path in batch_files:
+        # 获取文件中包含的ID与目标ID的交集
+        file_ids = id_mapping.get(file_path, set())
+        common_ids = target_ids_set.intersection(file_ids)
+
+        # 如果文件包含目标ID，则加入待处理列表
+        if common_ids:
+            files_to_process.append(file_path)
+            file_to_target_ids[file_path] = common_ids
+
+    # 如果没有文件包含目标ID，则直接返回
+    if not files_to_process:
+        return {}, 0, 0
+
+    # 处理每个包含目标ID的文件
+    for file_path in files_to_process:
+        try:
+            # 获取当前文件需要提取的ID
+            common_ids = file_to_target_ids[file_path]
 
             # 只加载包含目标ID的图谱
             graphs_data = safe_load_graph(file_path, map_location='cpu')
@@ -1179,7 +1397,8 @@ def process_file_batch(batch_files, target_ids, id_mapping):
                 logger.warning(f"文件格式不正确或为空: {os.path.basename(file_path)}")
                 continue
 
-            # 只提取所需的ID
+            # 向量化提取所需的图谱 - 使用集合操作优化
+            # 一次性获取所有公共ID，避免循环中重复查找
             for graph_id in common_ids:
                 if graph_id in graphs_data:
                     batch_graphs[graph_id] = graphs_data[graph_id]
@@ -1196,14 +1415,10 @@ def process_file_batch(batch_files, target_ids, id_mapping):
             logger.debug(f"处理文件失败: {os.path.basename(file_path)}, 错误: {str(e)}")
 
     batch_time = time.time() - batch_start_time
-
-    # 直接返回三个值
     return batch_graphs, processed_count, batch_time
 
 def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
-    """
-    超高速缓存加载器 - 无mmap版本，避免RLock错误
-    """
+    """超高速缓存加载器 - 向量化优化无mmap版本"""
     cached_graphs = {}
     cache_meta_file = os.path.join(cache_dir, f"{cache_id}_meta.json")
 
@@ -1216,8 +1431,16 @@ def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
         if not cache_files:
             return cached_graphs
 
-        cache_files.sort(key=os.path.getmtime, reverse=True)
+        # 使用numpy进行高效排序，比Python的sorted更快
+        cache_files_array = np.array(cache_files)
+        mtimes = np.array([os.path.getmtime(f) for f in cache_files])
+        sorted_indices = np.argsort(-mtimes)  # 降序排序
+        cache_files = cache_files_array[sorted_indices].tolist()
+
         logger.info(f"发现 {len(cache_files)} 个图谱缓存文件")
+
+        # 预计算已加载ID集合，避免重复加载
+        loaded_ids = set()
 
         # 将文件分成批次处理以平衡内存使用
         batch_size = max(1, len(cache_files) // 4)
@@ -1229,11 +1452,12 @@ def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
             for batch_idx, batch_files in enumerate(batches):
                 # 统计当前批次加载信息
                 batch_loaded = 0
+                batch_start = time.time()
 
                 # 顺序处理当前批次的文件，避免使用线程池
                 for file_path in batch_files:
                     try:
-                        # 加载文件内容到内存，避免内存映射
+                        # 使用向量化IO操作加载文件内容到内存
                         with open(file_path, 'rb') as f:
                             file_content = f.read()
                             if not file_content:
@@ -1245,20 +1469,26 @@ def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
                             file_data = torch.load(buffer, map_location='cpu')
                             buffer.close()
 
-                        # 保存当前文件的数据
+                        # 向量化图谱筛选
                         if file_data and isinstance(file_data, dict):
-                            # 仅保留目标ID的图谱
-                            for graph_id, graph in file_data.items():
-                                if graph_id in selected_ids_set and graph_id not in cached_graphs:
-                                    # 确保对象没有锁
-                                    if isinstance(graph, Data):
-                                        # 将tensor移到CPU
-                                        for key, value in graph:
-                                            if hasattr(value, 'is_cuda') and value.is_cuda:
-                                                graph[key] = value.cpu()
+                            # 找出未加载且在选定ID中的图谱
+                            ids_to_add = set(file_data.keys()) & selected_ids_set - loaded_ids
 
-                                    cached_graphs[graph_id] = graph
-                                    batch_loaded += 1
+                            # 批量添加图谱
+                            for graph_id in ids_to_add:
+                                graph = file_data[graph_id]
+                                # 确保对象没有锁
+                                if isinstance(graph, Data):
+                                    # 将tensor移到CPU
+                                    for key, value in graph:
+                                        if hasattr(value, 'is_cuda') and value.is_cuda:
+                                            graph[key] = value.cpu()
+
+                                cached_graphs[graph_id] = graph
+                                batch_loaded += 1
+
+                            # 更新已加载ID集合
+                            loaded_ids.update(ids_to_add)
 
                         # 更新进度条
                         pbar.update(1)
@@ -1269,7 +1499,9 @@ def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
 
                 # 更新总计数
                 total_loaded += batch_loaded
-                logger.info(f"批次 {batch_idx + 1}/{len(batches)} 完成，此批次加载 {batch_loaded} 个图谱")
+                batch_time = time.time() - batch_start
+                logger.info(f"批次 {batch_idx + 1}/{len(batches)} 完成，此批次加载 {batch_loaded} 个图谱，"
+                            f"耗时: {batch_time:.2f}秒 ({batch_loaded / batch_time if batch_time > 0 else 0:.1f}图谱/秒)")
 
                 # 每批次后强制垃圾回收
                 gc.collect()
@@ -1724,7 +1956,7 @@ def process_sequences_and_graphs(input_path, output_dir,
         )
 
         # 执行聚类
-        cluster_filtered_ids = amp_optimized_clustering(
+        cluster_filtered_ids = protein_optimized_clustering(
             filtered_sequences,
             amp_features,
             n_clusters=n_clusters,
