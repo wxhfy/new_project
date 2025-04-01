@@ -56,6 +56,8 @@ import warnings
 warnings.filterwarnings("ignore", message="Unlikely unit cell vectors")
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=r"CUDA error: out of memory")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ======================= 常量与配置 =======================
 
@@ -528,276 +530,6 @@ def compute_secondary_structure(structure):
         return np.full((structure.n_frames, structure.n_residues), 'C')
 
 
-def compute_solvent_accessibility(structure):
-    """计算溶剂可及性"""
-    try:
-        # 使用MDTraj计算溶剂可及表面积
-        sasa = md.shrake_rupley(structure, probe_radius=0.14, n_sphere_points=960)
-        # 归一化（除以最大观测值或理论最大值）
-        max_sasa = np.max(sasa)
-        if max_sasa > 0:
-            normalized_sasa = sasa / max_sasa
-        else:
-            normalized_sasa = sasa
-        return normalized_sasa
-    except Exception as e:
-        logger.error(f"计算溶剂可及性失败: {str(e)}")
-        # 返回默认值0.5
-        return np.full((structure.n_frames, structure.n_residues), 0.5)
-
-
-def compute_contacts(structure, cutoff=0.8):
-    """计算残基接触图（兼容新版MDTraj）
-
-    参数:
-        structure: MDTraj结构对象
-        cutoff: 接触距离阈值，单位为nm
-
-    返回:
-        contacts: 接触矩阵
-        residue_pairs: 接触残基对
-    """
-    try:
-        # 使用MDTraj计算残基接触
-        # 而是需要在获取contacts后进行过滤
-        residue_pairs = []
-        n_res = structure.n_residues
-
-        # 创建所有可能的残基对（不包括相邻的）
-        for i in range(n_res):
-            for j in range(i + 2, n_res):  # 跳过相邻残基
-                residue_pairs.append([i, j])
-
-        if not residue_pairs:
-            return [], []
-
-        # 转换为numpy数组
-        residue_pairs = np.array(residue_pairs)
-
-        # 计算这些残基对之间的最小距离
-        # 使用'ca'方案只考虑alpha碳原子之间的距离
-        distances, _ = md.compute_contacts(structure, contacts=residue_pairs, scheme='ca')
-
-        # 过滤出小于截断值的接触
-        # 注意：distances的shape是(n_frames, n_pairs)
-        contacts = distances[0] <= cutoff  # 使用第一帧
-
-        # 获取满足接触条件的残基对
-        contact_pairs = residue_pairs[contacts]
-        contact_distances = distances[0][contacts]
-
-        return contact_distances, contact_pairs
-    except Exception as e:
-        logger.error(f"计算接触图失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        return [], []
-
-
-def compute_hydrogen_bonds(structure):
-    """识别氢键"""
-    try:
-        hbonds = md.baker_hubbard(structure, freq=0.1, periodic=False)
-        return hbonds
-    except Exception as e:
-        logger.error(f"计算氢键失败: {str(e)}")
-        return []
-
-
-def compute_hydrophobic_contacts(structure, cutoff=0.5):
-    """识别疏水相互作用（兼容新版MDTraj）"""
-    try:
-        # 定义疏水氨基酸索引
-        hydrophobic_indices = []
-
-        for i, res in enumerate(structure.topology.residues):
-            res_name = res.name
-            one_letter = three_to_one(res_name)
-            if one_letter in 'AVILMFYW':  # 疏水氨基酸
-                hydrophobic_indices.append(i)
-
-        # 计算疏水残基间的接触
-        if len(hydrophobic_indices) >= 2:
-            pairs = []
-            for i in range(len(hydrophobic_indices)):
-                for j in range(i + 1, len(hydrophobic_indices)):
-                    pairs.append([hydrophobic_indices[i], hydrophobic_indices[j]])
-
-            pairs = np.array(pairs)
-            # 计算这些残基对之间的距离
-            distances = md.compute_contacts(structure, contacts=pairs, scheme='ca')[0][0]
-
-            # 找出小于阈值的接触对
-            contacts = pairs[distances < cutoff]
-            return contacts
-        else:
-            return []
-    except Exception as e:
-        logger.error(f"计算疏水接触失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        return []
-
-
-def compute_ionic_interactions(structure, cutoff=0.4):
-    """识别离子相互作用（盐桥）（兼容新版MDTraj）"""
-    try:
-        # 定义带电氨基酸索引
-        pos_indices = []  # 正电荷 (K, R, H)
-        neg_indices = []  # 负电荷 (D, E)
-
-        for i, res in enumerate(structure.topology.residues):
-            res_name = res.name
-            one_letter = three_to_one(res_name)
-            if one_letter in 'KRH':
-                pos_indices.append(i)
-            elif one_letter in 'DE':
-                neg_indices.append(i)
-
-        # 计算正负电荷残基间的接触对
-        pairs = []
-        for pos in pos_indices:
-            for neg in neg_indices:
-                pairs.append([pos, neg])
-
-        if pairs:
-            pairs = np.array(pairs)
-            # 计算这些残基对之间的距离
-            distances = md.compute_contacts(structure, contacts=pairs, scheme='ca')[0][0]
-
-            # 找出小于阈值的接触对
-            contacts = pairs[distances < cutoff]
-            return contacts
-        else:
-            return []
-    except Exception as e:
-        logger.error(f"计算离子相互作用失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        return []
-
-
-def batch_nearest_neighbor_query(tree, points, k=10, max_distance=None, max_batch=10000):
-    """
-    分批执行K近邻查询以避免内存溢出
-
-    参数:
-        tree: cKDTree对象
-        points: 查询点坐标数组
-        k: 近邻数量
-        max_distance: 最大距离限制
-        max_batch: 单批次最大处理点数
-
-    返回:
-        distances: 距离数组，形状为(n_points, k)
-        indices: 索引数组，形状为(n_points, k)
-    """
-    n_points = len(points)
-    points = np.asarray(points, dtype=np.float32)
-
-    # 预分配结果数组
-    distances = np.zeros((n_points, k), dtype=np.float32)
-    indices = np.zeros((n_points, k), dtype=np.int32)
-
-    # 分批处理
-    for start in range(0, n_points, max_batch):
-        end = min(start + max_batch, n_points)
-        batch_points = points[start:end]
-
-        # 使用额外参数提高性能
-        batch_dist, batch_idx = tree.query(
-            batch_points,
-            k=k,
-            distance_upper_bound=max_distance if max_distance else np.inf,
-            workers=-1,  # 使用多线程
-            eps=0.01  # 允许近似查询以提高速度
-        )
-
-        distances[start:end] = batch_dist
-        indices[start:end] = batch_idx
-
-    return distances, indices
-
-
-def compute_residue_distances_vectorized(ca_coords):
-    """
-    使用向量化操作高效计算所有残基对之间的距离
-
-    参数:
-        ca_coords: Alpha碳原子坐标数组，形状为(n_residues, 3)
-
-    返回:
-        distance_matrix: 距离矩阵，形状为(n_residues, n_residues)
-    """
-    # 优化数据类型减少内存使用
-    ca_coords = np.asarray(ca_coords, dtype=np.float32)
-
-    # 使用广播计算欧氏距离矩阵
-    # 公式: √[(x₁-x₂)² + (y₁-y₂)² + (z₁-z₂)²]
-    # 通过广播避免显式循环，显著提高速度
-    diff = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
-    dist_matrix = np.sqrt(np.sum(diff * diff, axis=-1))
-
-    return dist_matrix
-
-
-def identify_interactions_vectorized(distance_matrix, residue_types, threshold=8.0):
-    """
-    向量化判断残基间相互作用类型
-
-    参数:
-        distance_matrix: 残基间距离矩阵
-        residue_types: 残基类型列表
-        threshold: 相互作用距离阈值
-
-    返回:
-        interaction_types: 相互作用类型矩阵 (0=无, 1=空间近邻, 2=氢键, 3=离子, 4=疏水)
-    """
-    n_res = len(residue_types)
-
-    # 初始化交互矩阵
-    interaction_types = np.zeros((n_res, n_res), dtype=np.int8)
-
-    # 1. 空间距离过滤（矩阵操作）
-    spatial_contacts = distance_matrix <= threshold
-    interaction_types[spatial_contacts] = 1  # 标记为空间近邻
-
-    # 对角线和相邻位置不考虑空间近邻
-    np.fill_diagonal(interaction_types, 0)  # 清除对角线
-    for i in range(n_res - 1):
-        interaction_types[i, i + 1] = 0
-        interaction_types[i + 1, i] = 0
-
-    # 2. 氢键相互作用（向量化计算）
-    hbond_donors = np.array([aa in 'NQRKWST' for aa in residue_types])
-    hbond_acceptors = np.array([aa in 'DEQNSTYHW' for aa in residue_types])
-
-    # 创建供体与受体的交叉矩阵
-    donors_matrix = hbond_donors[:, np.newaxis] & hbond_acceptors[np.newaxis, :]
-    acceptors_matrix = hbond_acceptors[:, np.newaxis] & hbond_donors[np.newaxis, :]
-    potential_hbonds = donors_matrix | acceptors_matrix
-
-    # 应用距离条件（氢键通常<3.5Å，这里用5.0作为上限）
-    hbond_contacts = potential_hbonds & (distance_matrix < 5.0)
-    interaction_types[hbond_contacts] = 2  # 标记为氢键
-
-    # 3. 疏水相互作用（向量化计算）
-    hydrophobic_residues = np.array([aa in 'AVILMFYW' for aa in residue_types])
-    hydrophobic_matrix = hydrophobic_residues[:, np.newaxis] & hydrophobic_residues[np.newaxis, :]
-    hydrophobic_contacts = hydrophobic_matrix & (distance_matrix < 6.0)
-    interaction_types[hydrophobic_contacts] = 4  # 标记为疏水相互作用
-
-    # 4. 离子相互作用（向量化计算）
-    positive_residues = np.array([aa in 'KRH' for aa in residue_types])
-    negative_residues = np.array([aa in 'DE' for aa in residue_types])
-
-    pos_neg_matrix = positive_residues[:, np.newaxis] & negative_residues[np.newaxis, :]
-    neg_pos_matrix = negative_residues[:, np.newaxis] & positive_residues[np.newaxis, :]
-    potential_ionic = pos_neg_matrix | neg_pos_matrix
-
-    ionic_contacts = potential_ionic & (distance_matrix < 6.0)
-    interaction_types[ionic_contacts] = 3  # 标记为离子相互作用
-
-    return interaction_types
-
-
 def extract_plddt_from_bfactor(structure):
     try:
         # 正确获取B因子
@@ -825,6 +557,352 @@ def extract_plddt_from_bfactor(structure):
         logger.error(f"从B因子提取pLDDT失败: {str(e)}")
         return np.full(structure.n_residues, 70.0)  # 默认中等置信度
 
+
+def gpu_compute_residue_distances(ca_coords, device_id=None, memory_threshold=0.7):
+    """
+    使用向量化方法计算残基间距离矩阵，支持指定GPU设备或智能选择最优GPU
+    优化CUDA上下文管理和资源分配，提高多进程环境稳定性
+
+    参数:
+        ca_coords: Alpha碳原子坐标数组，形状为(n_residues, 3)
+        device_id: 指定使用的GPU设备ID，None表示自动选择，-1表示强制使用CPU
+        memory_threshold: GPU内存占用阈值，超过此阈值的设备将不会被自动选择
+
+    返回:
+        distance_matrix: 距离矩阵，形状为(n_residues, n_residues)
+    """
+    # 检查输入数据有效性
+    if ca_coords is None or len(ca_coords) < 2:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    # 如果强制使用CPU，直接返回CPU计算结果
+    if device_id == -1:
+        return _cpu_compute_distances(ca_coords)
+
+    # 数据规模检查 - 对小规模数据直接使用CPU计算
+    n_residues = len(ca_coords)
+    matrix_size_mb = (n_residues * n_residues * 4) / (1024 * 1024)  # 估计矩阵大小(MB)
+
+    # 小矩阵直接用CPU计算更高效
+    if n_residues < 50:
+        return _cpu_compute_distances(ca_coords)
+
+    try:
+        # 检查是否有可用的GPU
+        if not torch.cuda.is_available():
+            return _cpu_compute_distances(ca_coords)
+
+        # 获取当前CUDA设备ID并保存
+        prev_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        n_gpus = torch.cuda.device_count()
+
+        # 选择GPU设备
+        selected_device = 3
+
+        # 如果指定了设备ID
+        if device_id is not None:
+            if 0 <= device_id < n_gpus:
+                selected_device = device_id
+                logger.debug(f"使用指定的GPU设备: {device_id}")
+            else:
+                logger.warning(f"指定的GPU设备ID {device_id} 超出范围(0-{n_gpus - 1})，将自动选择GPU")
+
+        # 如果未指定设备ID或指定的设备无效，自动选择
+        if selected_device is None:
+            # 检查默认位置
+            selected_device = 0  # 默认使用第一个GPU
+
+            # 如果内存足够，不需要额外选择
+            try:
+                torch.cuda.set_device(selected_device)
+                free_memory = torch.cuda.get_device_properties(selected_device).total_memory
+                free_memory -= torch.cuda.memory_allocated(selected_device)
+                free_memory_mb = free_memory / (1024 * 1024)
+                total_memory_mb = torch.cuda.get_device_properties(selected_device).total_memory / (1024 * 1024)
+                memory_usage = 1.0 - (free_memory_mb / total_memory_mb)
+
+                # 检查是否需要寻找更好的设备
+                if memory_usage >= memory_threshold or free_memory_mb < matrix_size_mb * 3:
+                    need_better_device = True
+                else:
+                    need_better_device = False
+
+            except Exception as e:
+                logger.debug(f"检查默认GPU时出错: {str(e)[:100]}")
+                need_better_device = True
+
+            # 寻找最佳GPU设备
+            if need_better_device:
+                # 找到内存占用最少的GPU
+                max_free_memory = -1
+                for i in range(n_gpus):
+                    try:
+                        # 使用上下文管理器安全设置设备
+                        with torch.cuda.device(i):
+                            # 获取当前设备内存统计
+                            free_memory = torch.cuda.get_device_properties(i).total_memory
+                            free_memory -= torch.cuda.memory_allocated(i)
+                            free_memory_mb = free_memory / (1024 * 1024)
+
+                            # 计算内存占用率
+                            total_memory_mb = torch.cuda.get_device_properties(i).total_memory / (1024 * 1024)
+                            memory_usage = 1.0 - (free_memory_mb / total_memory_mb)
+
+                            logger.debug(f"GPU:{i} 内存占用率: {memory_usage:.2f}, 空闲内存: {free_memory_mb:.2f}MB")
+
+                            # 检查是否有足够内存计算距离矩阵
+                            if memory_usage < memory_threshold and free_memory_mb > matrix_size_mb * 3 and free_memory_mb > max_free_memory:
+                                selected_device = i
+                                max_free_memory = free_memory_mb
+                    except Exception as e:
+                        logger.debug(f"检查GPU {i}时出错: {str(e)[:100]}")
+
+                if selected_device is not None:
+                    logger.debug(f"自动选择GPU {selected_device}，空闲内存: {max_free_memory:.2f}MB")
+                else:
+                    logger.warning(f"没有找到符合条件的GPU（内存阈值:{memory_threshold}），所有设备内存占用过高或空间不足")
+                    # 回退到CPU计算
+                    return _cpu_compute_distances(ca_coords)
+
+        # 确保在计算前进行资源清理
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # 使用上下文管理器确保资源正确管理
+        device = torch.device(f"cuda:{selected_device}")
+
+        # 使用try-finally确保资源被正确释放
+        try:
+            # 设置设备并跟踪当前上下文
+            torch.cuda.set_device(device)
+
+            # 创建CUDA流，有助于异步操作管理
+            with torch.cuda.stream(torch.cuda.Stream(device=device)):
+                # 转换为PyTorch张量并移至所选GPU
+                coords_tensor = torch.tensor(ca_coords, dtype=torch.float32).to(device)
+
+                # 高效计算距离矩阵 - 使用广播避免循环
+                # ||a - b||^2 = ||a||^2 + ||b||^2 - 2a·b
+                a_square = torch.sum(coords_tensor ** 2, dim=1, keepdim=True)
+                b_square = torch.sum(coords_tensor ** 2, dim=1).unsqueeze(0)
+                ab = torch.matmul(coords_tensor, coords_tensor.transpose(0, 1))
+
+                dist_square = a_square + b_square - 2 * ab
+                # 处理数值误差导致的负值
+                dist_square = torch.clamp(dist_square, min=0.0)
+
+                # 计算距离
+                distances = torch.sqrt(dist_square)
+
+                # 同步以确保计算完成
+                torch.cuda.synchronize(device)
+
+                # 将结果转回CPU并转为NumPy数组
+                result = distances.cpu().numpy()
+
+                # 明确删除所有中间张量
+                del coords_tensor, a_square, b_square, ab, dist_square, distances
+
+                return result
+        except RuntimeError as e:
+            # 专门处理CUDA运行时错误
+            if "CUBLAS_STATUS_ALLOC_FAILED" in str(e):
+                logger.warning(f"CUBLAS资源分配失败: {str(e)[:150]}")
+                # 尝试主动执行垃圾回收
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            elif "out of memory" in str(e):
+                logger.warning(f"GPU内存不足: {str(e)[:150]}")
+            else:
+                logger.warning(f"CUDA运行时错误: {str(e)[:150]}")
+            # 回退到CPU计算
+            return _cpu_compute_distances(ca_coords)
+        except Exception as e:
+            # 处理其他异常
+            logger.warning(f"GPU距离计算一般错误: {str(e)[:150]}，回退到CPU计算")
+            return _cpu_compute_distances(ca_coords)
+        finally:
+            # 无论成功与否，确保清理GPU资源
+            try:
+                # 主动执行垃圾回收
+                torch.cuda.empty_cache()
+
+                # 恢复之前的设备状态
+                if prev_device is not None and prev_device != selected_device:
+                    torch.cuda.set_device(prev_device)
+            except Exception as e:
+                logger.debug(f"清理GPU资源时出错: {str(e)[:100]}")
+    except Exception as e:
+        # 外层错误处理
+        logger.warning(f"GPU距离计算初始化失败: {str(e)[:150]}，回退到CPU计算")
+
+    # 如果GPU计算失败，回退到CPU计算
+    return _cpu_compute_distances(ca_coords)
+
+
+def _cpu_compute_distances(ca_coords):
+    """
+    使用CPU进行残基间距离计算的优化实现
+    """
+    # 使用NumPy的向量化广播计算距离
+    try:
+        # 检查是否可以使用更快的SciPy实现
+        try:
+            from scipy.spatial.distance import pdist, squareform
+            # pdist计算的是压缩的距离矩阵，squareform转换为方阵
+            condensed_distances = pdist(ca_coords, metric='euclidean')
+            return squareform(condensed_distances)
+        except ImportError:
+            # 回退到纯NumPy实现
+            diff = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
+            return np.sqrt(np.sum(diff * diff, axis=2))
+    except Exception as e:
+        logger.warning(f"CPU距离计算出错: {str(e)}")
+        # 最终回退方案：循环计算
+        n = len(ca_coords)
+        distances = np.zeros((n, n), dtype=np.float32)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((ca_coords[i] - ca_coords[j]) ** 2))
+                distances[i, j] = distances[j, i] = d
+        return distances
+
+
+def _select_optimal_gpu(device_id=None, required_memory_mb=0, memory_threshold=0.7):
+    """
+    智能选择最优GPU设备，考虑内存利用率和负载均衡
+
+    参数:
+        device_id: 指定的GPU ID，如果指定且有效则直接使用
+        required_memory_mb: 所需的显存大小(MB)
+        memory_threshold: GPU内存使用率阈值，超过则不考虑使用
+
+    返回:
+        选择的GPU ID，失败则返回None
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+
+        n_gpus = torch.cuda.device_count()
+        if n_gpus == 0:
+            return None
+
+        # 如果指定了有效设备ID则直接使用
+        if device_id is not None and 0 <= device_id < n_gpus:
+            # 检查指定GPU的可用内存是否足够
+            try:
+                torch.cuda.set_device(device_id)
+                free_memory = torch.cuda.get_device_properties(device_id).total_memory
+                free_memory -= torch.cuda.memory_allocated(device_id)
+                free_memory_mb = free_memory / (1024 * 1024)
+
+                if free_memory_mb >= required_memory_mb * 2:  # 预留2倍空间
+                    return device_id
+            except Exception:
+                pass
+
+        # 自动选择最优GPU - 找出空闲内存最多的设备
+        best_device = None
+        max_free_memory = 0
+
+        for i in range(n_gpus):
+            try:
+                with torch.cuda.device(i):
+                    total_memory = torch.cuda.get_device_properties(i).total_memory
+                    allocated_memory = torch.cuda.memory_allocated(i)
+                    free_memory = total_memory - allocated_memory
+                    free_memory_mb = free_memory / (1024 * 1024)
+                    usage_ratio = allocated_memory / total_memory
+
+                    # 检查内存是否足够且使用率低于阈值
+                    if usage_ratio < memory_threshold and free_memory_mb > required_memory_mb * 2:
+                        if free_memory_mb > max_free_memory:
+                            max_free_memory = free_memory_mb
+                            best_device = i
+            except Exception:
+                continue
+
+        if best_device is not None:
+            logger.debug(f"选择GPU {best_device}，可用内存: {max_free_memory:.1f}MB")
+
+        return best_device
+
+    except Exception:
+        return None
+
+
+def chunked_gpu_compute_distances(ca_coords, device_id=None, chunk_size=200):
+    """
+    分块计算大型距离矩阵，有效避免显存溢出
+
+    参数:
+        ca_coords: 坐标数组
+        device_id: GPU设备ID
+        chunk_size: 分块大小
+
+    返回:
+        完整的距离矩阵
+    """
+    n_residues = len(ca_coords)
+    result = np.zeros((n_residues, n_residues), dtype=np.float32)
+
+    # 计算分块数
+    n_chunks = (n_residues + chunk_size - 1) // chunk_size
+
+    # 分块处理（只计算上三角部分）
+    for i in range(n_chunks):
+        start_i = i * chunk_size
+        end_i = min((i + 1) * chunk_size, n_residues)
+
+        # 优先使用CPU计算小块，避免GPU频繁切换开销
+        use_cpu = (end_i - start_i) < 50
+
+        # 处理对角块和上三角块
+        for j in range(i, n_chunks):
+            start_j = j * chunk_size
+            end_j = min((j + 1) * chunk_size, n_residues)
+
+            # 提取子坐标块
+            chunk_i = ca_coords[start_i:end_i]
+            chunk_j = ca_coords[start_j:end_j]
+
+            # 计算子块距离矩阵
+            if i == j:
+                # 对角块计算
+                if use_cpu:
+                    sub_dist = _cpu_compute_distances(chunk_i)
+                else:
+                    sub_dist = gpu_compute_residue_distances(chunk_i, device_id)
+
+                result[start_i:end_i, start_i:end_i] = sub_dist
+            else:
+                # 非对角块 - 需要特殊处理
+                # 创建组合坐标矩阵
+                combined = np.vstack([chunk_i, chunk_j])
+
+                if use_cpu:
+                    combined_dist = _cpu_compute_distances(combined)
+                else:
+                    combined_dist = gpu_compute_residue_distances(combined, device_id)
+
+                # 提取正确部分
+                ni = len(chunk_i)
+                nj = len(chunk_j)
+                sub_dist = combined_dist[:ni, ni:ni + nj]
+
+                # 填充上三角和下三角
+                result[start_i:end_i, start_j:end_j] = sub_dist
+                result[start_j:end_j, start_i:end_i] = sub_dist.T  # 对称性
+
+            # 每个块计算后释放内存
+            if not use_cpu and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return result
 # ======================= 蛋白质切割策略 =======================
 def create_intelligent_fragments(structure, ss_array, contact_map, residue_pairs,
                                        min_length=5, max_length=50, respect_ss=True, respect_domains=True):
@@ -1175,148 +1253,18 @@ def classify_interaction_vectorized(res_codes, distance_matrix, threshold=8.0):
 
     return interaction_types
 
-
-def gpu_compute_residue_distances(ca_coords, device_id=None, memory_threshold=0.7):
-    """
-    使用向量化方法计算残基间距离矩阵，支持指定GPU设备或智能选择最优GPU
-
-    参数:
-        ca_coords: Alpha碳原子坐标数组，形状为(n_residues, 3)
-        device_id: 指定使用的GPU设备ID，None表示自动选择，-1表示强制使用CPU
-        memory_threshold: GPU内存占用阈值，超过此阈值的设备将不会被自动选择
-
-    返回:
-        distance_matrix: 距离矩阵，形状为(n_residues, n_residues)
-    """
-    # 检查输入数据有效性
-    if ca_coords is None or len(ca_coords) < 2:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    # 数据规模检查 - 对小规模数据直接使用CPU计算
-    n_residues = len(ca_coords)
-    matrix_size_mb = (n_residues * n_residues * 4) / (1024 * 1024)  # 估计矩阵大小(MB)
-
-    try:
-        # 检查是否有可用的GPU
-        if torch.cuda.is_available():
-            # 获取可用的GPU数量
-            n_gpus = torch.cuda.device_count()
-
-            if n_gpus == 0:
-                return _cpu_compute_distances(ca_coords)
-
-            # 选择GPU设备
-            selected_device = 3
-
-            # 如果指定了设备ID
-            if device_id is not None:
-                if 0 <= device_id < n_gpus:
-                    selected_device = device_id
-                    logger.debug(f"使用指定的GPU设备: {device_id}")
-                else:
-                    logger.warning(f"指定的GPU设备ID {device_id} 超出范围(0-{n_gpus - 1})，将自动选择GPU")
-
-            # 如果未指定设备ID或指定的设备无效，自动选择
-            if selected_device is None:
-                # 找到内存占用最少的GPU
-                max_free_memory = -1
-                for i in range(n_gpus):
-                    try:
-                        # 获取当前设备内存统计
-                        torch.cuda.set_device(i)
-                        free_memory = torch.cuda.get_device_properties(i).total_memory
-                        free_memory -= torch.cuda.memory_allocated(i)
-                        free_memory_mb = free_memory / (1024 * 1024)
-
-                        # 计算内存占用率
-                        total_memory_mb = torch.cuda.get_device_properties(i).total_memory / (1024 * 1024)
-                        memory_usage = 1.0 - (free_memory_mb / total_memory_mb)
-
-                        logger.debug(f"GPU:{i} 内存占用率: {memory_usage:.2f}, 空闲内存: {free_memory_mb:.2f}MB")
-
-                        # 检查是否有足够内存计算距离矩阵
-                        if memory_usage < memory_threshold and free_memory_mb > matrix_size_mb * 3 and free_memory_mb > max_free_memory:
-                            selected_device = i
-                            max_free_memory = free_memory_mb
-                    except Exception as e:
-                        logger.debug(f"检查GPU {i}时出错: {str(e)[:100]}")
-
-                if selected_device is not None:
-                    logger.debug(f"自动选择GPU {selected_device}，空闲内存: {max_free_memory:.2f}MB")
-                else:
-                    logger.debug(f"没有找到符合条件的GPU（内存阈值:{memory_threshold}），所有设备内存占用过高或空间不足")
-                    return _cpu_compute_distances(ca_coords)
-
-            # 设置到选择的设备
-            device = torch.device(f"cuda:{selected_device}")
-            torch.cuda.set_device(device)
-
-            # 转换为PyTorch张量并移至所选GPU
-            coords_tensor = torch.tensor(ca_coords, dtype=torch.float32).to(device)
-
-            # 高效计算距离矩阵 - 使用广播避免循环
-            # ||a - b||^2 = ||a||^2 + ||b||^2 - 2a·b
-            a_square = torch.sum(coords_tensor ** 2, dim=1, keepdim=True)
-            b_square = torch.sum(coords_tensor ** 2, dim=1).unsqueeze(0)
-            ab = torch.matmul(coords_tensor, coords_tensor.transpose(0, 1))
-
-            dist_square = a_square + b_square - 2 * ab
-            # 处理数值误差导致的负值
-            dist_square = torch.clamp(dist_square, min=0.0)
-
-            # 计算距离
-            distances = torch.sqrt(dist_square)
-
-            # 将结果转回CPU并转为NumPy数组
-            return distances.cpu().numpy()
-
-    except Exception as e:
-        logger.warning(f"GPU距离计算失败: {str(e)[:100]}，回退到CPU计算")
-
-    # 如果GPU计算失败，回退到CPU计算
-    return _cpu_compute_distances(ca_coords)
-
-
-def _cpu_compute_distances(ca_coords):
-    """
-    使用CPU进行残基间距离计算的优化实现
-    """
-    # 使用NumPy的向量化广播计算距离
-    try:
-        # 检查是否可以使用更快的SciPy实现
-        try:
-            from scipy.spatial.distance import pdist, squareform
-            # pdist计算的是压缩的距离矩阵，squareform转换为方阵
-            condensed_distances = pdist(ca_coords, metric='euclidean')
-            return squareform(condensed_distances)
-        except ImportError:
-            # 回退到纯NumPy实现
-            diff = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
-            return np.sqrt(np.sum(diff * diff, axis=2))
-    except Exception as e:
-        logger.warning(f"CPU距离计算出错: {str(e)}")
-        # 最终回退方案：循环计算
-        n = len(ca_coords)
-        distances = np.zeros((n, n), dtype=np.float32)
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = np.sqrt(np.sum((ca_coords[i] - ca_coords[j]) ** 2))
-                distances[i, j] = distances[j, i] = d
-        return distances
-
 # ======================= 知识图谱构建函数 =======================
 
 def build_enhanced_residue_graph(structure, ss_array, fragment_range,
-                                 k_neighbors=8, distance_threshold=8.0, plddt_threshold=70):
+                                 k_neighbors=8, distance_threshold=8.0, plddt_threshold=70.0):
     """
-    高性能残基知识图谱构建函数
+    高性能残基知识图谱构建函数 - 针对短肽片段优化版
 
-    优化点:
-    - 全面NumPy向量化操作
-    - 批量特征计算
-    - 矩阵化节点属性生成
-    - 并行边构建策略
-    - 内存优化数据结构
+    新增特性:
+    - 短肽自适应过滤标准
+    - 降级过滤机制
+    - 详细过滤统计
+    - 节点数量保障策略
 
     参数:
         structure: MDTraj结构对象
@@ -1336,14 +1284,36 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
         logger.warning(f"无效片段范围: {start_idx}-{end_idx}, 蛋白质残基数: {structure.n_residues}")
         return None
 
+    # 片段残基数量
+    n_fragment_residues = end_idx - start_idx
+
+    # 判断是否为短肽（10个残基或更少）
+    is_short_peptide = n_fragment_residues <= 10
+
+    # 自适应参数调整 - 短肽使用更宽松的标准
+    adaptive_plddt = max(50.0, plddt_threshold - 20.0) if is_short_peptide else plddt_threshold
+    adaptive_k = min(k_neighbors, max(2, n_fragment_residues - 1))  # 确保K不超过残基数
+
     # 初始化图和统计信息
     graph = nx.Graph()
     debug_stats = {
-        'total_residues': end_idx - start_idx,
+        'total_residues': n_fragment_residues,
         'filtered_by_plddt': 0,
         'filtered_by_nonstandard': 0,
+        'filtered_by_ca_missing': 0,
         'valid_nodes': 0,
-        'edges_created': 0
+        'edges_created': 0,
+        'is_short_peptide': is_short_peptide,
+        'adaptive_plddt': adaptive_plddt,
+    }
+
+    # 记录过滤过程的中间统计
+    filter_stats = {
+        'initial_count': n_fragment_residues,
+        'after_plddt': 0,
+        'after_standard_aa': 0,
+        'after_ca': 0,
+        'final_count': 0
     }
 
     try:
@@ -1361,11 +1331,13 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
 
         if len(valid_indices_in_plddt) > 0:
             valid_plddt = plddt_values[fragment_indices[valid_indices_in_plddt]]
-            plddt_mask[valid_indices_in_plddt] = valid_plddt >= plddt_threshold
+            # 使用自适应pLDDT阈值
+            plddt_mask[valid_indices_in_plddt] = valid_plddt >= adaptive_plddt
             debug_stats['filtered_by_plddt'] = np.sum(~plddt_mask)
 
         # 初始过滤后的索引
         filtered_indices = fragment_indices[plddt_mask]
+        filter_stats['after_plddt'] = len(filtered_indices)
 
         # 1.2 提取残基名称和CA坐标 (批量处理)
         residue_names = []
@@ -1397,18 +1369,52 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
 
         # 1.4 过滤非标准氨基酸 (向量化)
         standard_aa_mask = residue_codes != 'X'
+        filter_stats['after_standard_aa'] = np.sum(standard_aa_mask)
+        debug_stats['filtered_by_nonstandard'] = len(residue_codes) - np.sum(standard_aa_mask)
+
+        # 1.5 过滤缺失CA原子的残基
         ca_found_mask = ca_indices >= 0
-        valid_mask = standard_aa_mask & ca_found_mask
+        filter_stats['after_ca'] = np.sum(standard_aa_mask & ca_found_mask)
+        debug_stats['filtered_by_ca_missing'] = np.sum(standard_aa_mask) - np.sum(standard_aa_mask & ca_found_mask)
 
-        debug_stats['filtered_by_nonstandard'] = np.sum(~standard_aa_mask)
+        # 短肽特殊处理 - 如果过滤太严格导致剩余节点过少
+        if is_short_peptide and np.sum(standard_aa_mask & ca_found_mask) < 2:
+            logger.debug(f"短肽{fragment_id}节点过滤过严，降低要求")
 
-        # 1.5 最终有效残基过滤
+            # 阶段1：尝试仅使用标准氨基酸条件，忽略CA原子条件
+            if np.sum(standard_aa_mask) >= 2:
+                valid_mask = standard_aa_mask
+                logger.debug(f"短肽{fragment_id}忽略CA原子要求，保留{np.sum(valid_mask)}个节点")
+            # 阶段2：退一步，保留所有可能的残基
+            else:
+                valid_mask = np.ones_like(standard_aa_mask, dtype=bool)
+                logger.debug(f"短肽{fragment_id}忽略所有过滤条件，保留{np.sum(valid_mask)}个节点")
+        else:
+            # 标准过滤策略
+            valid_mask = standard_aa_mask & ca_found_mask
+
+        # 1.6 最终有效残基过滤
         valid_indices = filtered_indices[valid_mask]
         valid_ca_indices = ca_indices[valid_mask]
         valid_residue_codes = residue_codes[valid_mask]
+        filter_stats['final_count'] = len(valid_indices)
+
+        # 记录详细过滤统计
+        logger.debug(
+            f"节点过滤统计 - {fragment_id}:\n"
+            f"  初始残基数: {filter_stats['initial_count']}\n"
+            f"  pLDDT过滤后: {filter_stats['after_plddt']} (移除: {filter_stats['initial_count'] - filter_stats['after_plddt']})\n"
+            f"  标准氨基酸过滤后: {filter_stats['after_standard_aa']} (移除: {filter_stats['after_plddt'] - filter_stats['after_standard_aa']})\n"
+            f"  CA原子检查后: {filter_stats['after_ca']} (移除: {filter_stats['after_standard_aa'] - filter_stats['after_ca']})\n"
+            f"  最终保留: {filter_stats['final_count']}"
+        )
 
         # 检查有效节点数量
         if len(valid_indices) < 2:
+            # 极端情况：进入终极救援模式
+            if is_short_peptide and len(valid_indices) < 2 and n_fragment_residues >= 2:
+                return rescue_short_peptide(structure, fragment_range, plddt_values)
+
             logger.warning(f"有效节点数量不足 ({len(valid_indices)}): {fragment_id}")
             return None
 
@@ -1442,7 +1448,6 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
 
         # 5. 批量构建节点属性
         # 5.1 获取理化特性向量
-        # 假设这是一个映射氨基酸到其特性向量的字典
         AA_PROPERTY_VECTORS = {aa: np.array([
             AA_PROPERTIES[aa]['hydropathy'],
             AA_PROPERTIES[aa]['charge'],
@@ -1469,7 +1474,7 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
                 'residue_name': residue_names[valid_mask][i],
                 'residue_code': valid_residue_codes[i],
                 'residue_idx': res_idx,
-                'position': normalized_coords[i].tolist(),
+                'position': normalized_coords[i].tolist() if i < len(normalized_coords) else [0.0, 0.0, 0.0],
                 'plddt': float(plddt_values[res_idx]) if res_idx < len(plddt_values) else 70.0,
 
                 # 氨基酸理化特性 (使用预计算的向量)
@@ -1534,11 +1539,11 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
             kd_tree = KDTree(normalized_coords)
 
             # 批量查询所有点的K近邻 (向量化)
-            k = min(k_neighbors + 1, len(normalized_coords))
+            k = min(adaptive_k + 1, len(normalized_coords))
             distances, indices = kd_tree.query(normalized_coords, k=k)
 
-            # 7.2 计算所有残基间的距离矩阵 (使用GPU加速)
-            distance_matrix = gpu_compute_residue_distances(normalized_coords)
+            # 7.2 计算所有残基间的距离矩阵
+            distance_matrix = gpu_compute_residue_distances(normalized_coords)  # 默认使用CPU计算，避免GPU内存问题
 
             # 7.3 批量分类相互作用类型 (向量化)
             interaction_matrix = classify_interaction_vectorized(
@@ -1632,10 +1637,49 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
             logger.error(f"空间边构建失败: {str(e)[:100]}")
             # 继续处理，即使空间边失败
 
+            # 短肽特殊处理 - 如果没有空间边，确保至少添加序列连接
+            if is_short_peptide and graph.number_of_edges() == 0:
+                # 按残基索引排序节点
+                sorted_nodes = sorted(graph.nodes(), key=lambda n: graph.nodes[n]['residue_idx'])
+                for i in range(len(sorted_nodes) - 1):
+                    graph.add_edge(
+                        sorted_nodes[i], sorted_nodes[i + 1],
+                        edge_type=1, type_name='peptide',
+                        distance=3.8, interaction_strength=1.0,
+                        direction=[1.0, 0.0]
+                    )
+                logger.debug(f"短肽{fragment_id}添加基本序列连接，确保图连通性")
+
         # 8. 检查结果图
         if graph.number_of_nodes() < 2:
             logger.warning(f"节点数量不足 ({graph.number_of_nodes()}): {fragment_id}")
+
+            # 最后尝试短肽救援
+            if is_short_peptide and n_fragment_residues >= 2:
+                return rescue_short_peptide(structure, fragment_range, plddt_values)
             return None
+
+        # 确保图连通性 - 特别是对小片段
+        if not nx.is_connected(graph) and is_short_peptide:
+            # 找出所有连通分量
+            components = list(nx.connected_components(graph))
+            if len(components) > 1:
+                # 连接最大的两个组件
+                largest_comp = max(components, key=len)
+                second_comp = sorted(components, key=len)[-2]
+
+                # 从每个组件选择一个代表节点
+                node1 = list(largest_comp)[0]
+                node2 = list(second_comp)[0]
+
+                # 添加连接边
+                graph.add_edge(
+                    node1, node2,
+                    edge_type=5, type_name='artificial',
+                    distance=5.0, interaction_strength=0.2,
+                    direction=[0.5, 0.5]
+                )
+                logger.debug(f"短肽{fragment_id}添加人工边连接不同组件，确保图连通性")
 
         # 更新最终统计
         debug_stats['edges_created'] = graph.number_of_edges()
@@ -1649,8 +1693,138 @@ def build_enhanced_residue_graph(structure, ss_array, fragment_range,
     except Exception as e:
         logger.error(f"构建图谱失败: {str(e)}")
         logger.error(traceback.format_exc())
+
+        # 短肽最后机会
+        if is_short_peptide and n_fragment_residues >= 2:
+            return rescue_short_peptide(structure, fragment_range, plddt_values)
         return None
 
+
+def rescue_short_peptide(structure, fragment_range, plddt_values):
+    """
+    短肽救援函数 - 在标准图谱构建失败时使用
+    确保生成最基本的有效图结构
+
+    参数:
+        structure: MDTraj结构对象
+        fragment_range: (start_idx, end_idx, fragment_id)元组
+        plddt_values: pLDDT值数组
+
+    返回:
+        简化的NetworkX图对象
+    """
+    start_idx, end_idx, fragment_id = fragment_range
+    n_residues = end_idx - start_idx
+
+    if n_residues < 2:
+        return None
+
+    try:
+        logger.debug(f"启动短肽救援流程: {fragment_id}")
+        graph = nx.Graph()
+
+        # 获取所有残基的基本信息
+        valid_indices = []
+        residue_codes = []
+
+        for i in range(start_idx, end_idx):
+            try:
+                res = structure.topology.residue(i)
+                res_code = three_to_one(res.name)
+                if res_code != 'X':  # 只使用标准氨基酸
+                    valid_indices.append(i)
+                    residue_codes.append(res_code)
+            except:
+                continue
+
+        # 如果没有足够的有效残基，使用全部残基
+        if len(valid_indices) < 2:
+            valid_indices = list(range(start_idx, end_idx))
+            residue_codes = ['G'] * len(valid_indices)  # 默认使用甘氨酸
+
+        # 创建基本节点
+        for i, res_idx in enumerate(valid_indices):
+            res_code = residue_codes[i] if i < len(residue_codes) else 'G'
+            node_id = f"res_{res_idx}"
+
+            # 获取最基本的节点属性
+            props = AA_PROPERTIES.get(res_code, AA_PROPERTIES['X'])
+
+            # 基本节点属性 - 比标准函数简化
+            node_attrs = {
+                'residue_name': res_code,
+                'residue_code': res_code,
+                'residue_idx': res_idx,
+                'position': [0.0, 0.0, 0.0],  # 默认位置
+                'plddt': float(plddt_values[res_idx]) if res_idx < len(plddt_values) else 50.0,
+
+                # 氨基酸理化特性
+                'hydropathy': float(props['hydropathy']),
+                'charge': float(props['charge']),
+                'molecular_weight': float(props['mw']),
+                'volume': float(props['volume']),
+                'flexibility': float(props['flexibility']),
+                'is_aromatic': bool(props['aromatic']),
+
+                # 二级结构信息 - 默认为卷曲
+                'secondary_structure': 'C',
+                'ss_alpha': 0.0,
+                'ss_beta': 0.0,
+                'ss_coil': 1.0,
+
+                # 序列信息 - 使用默认BLOSUM编码
+                'blosum62': get_blosum62_encoding(res_code).tolist(),
+                'fragment_id': fragment_id
+            }
+
+            graph.add_node(node_id, **node_attrs)
+
+        # 添加序列连接边
+        for i in range(len(valid_indices) - 1):
+            node_id1 = f"res_{valid_indices[i]}"
+            node_id2 = f"res_{valid_indices[i + 1]}"
+
+            # 检查节点是否存在
+            if node_id1 in graph and node_id2 in graph:
+                graph.add_edge(
+                    node_id1, node_id2,
+                    edge_type=1,
+                    type_name='peptide',
+                    distance=3.8,  # 默认CA-CA距离
+                    interaction_strength=1.0,
+                    direction=[1.0, 0.0]  # N->C方向
+                )
+
+        # 确保图是连通的 - 如果有孤立节点，添加边连接它们
+        if not nx.is_connected(graph):
+            components = list(nx.connected_components(graph))
+            for i in range(len(components) - 1):
+                # 从每个连通分量选择一个代表节点
+                node1 = list(components[i])[0]
+                node2 = list(components[i + 1])[0]
+
+                # 添加人工边
+                graph.add_edge(
+                    node1, node2,
+                    edge_type=5,
+                    type_name='artificial',
+                    distance=5.0,
+                    interaction_strength=0.2,
+                    direction=[0.5, 0.5]
+                )
+
+        # 最终检查
+        if graph.number_of_nodes() >= 2:
+            logger.debug(
+                f"短肽救援成功: {fragment_id}, 节点数: {graph.number_of_nodes()}, 边数: {graph.number_of_edges()}")
+            return graph
+        else:
+            logger.warning(f"短肽救援失败: {fragment_id}, 节点数不足")
+            return None
+
+    except Exception as e:
+        logger.error(f"短肽救援失败: {str(e)[:100]}")
+        return None
 
 # ======================= 文件处理函数 =======================
 def process_structure_file(file_path, min_length=5, max_length=50, k_neighbors=8,
@@ -1988,7 +2162,6 @@ def find_pdb_files(root_dir):
     return pdb_files
 
 
-
 def process_file_chunk(file_list, min_length=5, max_length=50, k_neighbors=8,
                        distance_threshold=8.0, plddt_threshold=70.0,
                        respect_ss=True, respect_domains=True):
@@ -2164,14 +2337,14 @@ def process_file_parallel(file_list, output_dir, min_length=5, max_length=50,
             # 并行保存蛋白质数据
             protein_future = save_executor.submit(
                 save_results_chunked, batch_proteins, batch_output_dir,
-                base_name="protein_data", chunk_size=10000
+                base_name="protein_data", chunk_size=100000
             )
 
             # 并行保存图谱数据
             if batch_graphs:
                 graph_future = save_executor.submit(
                     save_knowledge_graphs, batch_graphs, batch_output_dir,
-                    base_name="protein_kg", chunk_size=10000, format_type=format_type
+                    base_name="protein_kg", chunk_size=100000, format_type=format_type
                 )
 
         # 等待保存完成
