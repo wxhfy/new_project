@@ -29,6 +29,7 @@ import time
 import traceback
 from collections import defaultdict, Counter
 
+import faiss
 import numpy as np
 import psutil
 import torch
@@ -43,6 +44,8 @@ from tqdm import tqdm
 # 初始化日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+FAISS_AVAILABLE = faiss.__version__ is not None
 
 # 氨基酸物理化学性质常量 (针对AMPs功能优化)
 AA_PROPERTIES = {
@@ -797,51 +800,6 @@ def generate_amp_features_batch(sequences_batch):
     return features_batch
 
 
-# 在amp_optimized_clustering函数中添加这个优化方法，替换原有的距离计算部分
-def select_diverse_samples_optimized(remaining_vectors, selected_vectors, remaining_seq_ids, diverse_samples):
-    """使用向量化计算选择多样性样本 - MaxMin策略"""
-    selected_diverse = []
-
-    if diverse_samples <= 0 or len(remaining_seq_ids) == 0:
-        return selected_diverse
-
-    # 优化: 一次性预分配数组来存储所有迭代的结果
-    max_samples = min(diverse_samples, len(remaining_seq_ids))
-    selected_indices = []
-
-    for _ in range(max_samples):
-        if not remaining_vectors.shape[0] or not remaining_seq_ids:
-            break
-
-        # 向量化计算距离矩阵 - 使用scipy的cdist函数批量计算距离
-        try:
-            from scipy.spatial.distance import cdist
-            distances = cdist(remaining_vectors, selected_vectors)
-        except ImportError:
-            # 如果scipy不可用，回退到numpy实现
-            distances = np.zeros((remaining_vectors.shape[0], selected_vectors.shape[0]))
-            for i in range(remaining_vectors.shape[0]):
-                for j in range(selected_vectors.shape[0]):
-                    distances[i, j] = np.linalg.norm(remaining_vectors[i] - selected_vectors[j])
-
-        # 找出每个点到已选集合的最小距离
-        min_distances = np.min(distances, axis=1)
-
-        # 选择具有最大最小距离的点
-        if min_distances.size > 0:
-            best_idx = np.argmax(min_distances)
-            selected_diverse.append(remaining_seq_ids[best_idx])
-
-            # 更新已选向量集合
-            selected_vectors = np.vstack([selected_vectors,
-                                          remaining_vectors[best_idx:best_idx + 1]])
-
-            # 移除已选的点
-            remaining_vectors = np.delete(remaining_vectors, best_idx, axis=0)
-            remaining_seq_ids.pop(best_idx)
-
-    return selected_diverse
-
 def parallel_generate_amp_features(sequences, num_workers=32, batch_size=5000):
     """并行生成所有序列的AMPs特征 - 向量化优化版"""
     logger.info(f"为 {len(sequences)} 个序列并行生成AMPs特征...")
@@ -901,9 +859,93 @@ def parallel_generate_amp_features(sequences, num_workers=32, batch_size=5000):
     logger.info(f"成功为 {len(all_features)} 个序列生成AMPs特征")
     return all_features
 
+
+def hybrid_representative_sampling(unique_labels, cluster_sizes, labels, seq_ids, X_scaled,
+                                   sample_ratio=0.6, key_features=(0, 1, 2, 3, 4), feature_weights=None):
+    """
+    混合策略的代表性采样算法 - 结合距离分层与功能重要性
+    """
+    # 默认特征权重
+    if feature_weights is None:
+        feature_weights = np.ones(len(key_features))
+
+    retained_ids = []
+    logger.info(f"使用混合代表性采样算法 (采样率: {sample_ratio:.1%})...")
+
+    with tqdm(total=len(unique_labels), desc="混合代表性采样") as pbar:
+        for label, cluster_size in cluster_sizes:
+            # 获取簇数据
+            cluster_indices = np.where(labels == label)[0]
+            cluster_seq_ids = [seq_ids[i] for i in cluster_indices]
+
+            # 小簇直接全部保留
+            if cluster_size <= 5:
+                retained_ids.extend(cluster_seq_ids)
+                pbar.update(1)
+                continue
+
+            # 计算采样数量
+            sample_count = max(1, int(cluster_size * sample_ratio))
+
+            # 获取簇特征向量
+            cluster_vectors = X_scaled[cluster_indices]
+
+            # 计算加权欧氏距离（考虑特征重要性）
+            weighted_vectors = cluster_vectors.copy()
+            for i, f_idx in enumerate(key_features):
+                if f_idx < cluster_vectors.shape[1]:
+                    weighted_vectors[:, f_idx] *= feature_weights[i]
+
+            # 计算簇中心和距离
+            cluster_center = np.mean(weighted_vectors, axis=0)
+            distances = np.linalg.norm(weighted_vectors - cluster_center, axis=1)
+
+            # 分层代表性采样
+            num_bins = 5  # 固定5个距离层
+            bins = np.percentile(distances, np.linspace(0, 100, num_bins + 1))
+            bin_indices = np.digitize(distances, bins[:-1]) - 1
+
+            # 按比例从每层选择样本
+            selected_indices = []
+            for bin_idx in range(num_bins):
+                bin_samples = np.where(bin_indices == bin_idx)[0]
+                if len(bin_samples) == 0:
+                    continue
+
+                bin_sample_count = max(1, int(sample_count * (len(bin_samples) / len(distances))))
+
+                if len(bin_samples) <= bin_sample_count:
+                    selected_indices.extend(bin_samples)
+                else:
+                    # 在每层内部使用功能多样性排序进行选择
+                    bin_vectors = cluster_vectors[bin_samples]
+                    diversity_scores = np.zeros(len(bin_samples))
+
+                    # 计算功能多样性得分
+                    for i, f_idx in enumerate(key_features):
+                        if f_idx < bin_vectors.shape[1]:
+                            feature_values = bin_vectors[:, f_idx]
+                            if np.std(feature_values) > 0:
+                                feature_values = (feature_values - np.mean(feature_values)) / np.std(feature_values)
+                                feature_ranks = np.argsort(np.abs(feature_values))[::-1]
+                                for rank, idx in enumerate(feature_ranks):
+                                    diversity_scores[idx] += feature_weights[i] * (len(feature_ranks) - rank)
+
+                    # 选择得分最高的样本
+                    diverse_indices = np.argsort(diversity_scores)[::-1][:bin_sample_count]
+                    selected_indices.extend(bin_samples[diverse_indices])
+
+            # 选择最终样本
+            selected_ids = [cluster_seq_ids[i] for i in selected_indices]
+            retained_ids.extend(selected_ids)
+
+            pbar.update(1)
+
+    return retained_ids
+
 def protein_optimized_clustering(sequences, features, select_features=None, feature_weights=None,
-                             n_clusters=None, sample_ratio=0.6, diversity_ratio=0.7,
-                             num_workers=32, output_dir=None, pca_vis=False):
+                                 n_clusters=None, sample_ratio=0.6, diversity_ratio=0.7,
+                                 output_dir=None, pca_vis=False, num_workers=32):
     """
     针对AMPs优化的聚类算法，使用特征选择和优化的多样性采样
 
@@ -1047,15 +1089,97 @@ def protein_optimized_clustering(sequences, features, select_features=None, feat
         range_clusters = range(2, min(20, int(np.sqrt(len(sequences)) / 2) + 1))
         silhouette_scores = []
 
+        # 优化的代码结构
         logger.info("自动评估最佳簇数...")
-        for n in range_clusters:
-            # 为了效率，在小样本上评估
-            sample_size = min(5000, X_scaled.shape[0])
-            if X_scaled.shape[0] > sample_size:
+
+        # 1. 先进行一次性分层抽样，用于所有聚类数的评估
+        sample_size = min(5000, X_scaled.shape[0])
+        if X_scaled.shape[0] > sample_size:
+            try:
+                # 获取序列ID和对应的长度信息
+                seq_lengths = []
+                for i, seq_id in enumerate(seq_ids):
+                    try:
+                        # 尝试多种方式获取长度
+                        if isinstance(sequences[seq_id], dict) and 'sequence' in sequences[seq_id]:
+                            length = len(sequences[seq_id]['sequence'])
+                        elif 'length' in features[seq_id]:
+                            length = features[seq_id]['length']
+                        else:
+                            # 使用特征向量中的长度相关特征或默认值
+                            length_idx = -1
+                            if 'length' in feature_names:
+                                length_idx = feature_names.index('length')
+                            length = X[i, length_idx] if length_idx >= 0 else 0
+
+                        seq_lengths.append((i, length))
+                    except Exception as e:
+                        # 出现异常时使用默认值
+                        seq_lengths.append((i, 0))
+
+                # 根据序列长度进行分组
+                length_groups = {}
+                for idx, length in seq_lengths:
+                    # 对长度进行离散化处理
+                    length_bin = length // 20 * 20  # 每20个氨基酸一组
+                    if length_bin not in length_groups:
+                        length_groups[length_bin] = []
+                    length_groups[length_bin].append(idx)
+
+                # 记录长度分布概况
+                length_ranges = sorted(length_groups.keys())
+                logger.info(
+                    f"序列长度分组: {len(length_groups)}组 (范围: {min(length_ranges)}-{max(length_ranges)}氨基酸)")
+
+                # 按比例从每个长度组抽样
+                X_sample_indices = []
+                for length_bin, indices in length_groups.items():
+                    # 计算该长度组应该抽取的样本数
+                    group_ratio = len(indices) / X_scaled.shape[0]
+                    group_sample_size = max(1, int(sample_size * group_ratio))
+
+                    # 抽取样本（不超过该组的总样本数）
+                    group_sample_size = min(group_sample_size, len(indices))
+                    group_samples = np.random.choice(indices, group_sample_size, replace=False)
+                    X_sample_indices.extend(group_samples)
+
+                # 调整最终样本数量
+                if len(X_sample_indices) > sample_size:
+                    X_sample_indices = np.random.choice(X_sample_indices, sample_size, replace=False)
+                elif len(X_sample_indices) < sample_size:
+                    remaining = list(set(range(X_scaled.shape[0])) - set(X_sample_indices))
+                    if remaining:
+                        supplement_count = min(sample_size - len(X_sample_indices), len(remaining))
+                        supplement_indices = np.random.choice(remaining, supplement_count, replace=False)
+                        X_sample_indices.extend(supplement_indices)
+
+                # 提取抽样后的特征矩阵
+                X_sample = X_scaled[X_sample_indices]
+                logger.info(f"长度分层抽样完成: 从{X_scaled.shape[0]}个样本中抽取{len(X_sample_indices)}个用于评估")
+
+            except Exception as e:
+                # 采样出错时回退到随机采样
+                logger.warning(f"分层抽样时出错: {str(e)}，将使用随机抽样")
                 indices = np.random.choice(X_scaled.shape[0], sample_size, replace=False)
                 X_sample = X_scaled[indices]
-            else:
-                X_sample = X_scaled
+        else:
+            X_sample = X_scaled
+
+        # 2. 使用固定的样本集评估不同聚类数
+        silhouette_scores = []
+        for n in range_clusters:
+            kmeans = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=min(1024, X_sample.shape[0]))
+            cluster_labels = kmeans.fit_predict(X_sample)
+
+            if len(np.unique(cluster_labels)) <= 1:
+                continue
+
+            score = silhouette_score(X_sample, cluster_labels)
+            silhouette_scores.append((n, score))
+
+            # 可以添加简洁的进度日志
+            if len(range_clusters) > 10 and n % (len(range_clusters) // 5) == 0:
+                logger.info(f"  评估进度: {n}/{max(range_clusters)}，当前轮廓系数: {score:.4f}")
 
             kmeans = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=min(1024, X_sample.shape[0]))
             cluster_labels = kmeans.fit_predict(X_sample)
@@ -1105,80 +1229,20 @@ def protein_optimized_clustering(sequences, features, select_features=None, feat
             importance = feature_importance[idx]
             logger.info(f"  {i + 1}. {feature_names[idx]}: {importance:.4f}")
 
-        # 从每个簇中选择代表性样本
-        retained_ids = []
-        retained_info = {}  # 记录选择信息
+    # 从每个簇中选择代表性样本
+    retained_info = {}  # 记录选择信息
 
-        logger.info("从每个簇中选择代表性样本...")
-        with tqdm(total=len(unique_labels), desc="处理簇") as pbar:
-            for cluster_idx, (label, cluster_size) in enumerate(cluster_sizes):
-                # 获取当前簇的索引
-                cluster_indices = np.where(labels == label)[0]
-                cluster_seq_ids = [seq_ids[i] for i in cluster_indices]
-
-                # 计算采样数量
-                sample_count = max(1, int(cluster_size * sample_ratio))
-
-                # 对于小簇，保留所有样本
-                if cluster_size <= 5:
-                    retained_ids.extend(cluster_seq_ids)
-                    retained_info[f"cluster_{label}"] = {
-                        "size": cluster_size,
-                        "selected": cluster_size,
-                        "method": "all_kept"
-                    }
-                    pbar.update(1)
-                    continue
-
-                # 获取簇的特征向量 - 直接使用numpy索引提取
-                cluster_vectors = X_scaled[cluster_indices]
-
-                # 计算簇的中心 - 向量化均值计算
-                cluster_center = np.mean(cluster_vectors, axis=0)
-
-                # 向量化计算到中心的距离
-                distances_to_center = np.linalg.norm(cluster_vectors - cluster_center, axis=1)
-
-                # 分配中心样本和多样性样本的数量
-                center_samples = max(1, int(sample_count * (1 - diversity_ratio)))
-                diverse_samples = sample_count - center_samples
-
-                # 选择最接近中心的样本 - 使用numpy argpartition高效选择
-                center_indices = np.argpartition(distances_to_center, center_samples)[:center_samples]
-                center_ids = [cluster_seq_ids[i] for i in center_indices]
-                retained_ids.extend(center_ids)
-
-                # 如果还需要选择多样性样本
-                if diverse_samples > 0:
-                    # 排除已选的中心样本
-                    remaining_indices = np.setdiff1d(np.arange(len(cluster_indices)), center_indices)
-
-                    if len(remaining_indices) > 0:
-                        remaining_local_indices = [cluster_indices[i] for i in remaining_indices]
-                        remaining_vectors = X_scaled[remaining_local_indices]
-                        remaining_seq_ids = [cluster_seq_ids[i] for i in remaining_indices]
-
-                        # 使用优化后的函数选择多样性样本
-                        selected_diverse = select_diverse_samples_optimized(
-                            remaining_vectors,
-                            X_scaled[[cluster_indices[i] for i in center_indices]],  # 已选中心样本向量
-                            remaining_seq_ids,
-                            diverse_samples
-                        )
-
-                        # 将选出的多样性样本添加到保留列表
-                        retained_ids.extend(selected_diverse)
-
-                # 记录选择结果
-                retained_info[f"cluster_{label}"] = {
-                    "size": cluster_size,
-                    "selected": center_samples + len(selected_diverse if 'selected_diverse' in locals() else []),
-                    "center_samples": center_samples,
-                    "diverse_samples": len(selected_diverse if 'selected_diverse' in locals() else []),
-                    "method": "hybrid"
-                }
-
-                pbar.update(1)
+    logger.info("从每个簇中选择代表性样本...")
+    retained_ids = hybrid_representative_sampling(
+        unique_labels=unique_labels,
+        cluster_sizes=cluster_sizes,
+        labels=labels,
+        seq_ids=seq_ids,
+        X_scaled=X_scaled,
+        sample_ratio=sample_ratio,
+        key_features=feature_ranks[:5],  # 使用前5个重要特征
+        feature_weights=feature_importance[feature_ranks[:5]]  # 对应特征的权重
+    )
 
     # 生成聚类可视化 (如果需要)
     if pca_vis and output_dir:
@@ -1234,6 +1298,14 @@ def protein_optimized_clustering(sequences, features, select_features=None, feat
         except Exception as e:
             logger.error(f"生成可视化时出错: {str(e)}")
 
+    # 确保返回的ID是可哈希类型
+    safe_retained_ids = []
+    for id_item in retained_ids:
+        if isinstance(id_item, list):
+            safe_retained_ids.append(tuple(id_item))
+        else:
+            safe_retained_ids.append(id_item)
+
     # 去重，确保没有重复ID
     retained_ids = list(set(retained_ids))
 
@@ -1242,7 +1314,6 @@ def protein_optimized_clustering(sequences, features, select_features=None, feat
     logger.info(f"AMPs优化聚类完成: 从 {len(sequences)} 个序列中选择了 {len(retained_ids)} 个代表性序列 "
                 f"(占 {len(retained_ids) * 100 / len(sequences):.1f}%, 减少率 {reduction_ratio:.1f}%)，"
                 f"耗时: {elapsed / 60:.1f}分钟")
-
     # 返回结果及统计信息
     return retained_ids, {
         "total": len(sequences),
@@ -1518,8 +1589,247 @@ def load_cached_graphs(cache_dir, cache_id, selected_ids_set):
 
     return cached_graphs
 
+# 定义文件处理函数
+def process_file(file_path):
+    try:
+        # 快速扫描文件以提取ID，而不是完全加载
+        file_ids = scan_file_for_ids(file_path)
+        return file_path, file_ids
+    except Exception as e:
+        logger.debug(f"处理文件 {file_path} 时出错: {str(e)}")
+        return file_path, []
+def index_batch_directory(batch_dir, num_workers=64):
+    """
+    为单个批次目录构建文件到ID的映射索引
+
+    参数:
+        batch_dir (str): 批次目录路径
+        num_workers (int): 并行处理的工作线程数
+
+    返回:
+        dict: 文件路径到包含ID列表的映射 {file_path: [id1, id2, ...]}
+    """
+    import os
+    import glob
+    import time
+    import pickle
+    import concurrent.futures
+    import logging
+
+    # 创建logger对象（如果在主函数中已定义）
+    logger = logging.getLogger(__name__)
+
+    start_time = time.time()
+    batch_file_to_ids = {}
+
+    # 查找批次目录中的所有图谱文件
+    file_pattern = os.path.join(batch_dir, "*.pkl")
+    graph_files = glob.glob(file_pattern)
+
+    if not graph_files:
+        logger.warning(f"批次目录 {batch_dir} 中未找到图谱文件")
+        return {}
+
+    logger.debug(f"在 {batch_dir} 中找到 {len(graph_files)} 个文件")
+
+    # 并行处理文件
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_file, file_path): file_path for file_path in graph_files}
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                file_path, file_ids = future.result()
+                if file_ids:  # 只有在找到ID时才添加到映射
+                    batch_file_to_ids[file_path] = file_ids
+            except Exception as e:
+                file_path = futures[future]
+                logger.debug(f"处理文件 {file_path} 结果时出错: {str(e)}")
+
+    elapsed = time.time() - start_time
+    logger.debug(f"索引批次目录 {batch_dir} 完成: {len(batch_file_to_ids)} 文件, 耗时 {elapsed:.2f}秒")
+
+    return batch_file_to_ids
+
+
+def scan_file_for_ids(file_path):
+    """
+    扫描图谱文件以提取ID列表，无需完全加载文件内容
+
+    参数:
+        file_path (str): 图谱文件路径
+
+    返回:
+        list: 文件中包含的图谱ID列表
+    """
+    import os
+    import pickle
+    import mmap
+
+    # 文件太小，无法使用mmap时的阈值
+    MIN_SIZE_FOR_MMAP = 1024 * 10  # 10KB
+
+    try:
+        file_size = os.path.getsize(file_path)
+
+        # 对于非常小的文件，直接加载
+        if file_size < MIN_SIZE_FOR_MMAP:
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
+
+                # 根据数据结构提取ID
+                if isinstance(data, dict):
+                    # 如果是字典格式，键可能是ID
+                    return list(data.keys())
+                elif isinstance(data, list):
+                    # 如果是列表，每个元素可能包含ID字段
+                    ids = []
+                    for item in data:
+                        if isinstance(item, dict) and 'id' in item:
+                            ids.append(item['id'])
+                    return ids
+                else:
+                    # 假设数据是单个图谱对象
+                    return [getattr(data, 'id', None)] if hasattr(data, 'id') else []
+
+        # 对于大文件，使用内存映射读取头部来提取信息
+        with open(file_path, 'rb') as f:
+            # 只映射文件的前部分来读取头信息
+            header_size = min(file_size, 4096)  # 读取前4KB
+            mm = mmap.mmap(f.fileno(), header_size, access=mmap.ACCESS_READ)
+
+            # 尝试从文件头部提取结构信息
+            try:
+                # 读取pickle头部信息
+                if mm[0:1] == b'\x80':  # pickle协议头的常见字节
+                    # 如果是标准pickle格式，分析文件名来提取ID
+                    file_name = os.path.basename(file_path)
+                    file_name_without_ext = os.path.splitext(file_name)[0]
+
+                    # 假设文件名包含ID信息（通常情况）
+                    if '_' in file_name_without_ext:
+                        parts = file_name_without_ext.split('_')
+                        potential_ids = [part for part in parts if len(part) > 4]  # ID通常较长
+                        if potential_ids:
+                            return potential_ids
+
+                    # 如果无法从文件名提取，返回文件名作为ID
+                    return [file_name_without_ext]
+            except:
+                pass
+
+            # 释放内存映射
+            mm.close()
+
+        # 如果无法从头部提取，加载完整文件（可能较慢）
+        with open(file_path, 'rb') as f:
+            data = pickle.load(f)
+
+            # 重复上面的ID提取逻辑
+            if isinstance(data, dict):
+                return list(data.keys())
+            elif isinstance(data, list):
+                ids = []
+                for item in data:
+                    if isinstance(item, dict) and 'id' in item:
+                        ids.append(item['id'])
+                return ids
+            else:
+                return [getattr(data, 'id', None)] if hasattr(data, 'id') else []
+
+    except Exception as e:
+        # 出错时返回空列表
+        return []
+
+
+def optimized_process_file_batch(file_batch, target_ids, use_mmap=True):
+    """
+    优化的文件批处理函数，支持内存映射和增量处理
+
+    参数:
+        file_batch (list): 要处理的文件路径列表
+        target_ids (list): 目标ID列表
+        use_mmap (bool): 是否使用内存映射技术
+
+    返回:
+        tuple: (加载的图谱字典, 成功处理的ID列表, 批处理总耗时)
+    """
+    import os
+    import time
+    import pickle
+    import mmap
+    import logging
+
+    # 创建logger对象（如果在主函数中已定义）
+    logger = logging.getLogger(__name__)
+
+    start_time = time.time()
+    batch_graphs = {}
+    processed_ids = set()
+
+    # 转换为集合加速查找
+    target_ids_set = set(target_ids)
+
+    for file_path in file_batch:
+        try:
+            file_size = os.path.getsize(file_path)
+
+            # 小文件直接加载
+            if file_size < 1024 * 1024 * 10 or not use_mmap:  # <10MB
+                with open(file_path, 'rb') as f:
+                    file_data = pickle.load(f)
+            else:
+                # 大文件使用内存映射加载
+                with open(file_path, 'rb') as f:
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    file_data = pickle.load(mm)
+                    mm.close()
+
+            # 处理不同的数据格式
+            if isinstance(file_data, dict):
+                # 字典格式：{id: graph_data, ...}
+                relevant_ids = target_ids_set.intersection(file_data.keys())
+                for id_ in relevant_ids:
+                    batch_graphs[id_] = file_data[id_]
+                    processed_ids.add(id_)
+
+            elif isinstance(file_data, list):
+                # 列表格式：[{id: id1, data: ...}, ...]
+                for item in file_data:
+                    if isinstance(item, dict) and 'id' in item:
+                        id_ = item['id']
+                        if id_ in target_ids_set:
+                            batch_graphs[id_] = item
+                            processed_ids.add(id_)
+
+            else:
+                # 单个图谱对象
+                if hasattr(file_data, 'id'):
+                    id_ = getattr(file_data, 'id')
+                    if id_ in target_ids_set:
+                        batch_graphs[id_] = file_data
+                        processed_ids.add(id_)
+
+        except Exception as e:
+            logger.debug(f"处理文件 {file_path} 时出错: {str(e)}")
+            continue
+
+    elapsed = time.time() - start_time
+
+    return batch_graphs, list(processed_ids), elapsed
+
+
+# 并行构建映射
+def build_id_mapping_chunk(file_chunk):
+    chunk_id_to_files = {}
+    for file_path, ids in file_chunk.items():
+        for id_ in ids:
+            if id_ not in chunk_id_to_files:
+                chunk_id_to_files[id_] = []
+            chunk_id_to_files[id_].append(file_path)
+    return chunk_id_to_files
+
 def accelerated_graph_loader(input_path, filtered_ids, num_workers=128, memory_limit_gb=900,
-                             use_cache=True, cache_dir=None, cache_id="graph_data_cache", use_mmap=False,
+                             use_cache=True, cache_dir=None, cache_id="graph_data_cache",
                              load_from_cache_only=False):
     """
     加速版图谱加载器 - 优先从缓存加载，然后按需从源文件加载缺失部分
@@ -1947,23 +2257,103 @@ def process_sequences_and_graphs(input_path, output_dir,
     # 第三步(可选)：序列聚类
     if use_clustering:
         logger.info("步骤3: 序列聚类分析...")
+        cluster_path = os.path.join(output_dir, "clustering_results")
+        os.makedirs(cluster_path, exist_ok=True)
+        # 定义聚类结果文件路径
+        cluster_cache_path = os.path.join(cluster_path, "cluster_results.pkl")
+        feature_cache_path = os.path.join(cluster_path, "protein_features.pkl")
 
-        # 生成序列特征
-        amp_features = parallel_generate_amp_features(
-            filtered_sequences,
-            num_workers=num_workers,
-            batch_size=min(5000, len(filtered_sequences))
-        )
+        # 检查是否已有聚类结果缓存
+        if os.path.exists(cluster_cache_path) and os.path.exists(feature_cache_path):
+            try:
+                logger.info(f"检测到已有聚类结果缓存，正在加载: {cluster_cache_path}")
 
-        # 执行聚类
-        cluster_filtered_ids = protein_optimized_clustering(
-            filtered_sequences,
-            amp_features,
-            n_clusters=n_clusters,
-            sample_ratio=sample_ratio,
-            num_workers=num_workers,
-            output_dir=output_dir
-        )
+                # 加载聚类结果
+                import pickle
+                with open(cluster_cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    cluster_filtered_ids = cache_data['cluster_filtered_ids']
+                    cluster_info = cache_data['cluster_info']
+
+
+                logger.info(f"成功加载缓存的聚类结果: {len(cluster_filtered_ids)}个代表性序列")
+                logger.info(
+                    f"聚类统计: {cluster_info.get('clusters', '未知')}个聚类，去冗余率: {cluster_info.get('reduction_ratio', 0):.1f}%")
+
+            except Exception as e:
+                logger.warning(f"加载聚类缓存失败: {str(e)}，将重新执行聚类分析")
+                use_cache = False
+            else:
+                use_cache = True
+
+        elif os.path.exists(feature_cache_path):
+            import pickle
+            use_cache = False
+            # 加载特征
+            with open(feature_cache_path, 'rb') as f:
+                protein_features = pickle.load(f)
+        else:
+            use_cache = False
+
+        # 如果没有可用缓存，执行聚类
+        if not use_cache:
+            logger.info("未找到有效聚类缓存，开始执行特征生成和聚类分析...")
+            if protein_features is None:
+                logger.info("未找到特征缓存，开始执行特征生成...")
+                # 生成序列特征
+                protein_features = parallel_generate_amp_features(
+                    filtered_sequences,
+                    num_workers=num_workers,
+                    batch_size=min(5000, len(filtered_sequences))
+                )
+
+                # 保存特征缓存
+                try:
+                    import pickle
+                    os.makedirs(os.path.dirname(feature_cache_path), exist_ok=True)
+                    with open(feature_cache_path, 'wb') as f:
+                        pickle.dump(protein_features, f)
+                    logger.info(f"序列特征已保存至: {feature_cache_path}")
+                except Exception as e:
+                    logger.warning(f"保存序列特征失败: {str(e)}")
+            else:
+                logger.info(f"加载了 {len(protein_features)} 个特征")
+
+            # 执行聚类
+            cluster_filtered_ids, cluster_info = protein_optimized_clustering(
+                filtered_sequences,
+                protein_features,
+                n_clusters=n_clusters,
+                sample_ratio=sample_ratio,
+                output_dir=output_dir,
+                num_workers=num_workers,
+            )
+
+            # 确保ID列表中的元素是可哈希类型
+            safe_cluster_ids = []
+            for seq_id in cluster_filtered_ids:
+                if isinstance(seq_id, list):
+                    safe_cluster_ids.append(tuple(seq_id))  # 转换列表为元组
+                else:
+                    safe_cluster_ids.append(seq_id)
+
+            cluster_filtered_ids = safe_cluster_ids
+
+            # 保存聚类结果
+            try:
+                import pickle
+                os.makedirs(os.path.dirname(cluster_cache_path), exist_ok=True)
+                cache_data = {
+                    'cluster_filtered_ids': cluster_filtered_ids,
+                    'cluster_info': cluster_info,
+                    'timestamp': time.time(),
+                    'version': '1.0'
+                }
+                with open(cluster_cache_path, 'wb') as f:
+                    pickle.dump(cache_data, f)
+                logger.info(f"聚类结果已保存至: {cluster_cache_path}")
+            except Exception as e:
+                logger.warning(f"保存聚类结果失败: {str(e)}")
 
         # 更新过滤后的序列
         old_count = len(filtered_sequences)
@@ -1973,7 +2363,7 @@ def process_sequences_and_graphs(input_path, output_dir,
         logger.info(f"聚类分析完成，保留 {len(filtered_sequences)}/{old_count} 个序列")
 
         # 清理内存
-        del amp_features
+        del protein_features
         check_memory_usage(force_gc=True)
 
     # 第四步：检查是否存在图谱文件
@@ -2058,7 +2448,7 @@ def main():
     # 测试参数
     parser.add_argument("--test_mode", "-tm", action="store_true", default=False,
                         help="测试模式，仅处理少量文件 (默认: False)")
-    parser.add_argument("--max_test_files", "-mtf", type=int, default=5,
+    parser.add_argument("--max_test_files", "-mtf", type=int, default=1,
                         help="测试模式下最多处理的文件数 (默认: 5)")
 
     # 缓存参数
@@ -2068,7 +2458,7 @@ def main():
                         help="图谱缓存目录，默认为输入目录下的graph_cache")
 
     # GPU参数
-    parser.add_argument("--gpu_device", "-g", type=str, default=3, help="指定GPU设备ID，例如'0,1'，默认使用所有可用GPU")
+    parser.add_argument("--gpu_device", "-g", type=str, default=1, help="指定GPU设备ID，例如'0,1'，默认使用所有可用GPU")
 
     args = parser.parse_args()
 
