@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-蛋白质知识图谱去冗余工具 (纯缓存图谱版)
+蛋白质知识图谱去冗余工具 (增强特征版)
 
 该脚本功能:
 1. 直接读取预先缓存的图谱文件
 2. 验证图谱缓存的完整性
-3. 执行图谱结构相似度计算和去冗余
+3. 执行图谱结构相似度计算和去冗余，充分利用35维节点特征和8维边特征
 4. 保存去冗余后的结果
 
 作者: wxhfy
@@ -25,146 +25,17 @@ import sys
 import time
 import traceback
 
+
 import numpy as np
-import psutil
+import math
 import torch
 from fsspec.asyn import ResourceError
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from sequence_postprocess import setup_logging, log_system_resources,  set_gpu_device
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-
-def set_gpu_device(device_id):
-    """设置使用的GPU设备ID"""
-    if device_id is not None:
-        try:
-            if torch.cuda.is_available():
-                device_id_list = [int(id.strip()) for id in device_id.split(',')]
-                devices_available = list(range(torch.cuda.device_count()))
-                valid_devices = [id for id in device_id_list if id in devices_available]
-
-                if valid_devices:
-                    # 设置环境变量以限制CUDA可见设备
-                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, valid_devices))
-                    torch.cuda.set_device(valid_devices[0])
-                    logger.info(f"已设置GPU设备: {valid_devices}")
-                else:
-                    logger.warning(f"未找到有效的GPU设备ID: {device_id}，将使用默认设备")
-            else:
-                logger.warning("未检测到可用的CUDA设备，将使用CPU")
-        except Exception as e:
-            logger.warning(f"设置GPU设备时出错: {str(e)}，将使用默认设备")
-
-
-def check_memory_usage(threshold_gb=None, force_gc=False):
-    """检查内存使用情况，并在需要时执行垃圾回收"""
-    try:
-        # 强制垃圾回收（如果要求）
-        if force_gc:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # 获取当前内存使用量
-        mem_used = psutil.Process().memory_info().rss / (1024 ** 3)  # 转换为GB
-
-        # 如果设置了阈值且内存超过阈值
-        if threshold_gb and mem_used > threshold_gb:
-            logger.warning(f"内存使用已达 {mem_used:.2f} GB，超过阈值 {threshold_gb:.2f} GB，执行垃圾回收")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return True
-
-        # 内存使用未超过阈值
-        return False
-
-    except Exception as e:
-        logger.error(f"检查内存使用时出错: {str(e)}")
-        gc.collect()  # 出错时仍执行垃圾回收以确保安全
-        return False
-
-
-def log_system_resources():
-    """记录系统资源使用情况"""
-    try:
-        mem = psutil.virtual_memory()
-        logger.info(f"系统内存: {mem.used / 1024 ** 3:.1f}GB/{mem.total / 1024 ** 3:.1f}GB ({mem.percent}%)")
-
-        swap = psutil.swap_memory()
-        logger.info(f"交换内存: {swap.used / 1024 ** 3:.1f}GB/{swap.total / 1024 ** 3:.1f}GB ({swap.percent}%)")
-
-        cpu_count = psutil.cpu_count()
-        cpu_percent = psutil.cpu_percent(interval=0.1, percpu=True)
-        logger.info(f"CPU核心: {cpu_count}个, 使用率: {sum(cpu_percent) / len(cpu_percent):.1f}%")
-
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                try:
-                    allocated = torch.cuda.memory_allocated(i) / 1024 ** 3
-                    reserved = torch.cuda.memory_reserved(i) / 1024 ** 3
-                    max_mem = torch.cuda.get_device_properties(i).total_memory / 1024 ** 3
-                    logger.info(
-                        f"GPU {i} ({torch.cuda.get_device_name(i)}): 已分配={allocated:.1f}GB, 已保留={reserved:.1f}GB, 总计={max_mem:.1f}GB")
-                except:
-                    logger.info(f"GPU {i}: 无法获取内存信息")
-    except Exception as e:
-        logger.warning(f"无法获取系统资源信息: {str(e)}")
-
-
-def setup_logging(output_dir):
-    """设置日志系统"""
-    os.makedirs(output_dir, exist_ok=True)
-    log_file = os.path.join(output_dir, f"graph_deduplication_{time.strftime('%Y%m%d_%H%M%S')}.log")
-
-    # 创建根日志记录器
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # 捕获所有级别的日志
-
-    # 清除现有处理器
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    # 添加控制台处理器 - 仅显示INFO及以上级别
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    root_logger.addHandler(console)
-
-    # 添加文件处理器 - 记录所有级别（包括DEBUG）
-    file_handler = logging.FileHandler(log_file, mode='w')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    root_logger.addHandler(file_handler)
-
-    # 记录系统信息
-    logger = logging.getLogger(__name__)
-    logger.info(f"日志文件: {log_file}")
-
-    if torch.cuda.is_available():
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        logger.info("未检测到GPU")
-
-    return root_logger, log_file
-
-
-import os
-import io
-import glob
-import time
-import json
-import torch
-import numpy as np
-import traceback
-import logging
-import gc
-from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler
-
 logger = logging.getLogger(__name__)
 
 
@@ -249,7 +120,7 @@ def safe_load_graph(file_path, map_location=None):
 
 
 def graph_feature_extraction(graph):
-    """增强版图谱特征提取 - 充分利用节点和边特征"""
+    """增强版图谱特征提取 - 充分利用35维节点特征和8维边特征"""
     features = []
 
     # 1. 基本拓扑特征
@@ -301,7 +172,141 @@ def graph_feature_extraction(graph):
         dir_feat = edge_attr[:, 6:8]
         features.extend(np.mean(dir_feat, axis=0))
 
+    # 确保所有特征都是有效的浮点数
+    features = [float(f) if not np.isnan(f) else 0.0 for f in features]
     return np.array(features, dtype=np.float32)
+
+
+def split_features(feature_vector):
+    """
+    将特征向量拆分为拓扑特征、节点特征和边特征
+
+    参数:
+        feature_vector: 完整特征向量
+
+    返回:
+        tuple: (拓扑特征, 节点特征, 边特征)
+    """
+    # 基础拓扑特征 - 前3个元素
+    topo_features = feature_vector[:3]
+
+    # 节点特征 - 接下来的部分
+    node_start = 3
+    blosum_mean = feature_vector[node_start:node_start + 20]
+    blosum_std = feature_vector[node_start + 20:node_start + 40]
+
+    coord_start = node_start + 40
+    coord_mean = feature_vector[coord_start:coord_start + 3]
+    coord_std = feature_vector[coord_start + 3:coord_start + 6]
+
+    physchem_start = coord_start + 6
+    physchem_mean = feature_vector[physchem_start:physchem_start + 6]
+    physchem_std = feature_vector[physchem_start + 6:physchem_start + 12]
+
+    struct_start = physchem_start + 12
+    struct_mean = feature_vector[struct_start:struct_start + 6]
+    struct_std = feature_vector[struct_start + 6:struct_start + 12]
+
+    # 边特征 - 最后部分
+    edge_start = struct_start + 12
+    edge_features = feature_vector[edge_start:]
+
+    # 组合节点特征
+    node_features = np.concatenate([
+        blosum_mean, blosum_std,
+        coord_mean, coord_std,
+        physchem_mean, physchem_std,
+        struct_mean, struct_std
+    ])
+
+    return topo_features, node_features, edge_features
+
+
+def compute_hybrid_similarity(feature1, feature2, feature_weights=None):
+    """
+    计算混合相似度，整合拓扑结构、节点特征和边特征
+
+    参数:
+        feature1: 第一个图谱特征向量
+        feature2: 第二个图谱特征向量
+        feature_weights: 特征类型权重字典
+
+    返回:
+        float: 混合相似度得分(0-1)
+    """
+    if feature_weights is None:
+        feature_weights = {
+            'topology': 0.3,  # 拓扑结构权重
+            'node_blosum': 0.15,  # BLOSUM编码权重
+            'node_coord': 0.10,  # 空间坐标权重
+            'node_physchem': 0.15,  # 理化特性权重
+            'node_struct': 0.1,  # 结构特征权重
+            'edge_features': 0.2  # 边特征权重
+        }
+
+    # 确保输入向量长度一致
+    min_len = min(len(feature1), len(feature2))
+    feature1 = feature1[:min_len]
+    feature2 = feature2[:min_len]
+
+    try:
+        # 拆分特征
+        topo1, node1, edge1 = split_features(feature1)
+        topo2, node2, edge2 = split_features(feature2)
+
+        # 节点特征进一步拆分
+        blosum_mean_len = 20
+        coord_mean_len = 3
+        physchem_mean_len = 6
+        struct_mean_len = 6
+
+        # 计算各部分相似度
+        topo_dist = np.linalg.norm(topo1 - topo2)
+        topo_sim = 1.0 / (1.0 + topo_dist / 3.0)  # 归一化
+
+        # 节点特征相似度
+        blosum_start = 0
+        blosum_end = blosum_start + blosum_mean_len * 2
+        blosum_dist = np.linalg.norm(node1[blosum_start:blosum_end] - node2[blosum_start:blosum_end])
+        blosum_sim = 1.0 / (1.0 + blosum_dist / 20.0)
+
+        coord_start = blosum_end
+        coord_end = coord_start + coord_mean_len * 2
+        coord_dist = np.linalg.norm(node1[coord_start:coord_end] - node2[coord_start:coord_end])
+        coord_sim = 1.0 / (1.0 + coord_dist / 3.0)
+
+        physchem_start = coord_end
+        physchem_end = physchem_start + physchem_mean_len * 2
+        physchem_dist = np.linalg.norm(node1[physchem_start:physchem_end] - node2[physchem_start:physchem_end])
+        physchem_sim = 1.0 / (1.0 + physchem_dist / 6.0)
+
+        struct_start = physchem_end
+        struct_end = struct_start + struct_mean_len * 2
+        struct_dist = np.linalg.norm(node1[struct_start:struct_end] - node2[struct_start:struct_end])
+        struct_sim = 1.0 / (1.0 + struct_dist / 6.0)
+
+        # 边特征相似度
+        edge_dist = np.linalg.norm(edge1 - edge2) if len(edge1) > 0 and len(edge2) > 0 else 1.0
+        edge_sim = 1.0 / (1.0 + edge_dist / 8.0)
+
+        # 加权混合相似度
+        hybrid_sim = (
+                feature_weights['topology'] * topo_sim +
+                feature_weights['node_blosum'] * blosum_sim +
+                feature_weights['node_coord'] * coord_sim +
+                feature_weights['node_physchem'] * physchem_sim +
+                feature_weights['node_struct'] * struct_sim +
+                feature_weights['edge_features'] * edge_sim
+        )
+
+        # 确保结果在0-1之间
+        return min(1.0, max(0.0, hybrid_sim))
+    except Exception as e:
+        # 出现错误时回退到简单欧氏距离
+        logger.debug(f"混合相似度计算错误: {str(e)}，使用简单欧氏距离")
+        dist = np.linalg.norm(feature1 - feature2)
+        return 1.0 / (1.0 + dist / 10.0)
+
 
 def process_batch(batch_ids, graphs):
     """
@@ -322,7 +327,7 @@ def process_batch(batch_ids, graphs):
             if feature is not None and not np.isnan(feature).any() and len(feature) > 0:
                 batch_features[graph_id] = feature
         except Exception as e:
-            pass  # 简化错误处理
+            logger.debug(f"处理图谱 {graph_id} 特征提取错误: {str(e)}")
     return batch_features
 
 
@@ -330,34 +335,41 @@ def compute_graph_level_features(graph):
     """计算图谱级别特征，包括拓扑特征"""
     features = []
 
-    # 计算连通分量数量
-    if hasattr(graph, 'edge_index') and graph.edge_index is not None:
-        import networkx as nx
-        # 转换为NetworkX图进行拓扑分析
-        G = nx.Graph()
-        edge_list = graph.edge_index.t().numpy()
-        G.add_edges_from(edge_list)
+    try:
+        # 计算连通分量数量
+        if hasattr(graph, 'edge_index') and graph.edge_index is not None:
+            import networkx as nx
+            # 转换为NetworkX图进行拓扑分析
+            G = nx.Graph()
+            edge_list = graph.edge_index.t().numpy()
+            G.add_edges_from(edge_list)
 
-        # 计算图拓扑特征
-        num_connected_components = nx.number_connected_components(G)
-        clustering_coef = nx.average_clustering(G)
-        try:
-            diameter = max(nx.eccentricity(G.subgraph(c)) for c in nx.connected_components(G))
-        except:
-            diameter = 0
+            # 计算图拓扑特征
+            num_connected_components = nx.number_connected_components(G)
+            clustering_coef = nx.average_clustering(G)
+            try:
+                diameter = max(nx.eccentricity(G.subgraph(c)) for c in nx.connected_components(G))
+            except:
+                diameter = 0
 
-        features.extend([num_connected_components, clustering_coef, diameter])
+            features.extend([num_connected_components, clustering_coef, diameter])
 
-        # 计算度分布统计
-        degrees = [d for _, d in G.degree()]
-        features.extend([np.mean(degrees), np.std(degrees), np.max(degrees)])
+            # 计算度分布统计
+            degrees = [d for _, d in G.degree()]
+            features.extend([np.mean(degrees), np.std(degrees), np.max(degrees)])
+
+    except Exception as e:
+        # 如果无法计算拓扑特征，返回默认值
+        features.extend([1, 0, 0, 0, 0, 0])
 
     return np.array(features, dtype=np.float32)
 
+
 def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similarity_threshold=0.85,
-                                       batch_size=10000, processing_batch_size=1000):
+                                       batch_size=100000, processing_batch_size=10000,
+                                       feature_weights=None, multi_file_batch=10, max_graphs_per_file=50000):
     """
-    分批加载和处理图谱，执行特征提取和相似度去冗余
+    增强版图谱相似度计算与去冗余 - 使用混合相似度算法与多文件批处理
 
     参数:
         cache_dir: 缓存目录路径
@@ -366,31 +378,38 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
         similarity_threshold: 相似度阈值，默认0.85
         batch_size: 每次从文件加载的图谱数量
         processing_batch_size: 特征提取的批处理大小
+        feature_weights: 特征权重配置
+        multi_file_batch: 一次处理的文件数量
+        max_graphs_per_file: 每个结果文件中最多包含的图谱数量
 
     返回:
         list: 处理结果文件列表
     """
-    import os
-    import torch
-    import numpy as np
-    import json
-    import glob
-    import time
-    import gc
-    import traceback
-    from tqdm import tqdm
-    from sklearn.preprocessing import StandardScaler
+    # 设置默认权重
+    if feature_weights is None:
+        feature_weights = {
+            'topology': 0.3,  # 拓扑结构权重
+            'node_blosum': 0.15,  # BLOSUM编码权重
+            'node_coord': 0.10,  # 空间坐标权重
+            'node_physchem': 0.15,  # 理化特性权重
+            'node_struct': 0.1,  # 结构特征权重
+            'edge_features': 0.2  # 边特征权重
+        }
 
-    # 创建输出目录
+    # 创建输出目录结构
     os.makedirs(output_dir, exist_ok=True)
+    temp_dir = os.path.join(output_dir, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    result_dir = os.path.join(output_dir, "results")
+    os.makedirs(result_dir, exist_ok=True)
 
     # 查找所有缓存文件
     cache_files = sorted(glob.glob(os.path.join(cache_dir, f"{cache_id}_part_*.pt")))
     if not cache_files:
         logger.error(f"未找到任何缓存文件: {os.path.join(cache_dir, f'{cache_id}_part_*.pt')}")
-        return {}
+        return []
 
-    logger.info(f"找到 {len(cache_files)} 个缓存文件，开始分批处理图谱")
+    logger.info(f"找到 {len(cache_files)} 个缓存文件，将以每批 {multi_file_batch} 个文件进行处理")
 
     # 记录处理开始时间
     start_time = time.time()
@@ -409,7 +428,7 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
 
         if not test_data:
             logger.error("无法加载测试文件来估计特征维度")
-            return {}
+            return []
 
         # 提取测试特征确定维度
         test_id = next(iter(test_data))
@@ -425,7 +444,7 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
 
         # 从首个文件采样训练标准化器
         sample_features = []
-        sample_count = min(2000, len(test_data))
+        sample_count = min(5000, len(test_data))
         sample_ids = list(test_data.keys())[:sample_count]
 
         logger.info(f"从 {len(sample_ids)} 个样本训练标准化器...")
@@ -446,7 +465,7 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
 
     except ImportError:
         logger.error("未安装FAISS库，无法继续图谱相似度计算")
-        return {}
+        return []
 
     # 跟踪已处理和已保留的图谱ID
     processed_ids = set()
@@ -456,34 +475,43 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
     total_graph_count = 0
     total_retained = 0
 
-    # 为中间结果创建临时目录
-    temp_output_dir = os.path.join(output_dir, "temp_similarity_results")
-    os.makedirs(temp_output_dir, exist_ok=True)
+    # 保存中间结果的列表
+    temp_result_files = []
 
-    # 处理结果文件列表
-    result_files = []
+    # 按批次处理文件
+    file_batches = [cache_files[i:i + multi_file_batch] for i in range(0, len(cache_files), multi_file_batch)]
+    logger.info(f"文件已分为 {len(file_batches)} 个批次，每批次 {multi_file_batch} 个文件")
 
-    # 处理每个缓存文件
-    with tqdm(total=len(cache_files), desc="处理图谱缓存文件") as pbar:
-        for file_idx, file_path in enumerate(cache_files):
+    # 处理每批文件
+    with tqdm(total=len(file_batches), desc="处理图谱缓存批次") as pbar:
+        for batch_idx, file_batch in enumerate(file_batches):
             batch_start = time.time()
-            logger.info(f"处理文件 {file_idx + 1}/{len(cache_files)}: {os.path.basename(file_path)}")
+            logger.info(f"处理批次 {batch_idx + 1}/{len(file_batches)}: 包含 {len(file_batch)} 个文件")
 
             try:
-                # 安全加载图谱
-                graphs_batch = safe_load_graph(file_path, map_location='cpu')
+                # 加载所有当前批次文件的图谱
+                combined_graphs = {}
+                batch_file_count = 0
 
-                if not graphs_batch:
-                    logger.warning(f"文件加载失败或为空: {os.path.basename(file_path)}")
+                # 加载当前批次所有文件
+                for file_path in file_batch:
+                    file_graphs = safe_load_graph(file_path, map_location='cpu')
+                    if file_graphs:
+                        combined_graphs.update(file_graphs)
+                        batch_file_count += 1
+
+                if not combined_graphs:
+                    logger.warning(f"批次 {batch_idx + 1} 中所有文件加载均为空")
                     pbar.update(1)
                     continue
 
                 # 更新计数器
-                total_graph_count += len(graphs_batch)
-                logger.info(f"加载了 {len(graphs_batch)} 个图谱，累计处理: {total_graph_count}")
+                total_graph_count += len(combined_graphs)
+                logger.info(
+                    f"批次 {batch_idx + 1} 加载了 {len(combined_graphs)} 个图谱，已处理文件数: {batch_file_count}/{len(file_batch)}")
 
                 # 只处理新图谱
-                new_graphs = {id: graph for id, graph in graphs_batch.items() if id not in processed_ids}
+                new_graphs = {id: graph for id, graph in combined_graphs.items() if id not in processed_ids}
                 logger.info(f"本批次有 {len(new_graphs)} 个新图谱需要处理")
 
                 if not new_graphs:
@@ -552,11 +580,14 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
                         k = min(100, len(feature_matrix))  # 限制查询数量
                         distances, neighbors = batch_index.search(query_vector, k)
 
-                        # 标记相似图谱为已处理
+                        # 标记相似图谱为已处理 - 使用混合相似度计算
                         for j, dist in zip(neighbors[0][1:], distances[0][1:]):  # 跳过自身
                             if j < len(feature_ids):
-                                # 计算相似度得分 (L2距离转换为相似度)
-                                similarity = 1.0 / (1.0 + dist / 10.0)  # 调整为更合适的相似度映射
+                                # 使用混合相似度计算
+                                feature1 = feature_matrix[idx]
+                                feature2 = feature_matrix[j]
+                                similarity = compute_hybrid_similarity(feature1, feature2, feature_weights)
+
                                 if similarity > similarity_threshold:
                                     similar_id = feature_ids[j]
                                     if similar_id not in processed_ids:
@@ -572,17 +603,18 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
 
                     # 记录批次结果
                     logger.info(
-                        f"批次 {file_idx + 1} 处理完成: 保留 {len(batch_filtered_graphs)}/{len(new_graphs)} 个图谱 (总保留: {total_retained})")
+                        f"批次 {batch_idx + 1} 处理完成: 保留 {len(batch_filtered_graphs)}/{len(new_graphs)} 个图谱 (累计保留: {total_retained})")
 
-                    # 保存当前批次结果
+                    # 保存当前批次结果为临时文件
                     if batch_filtered_graphs:
-                        result_file = os.path.join(temp_output_dir, f"similar_filtered_{file_idx}.pt")
-                        torch.save(batch_filtered_graphs, result_file)
-                        result_files.append(result_file)
-                        logger.info(f"批次结果已保存至: {result_file}")
+                        temp_file = os.path.join(temp_dir, f"batch_{batch_idx + 1}_filtered.pt")
+                        torch.save(batch_filtered_graphs, temp_file)
+                        temp_result_files.append((temp_file, len(batch_filtered_graphs)))
+                        logger.info(
+                            f"批次 {batch_idx + 1} 结果已保存至临时文件: {temp_file} (包含 {len(batch_filtered_graphs)} 个图谱)")
 
                 # 释放资源
-                del graphs_batch
+                del combined_graphs
                 del new_graphs
                 del features
                 if 'feature_matrix' in locals():
@@ -591,15 +623,76 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
 
                 # 更新进度
                 pbar.update(1)
-                pbar.set_postfix({"保留率": f"{total_retained * 100 / total_graph_count:.1f}%"})
+                pbar.set_postfix({
+                    "保留率": f"{total_retained * 100 / total_graph_count:.1f}%",
+                    "已处理": f"{batch_idx + 1}/{len(file_batches)}"
+                })
                 logger.info(f"批次处理用时: {time.time() - batch_start:.2f}秒")
 
             except Exception as e:
-                logger.error(f"处理文件出错: {os.path.basename(file_path)}")
+                logger.error(f"处理批次 {batch_idx + 1} 出错")
                 logger.error(traceback.format_exc())
                 pbar.update(1)
 
-    # 处理完成后，合并和保存最终结果
+    # 处理完成后，按固定数量分块保存最终结果
+    result_files = []
+
+    if temp_result_files:
+        logger.info(f"开始重新分块保存结果，每个文件最多包含 {max_graphs_per_file} 个图谱")
+
+        # 计算总图谱数量
+        total_retained_confirmed = sum(count for _, count in temp_result_files)
+
+        # 计算需要的文件数量
+        num_result_files = math.ceil(total_retained_confirmed / max_graphs_per_file)
+        logger.info(f"将分成 {num_result_files} 个结果文件进行保存")
+
+        # 创建进度条
+        with tqdm(total=total_retained_confirmed, desc="重新分块保存") as save_pbar:
+            current_graphs = {}
+            current_count = 0
+            file_idx = 1
+
+            # 遍历所有临时文件
+            for temp_file, _ in temp_result_files:
+                try:
+                    # 加载临时文件中的图谱
+                    batch_graphs = safe_load_graph(temp_file, map_location='cpu')
+
+                    if not batch_graphs:
+                        continue
+
+                    # 添加到当前块
+                    for gid, graph in batch_graphs.items():
+                        current_graphs[gid] = graph
+                        current_count += 1
+
+                        # 达到最大数量，保存当前块
+                        if current_count >= max_graphs_per_file:
+                            result_file = os.path.join(result_dir, f"nonredundant_graphs_part_{file_idx}.pt")
+                            torch.save(current_graphs, result_file)
+                            result_files.append(result_file)
+                            logger.info(
+                                f"已保存结果文件 {file_idx}/{num_result_files}: {result_file} (包含 {len(current_graphs)} 个图谱)")
+
+                            # 重置
+                            current_graphs = {}
+                            current_count = 0
+                            file_idx += 1
+
+                        save_pbar.update(1)
+
+                except Exception as e:
+                    logger.error(f"加载临时文件 {temp_file} 时出错: {str(e)}")
+
+            # 保存最后一个不满的块
+            if current_graphs:
+                result_file = os.path.join(result_dir, f"nonredundant_graphs_part_{file_idx}.pt")
+                torch.save(current_graphs, result_file)
+                result_files.append(result_file)
+                logger.info(f"已保存最后一个结果文件: {result_file} (包含 {len(current_graphs)} 个图谱)")
+
+    # 总结处理结果
     total_time = time.time() - start_time
     logger.info("=" * 50)
     logger.info(f"图谱相似度计算与去冗余处理完成")
@@ -617,38 +710,37 @@ def load_and_process_graphs_in_batches(cache_dir, cache_id, output_dir, similari
         json.dump(list(retained_graph_ids), f)
     logger.info(f"保留的图谱ID已保存至: {retained_ids_file}")
 
-    # 如果需要，合并所有结果到一个文件
-    if result_files and len(result_files) > 0:
-        merged_file = os.path.join(output_dir, "merged_nonredundant_graphs.pt")
-        try:
-            logger.info(f"合并 {len(result_files)} 个结果文件...")
-            merged_graphs = {}
+    # 创建索引文件
+    index_file = os.path.join(result_dir, "graphs_index.json")
+    index_data = {
+        "total_files": len(result_files),
+        "total_graphs": total_retained,
+        "graphs_per_file": max_graphs_per_file,
+        "file_list": [os.path.basename(f) for f in result_files],
+        "file_sizes": [len(safe_load_graph(f)) for f in result_files]
+    }
+    with open(index_file, 'w') as f:
+        json.dump(index_data, f, indent=2)
+    logger.info(f"已创建索引文件: {index_file}")
 
-            for result_file in tqdm(result_files, desc="合并结果"):
-                batch_graphs = safe_load_graph(result_file)
-                merged_graphs.update(batch_graphs)
+    # 更新元数据
+    meta_output_path = os.path.join(output_dir, "similarity_meta.json")
+    meta_info = {
+        "original_count": total_graph_count,
+        "filtered_count": total_retained,
+        "retention_rate": float(total_retained) / total_graph_count if total_graph_count > 0 else 0,
+        "similarity_threshold": similarity_threshold,
+        "feature_weights": feature_weights,
+        "processing_time": total_time,
+        "timestamp": time.time(),
+        "date": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "multi_file_batch": multi_file_batch,
+        "max_graphs_per_file": max_graphs_per_file,
+        "result_files": len(result_files)
+    }
 
-            # 保存合并结果
-            torch.save(merged_graphs, merged_file)
-            logger.info(f"合并完成，保存 {len(merged_graphs)} 个非冗余图谱至: {merged_file}")
-
-            # 更新元数据
-            meta_output_path = os.path.join(output_dir, "similarity_meta.json")
-            meta_info = {
-                "original_count": total_graph_count,
-                "filtered_count": total_retained,
-                "retention_rate": float(total_retained) / total_graph_count if total_graph_count > 0 else 0,
-                "similarity_threshold": similarity_threshold,
-                "processing_time": total_time,
-                "timestamp": time.time(),
-                "date": time.strftime('%Y-%m-%d %H:%M:%S')
-            }
-
-            with open(meta_output_path, 'w') as f:
-                json.dump(meta_info, f, indent=2)
-
-        except Exception as e:
-            logger.error(f"合并结果文件时出错: {str(e)}")
+    with open(meta_output_path, 'w') as f:
+        json.dump(meta_info, f, indent=2)
 
     return result_files
 
@@ -680,7 +772,7 @@ def save_statistics(output_dir, original_count, filtered_count):
         f.write(f"保留率: {retention_rate:.2f}%\n")
         f.write(f"冗余率: {redundancy_rate:.2f}%\n\n")
         f.write("=" * 40 + "\n")
-        f.write("说明: 本系统使用图神经网络特征和FAISS向量相似度进行图谱去冗余\n")
+        f.write("说明: 本系统使用混合相似度算法进行图谱去冗余，充分利用节点特征(35维)和边特征(8维)\n")
 
     # 同时保存JSON格式便于程序读取
     json_file = os.path.join(output_dir, "similarity_stats.json")
@@ -756,7 +848,7 @@ def increase_file_limit():
         logger.info(f"当前文件描述符限制: soft={soft}, hard={hard}")
 
         # 设置新的软限制（不超过硬限制）
-        new_soft = max(hard, 65536)  # 设置为65536或硬限制中较小者
+        new_soft = min(hard, 65536)  # 设置为65536或硬限制中较小者
         resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
 
         # 验证新限制是否生效
@@ -776,8 +868,8 @@ def main():
     # 输入输出参数
     parser.add_argument("--cache_dir", "-c", type=str, required=True,
                         help="图谱缓存目录路径")
-    parser.add_argument("--cache_id", "-ci", type=str, default="graph_data_cache",
-                        help="图谱缓存ID前缀 (默认: graph_data_cache)")
+    parser.add_argument("--cache_id", "-ci", type=str, default="filtered_graphs",
+                        help="图谱缓存ID前缀 (默认: filtered_graphs)")
     parser.add_argument("--output_dir", "-o", type=str, default="./filtered_graphs",
                         help="输出目录路径 (默认: ./filtered_graphs)")
 
@@ -786,28 +878,45 @@ def main():
                         help="图谱相似度阈值 (默认: 0.85)")
 
     # 性能参数
-    parser.add_argument("--processing_batch_size", "-pbs", type=int, default=2000,
-                        help="特征提取批处理大小 (默认: 1000)")
-    parser.add_argument("--file_batch_size", "-fbs", type=int, default=50000,
-                        help="文件加载批处理大小 (默认: 50000)")
+    parser.add_argument("--processing_batch_size", "-pbs", type=int, default=50000,
+                        help="特征提取批处理大小 (默认: 50000)")
+    parser.add_argument("--file_batch_size", "-fbs", type=int, default=200000,
+                        help="文件加载批处理大小 (默认: 200000)")
+
+    # 特征权重参数
+    parser.add_argument("--topo_weight", type=float, default=0.3,
+                        help="拓扑结构特征权重 (默认: 0.3)")
+    parser.add_argument("--blosum_weight", type=float, default=0.15,
+                        help="BLOSUM编码特征权重 (默认: 0.15)")
+    parser.add_argument("--coord_weight", type=float, default=0.1,
+                        help="空间坐标特征权重 (默认: 0.1)")
+    parser.add_argument("--physchem_weight", type=float, default=0.15,
+                        help="理化特性特征权重 (默认: 0.15)")
+    parser.add_argument("--struct_weight", type=float, default=0.1,
+                        help="结构特征权重 (默认: 0.1)")
+    parser.add_argument("--edge_weight", type=float, default=0.2,
+                        help="边特征权重 (默认: 0.2)")
 
     # 采样参数
     parser.add_argument("--use_sampling", "-s", action="store_true", default=False,
                         help="对大数据集进行采样处理 (默认: False)")
     parser.add_argument("--sample_ratio", "-sr", type=float, default=0.1,
                         help="采样比例 (默认: 0.1)")
+    # 多文件批处理参数
+    parser.add_argument("--multi_file_batch", "-mfb", type=int, default=10,
+                        help="一次处理的文件数量 (默认: 10)")
+    # GPU参数
+    parser.add_argument("--gpu_device", "-g", type=str, default=0,
+                        help="指定GPU设备ID，例如'0,1'")
 
     args = parser.parse_args()
 
+    # 设置GPU设备
+    if args.gpu_device:
+        set_gpu_device(args.gpu_device)
+
     # 尝试增加文件描述符限制
-    try:
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        new_soft = max(hard, 65536)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
-        logger.info(f"文件描述符限制: {soft} → {new_soft}")
-    except:
-        pass
+    increase_file_limit()
 
     # 设置输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -818,6 +927,16 @@ def main():
 
     # 记录系统资源状态
     log_system_resources()
+
+    # 配置特征权重
+    feature_weights = {
+        'topology': args.topo_weight,
+        'node_blosum': args.blosum_weight,
+        'node_coord': args.coord_weight,
+        'node_physchem': args.physchem_weight,
+        'node_struct': args.struct_weight,
+        'edge_features': args.edge_weight
+    }
 
     # 打印运行配置
     logger.info("运行配置:")
@@ -831,6 +950,15 @@ def main():
     if args.use_sampling:
         logger.info(f"- 采样比例: {args.sample_ratio}")
 
+    # 打印特征权重设置
+    logger.info("特征权重配置:")
+    logger.info(f"- 拓扑结构权重: {feature_weights['topology']}")
+    logger.info(f"- BLOSUM编码权重: {feature_weights['node_blosum']}")
+    logger.info(f"- 空间坐标权重: {feature_weights['node_coord']}")
+    logger.info(f"- 理化特性权重: {feature_weights['node_physchem']}")
+    logger.info(f"- 结构特征权重: {feature_weights['node_struct']}")
+    logger.info(f"- 边特征权重: {feature_weights['edge_features']}")
+
     try:
         # 检查FAISS是否可用
         try:
@@ -842,14 +970,16 @@ def main():
             logger.error("未安装FAISS库，无法进行图谱去冗余")
             return
 
-        # 使用新的批处理方法
+        # 使用增强的批处理方法
         result_files = load_and_process_graphs_in_batches(
             cache_dir=args.cache_dir,
             cache_id=args.cache_id,
             output_dir=args.output_dir,
             similarity_threshold=args.similarity_threshold,
             batch_size=args.file_batch_size,
-            processing_batch_size=args.processing_batch_size
+            processing_batch_size=args.processing_batch_size,
+            feature_weights=feature_weights,
+            multi_file_batch=args.multi_file_batch
         )
 
         if result_files:

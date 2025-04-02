@@ -3,7 +3,7 @@ import torch
 from torch_geometric.data import Data
 
 # 加载图谱数据
-data_path = "/home/20T-1/fyh0106/kg/ALL/batch_1/knowledge_graphs_pyg/protein_kg_chunk_1.pt"
+data_path = "/home/20T-1/fyh0106/kg/FILTERED/filtered_graphs/merged_nonredundant_graphs.pt"
 graph_data = torch.load(data_path)
 
 # 检查第一个图谱
