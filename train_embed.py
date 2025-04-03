@@ -26,6 +26,7 @@ from pathlib import Path
 import seaborn as sns
 from matplotlib import pyplot as plt
 from pandas.io.formats.style import subset_args
+from torch_geometric.data import Data, Batch, InMemoryDataset
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -50,6 +51,38 @@ os.environ["ESM_CACHE_DIR"] = "data/weight"  # 指定包含模型文件的目录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+class ProteinData(Data):
+    def __init__(self, **kwargs):
+        # 分离字符串字段
+        self.string_data = {
+            k: v for k, v in kwargs.items()
+            if isinstance(v, (str, list)) and not isinstance(v, (torch.Tensor, np.ndarray))
+        }
+
+        # 仅保留数值字段给父类
+        super().__init__(**{
+            k: v for k, v in kwargs.items()
+            if k not in self.string_data
+        })
+
+    def __getitem__(self, key):
+        # 优先从字符串数据中查找
+        if key in self.string_data:
+            return self.string_data[key]
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        if isinstance(value, (str, list)) and not isinstance(value, (torch.Tensor, np.ndarray)):
+            self.string_data[key] = value
+        else:
+            super().__setitem__(key, value)
+
+    def keys(self):
+        return list(super().keys()) + list(self.string_data.keys())
+
+    def to_dict(self):
+        return {**super().to_dict(), **self.string_data}
 
 class ProteinMultiModalTrainer:
     """蛋白质多模态融合训练器"""
@@ -134,14 +167,7 @@ class ProteinMultiModalTrainer:
             self.esm_model = ESMC.from_pretrained(self.config.ESM_MODEL_NAME, device=self.device)
             logger.info(f"ESM模型成功加载: {self.config.ESM_MODEL_NAME}")
 
-            # 跳过模型测试，避免维度错误
-            logger.info("ESM模型已加载，跳过测试阶段以避免维度错误")
 
-            # 打印模型信息供调试
-            if hasattr(self.esm_model, "embedding_dim"):
-                logger.info(f"ESM模型嵌入维度: {self.esm_model.embedding_dim}")
-            else:
-                logger.info("ESM模型嵌入维度未知，使用配置中的默认值")
         except Exception as e:
             logger.error(f"ESM模型加载失败: {e}")
             logger.error(f"环境变量: ESM_CACHE_DIR={os.environ.get('ESM_CACHE_DIR')}")
@@ -426,7 +452,7 @@ class ProteinMultiModalTrainer:
 
     def _extract_sequences_from_graphs(self, graphs_batch):
         """
-        从PyG图批次中提取序列
+        从PyG图批次中提取序列 - 兼容自定义ProteinData
 
         参数:
             graphs_batch: PyG图数据批次
@@ -436,6 +462,11 @@ class ProteinMultiModalTrainer:
         """
         sequences = []
 
+        # 检查是否有sequence字段且为列表
+        if hasattr(graphs_batch, 'sequence'):
+            if isinstance(graphs_batch.sequence, list):
+                return graphs_batch.sequence
+
         # 遍历批次中的每个图
         for i in range(graphs_batch.num_graphs):
             # 获取当前图的掩码
@@ -444,25 +475,25 @@ class ProteinMultiModalTrainer:
             # 提取节点特征
             x = graphs_batch.x[mask]
 
-            # 尝试多种方式提取序列
+            # 获取序列
             sequence = None
 
-            # 方法1: 尝试从图属性中提取
+            # 尝试从图属性中提取
             if hasattr(graphs_batch, 'sequence'):
-                sequence_list = graphs_batch.sequence
-                if isinstance(sequence_list, list) and i < len(sequence_list):
-                    sequence = sequence_list[i]
+                # 对于ProteinData，sequence已转换为列表
+                if isinstance(graphs_batch.sequence, list) and i < len(graphs_batch.sequence):
+                    sequence = graphs_batch.sequence[i]
 
-            # 方法2: 尝试从节点特征中提取氨基酸信息
+            # 如果无法从属性获取，尝试从节点特征生成
             if sequence is None:
-                # 假设节点特征的前20维是氨基酸的one-hot编码
                 try:
+                    # 假设前20维是氨基酸的one-hot编码
                     aa_indices = torch.argmax(x[:, :20], dim=1).cpu().numpy()
                     aa_map = 'ACDEFGHIKLMNPQRSTVWY'
                     sequence = ''.join([aa_map[idx] for idx in aa_indices])
                 except:
-                    # 如果无法从节点特征提取，使用占位符
-                    sequence = 'A' * x.shape[0]  # 使用序列长度的"A"占位
+                    # 使用占位符
+                    sequence = 'A' * x.shape[0]
 
             sequences.append(sequence)
 
@@ -470,7 +501,7 @@ class ProteinMultiModalTrainer:
 
     def _get_fused_embedding(self, graph_batch, sequences=None):
         """
-        获取图嵌入和序列嵌入的融合表示
+        获取图嵌入和序列嵌入的融合表示 - 适应字符串字段版本
 
         参数:
             graph_batch: PyG图数据批次
@@ -592,141 +623,216 @@ class ProteinMultiModalTrainer:
 
     def train_epoch(self, train_loader, epoch):
         """
-        训练一个epoch
+        训练一个epoch - 优化版本
 
         参数:
-            train_loader: 训练数据加载器
+            train_loader: 训练数据加载器，包含ProteinData对象的批次
             epoch: 当前epoch数
 
         返回:
             dict: 训练统计信息
         """
+        # 设置模型为训练模式
         self.graph_encoder.train()
         self.latent_mapper.train()
         self.contrast_head.train()
         self.fusion_module.train()
 
+        # 初始化统计信息
         epoch_stats = {
-            'loss': 0.0,
-            'contrast_loss': 0.0,
-            'consistency_loss': 0.0,
-            'structure_loss': 0.0,
-            'graph_latent_norm': 0.0,
-            'seq_emb_norm': 0.0,
-            'batch_count': 0
+            'loss': 0.0,  # 总损失
+            'contrast_loss': 0.0,  # 对比损失
+            'consistency_loss': 0.0,  # 一致性损失
+            'structure_loss': 0.0,  # 结构损失
+            'graph_latent_norm': 0.0,  # 图潜空间嵌入范数
+            'seq_emb_norm': 0.0,  # 序列嵌入范数
+            'batch_count': 0,  # 成功处理的批次数
+            'skipped_batches': 0  # 跳过的批次数
         }
 
-        # 设置进度条
+        # 设置进度条（仅在主进程上）
         if self.is_master:
             pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}/{self.config.EPOCHS}")
 
         # 训练循环
         for batch_idx, batch in enumerate(train_loader):
-            # 将数据移到设备上
-            batch = batch.to(self.device)
+            try:
+                # 基本数据验证
+                if batch is None:
+                    logger.warning(f"批次 {batch_idx} 为空，跳过")
+                    if self.is_master:
+                        pbar.update(1)
+                    epoch_stats['skipped_batches'] += 1
+                    continue
 
-            # 清零梯度
-            self.optimizer.zero_grad()
+                # 确保批次包含必要的图数据属性
+                required_attrs = ['x', 'edge_index', 'batch']
+                missing_attrs = [attr for attr in required_attrs if not hasattr(batch, attr)]
+                if missing_attrs:
+                    logger.warning(f"批次 {batch_idx} 缺少必要属性: {missing_attrs}，跳过")
+                    if self.is_master:
+                        pbar.update(1)
+                    epoch_stats['skipped_batches'] += 1
+                    continue
 
-            # 混合精度训练
-            with autocast(enabled=self.fp16_training):
-                # 获取图嵌入和序列嵌入
-                graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch)
+                # 数据预处理 - 确保字符串字段正确处理
+                if hasattr(batch, 'sequence') and not isinstance(batch.sequence, list):
+                    # 确保sequence是列表形式，便于后续处理
+                    logger.warning(f"批次 {batch_idx} 的sequence字段不是列表，尝试修复")
+                    try:
+                        if isinstance(batch.sequence, str):
+                            # 单个序列转换为列表
+                            batch.sequence = [batch.sequence] * batch.num_graphs
+                    except Exception as e:
+                        logger.error(f"修复sequence字段失败: {e}")
 
-                # 计算融合损失
-                loss, loss_dict = self.protein_fusion_loss(
-                    graph_embedding,
-                    seq_embedding,
-                    graph_latent,
-                    fused_embedding,
-                    batch
-                )
+                # 将数据移到指定设备
+                batch = batch.to(self.device)
 
-            # 反向传播
-            if self.fp16_training:
-                self.scaler.scale(loss).backward()
+                # 清零梯度
+                self.optimizer.zero_grad()
 
-                # 梯度裁剪
-                if self.config.GRADIENT_CLIP > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.graph_encoder.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.latent_mapper.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.contrast_head.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.fusion_module.parameters(), self.config.GRADIENT_CLIP)
+                # 使用混合精度训练（如果启用）
+                with autocast(enabled=self.fp16_training):
+                    # 获取图嵌入和序列嵌入
+                    graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch)
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
+                    # 计算融合损失
+                    loss, loss_dict = self.protein_fusion_loss(
+                        graph_embedding,
+                        seq_embedding,
+                        graph_latent,
+                        fused_embedding,
+                        batch
+                    )
 
-                # 梯度裁剪
-                if self.config.GRADIENT_CLIP > 0:
-                    torch.nn.utils.clip_grad_norm_(self.graph_encoder.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.latent_mapper.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.contrast_head.parameters(), self.config.GRADIENT_CLIP)
-                    torch.nn.utils.clip_grad_norm_(self.fusion_module.parameters(), self.config.GRADIENT_CLIP)
+                # 反向传播 - 混合精度版本
+                if self.fp16_training:
+                    self.scaler.scale(loss).backward()
 
-                self.optimizer.step()
+                    # 梯度裁剪（如果启用）
+                    if self.config.GRADIENT_CLIP > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.graph_encoder.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.latent_mapper.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.contrast_head.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.fusion_module.parameters(), self.config.GRADIENT_CLIP)
 
-            # 累积统计信息
-            epoch_stats['loss'] += loss.item()
-            epoch_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
-            epoch_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
-            epoch_stats['structure_loss'] += loss_dict['structure_loss'].item()
-            epoch_stats['graph_latent_norm'] += torch.norm(graph_latent.detach(), dim=1).mean().item()
-            epoch_stats['seq_emb_norm'] += torch.norm(seq_embedding.detach(), dim=1).mean().item()
-            epoch_stats['batch_count'] += 1
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # 标准反向传播
+                    loss.backward()
 
-            # 更新全局步数
-            self.global_step += 1
+                    # 梯度裁剪（如果启用）
+                    if self.config.GRADIENT_CLIP > 0:
+                        torch.nn.utils.clip_grad_norm_(self.graph_encoder.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.latent_mapper.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.contrast_head.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(self.fusion_module.parameters(), self.config.GRADIENT_CLIP)
 
-            # 学习率预热
-            if self.warmup_scheduler is not None and self.global_step < self.config.WARMUP_STEPS:
-                self.warmup_scheduler.step()
+                    self.optimizer.step()
 
-            # 更新进度条
-            if self.is_master:
-                pbar.update(1)
-                if batch_idx % self.config.LOG_INTERVAL == 0:
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    pbar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'c_loss': f"{loss_dict['contrast_loss'].item():.4f}",
-                        'cons_loss': f"{loss_dict['consistency_loss'].item():.4f}",
-                        'lr': f"{current_lr:.6f}"
-                    })
+                # 累积统计信息
+                epoch_stats['loss'] += loss.item()
+                epoch_stats['contrast_loss'] += loss_dict['contrast_loss'].item()
+                epoch_stats['consistency_loss'] += loss_dict['consistency_loss'].item()
+                epoch_stats['structure_loss'] += loss_dict['structure_loss'].item()
+                epoch_stats['graph_latent_norm'] += torch.norm(graph_latent.detach(), dim=1).mean().item()
+                epoch_stats['seq_emb_norm'] += torch.norm(seq_embedding.detach(), dim=1).mean().item()
+                epoch_stats['batch_count'] += 1
 
-                    # 记录到TensorBoard
-                    self.writer.add_scalar('train/loss', loss.item(), self.global_step)
-                    self.writer.add_scalar('train/contrast_loss', loss_dict['contrast_loss'].item(), self.global_step)
-                    self.writer.add_scalar('train/consistency_loss', loss_dict['consistency_loss'].item(),
-                                           self.global_step)
-                    self.writer.add_scalar('train/structure_loss', loss_dict['structure_loss'].item(), self.global_step)
-                    self.writer.add_scalar('train/lr', current_lr, self.global_step)
+                # 更新全局步数
+                self.global_step += 1
 
-                    # 记录梯度范数
-                    for name, param in self.graph_encoder.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            self.writer.add_histogram(f'grad/graph_encoder.{name}', param.grad, self.global_step)
+                # 学习率预热（如果启用）
+                if self.warmup_scheduler is not None and self.global_step < self.config.WARMUP_STEPS:
+                    self.warmup_scheduler.step()
 
-                    # 记录相似度矩阵
-                    if batch_idx % (self.config.LOG_INTERVAL * 10) == 0 and 'similarity' in loss_dict:
-                        self.writer.add_figure(
-                            'train/similarity_matrix',
-                            self._plot_similarity_matrix(loss_dict['similarity'].cpu().numpy()),
-                            self.global_step
-                        )
-
-                # 关闭进度条
+                # 更新进度条和日志（仅在主进程上）
                 if self.is_master:
-                    pbar.close()
+                    pbar.update(1)
+                    if batch_idx % self.config.LOG_INTERVAL == 0:
+                        # 获取当前学习率
+                        current_lr = self.optimizer.param_groups[0]['lr']
 
-                # 计算平均统计信息
-                for key in epoch_stats:
-                    if key != 'batch_count':
-                        epoch_stats[key] /= epoch_stats['batch_count']
+                        # 更新进度条状态
+                        pbar.set_postfix({
+                            'loss': f"{loss.item():.4f}",
+                            'c_loss': f"{loss_dict['contrast_loss'].item():.4f}",
+                            'cons_loss': f"{loss_dict['consistency_loss'].item():.4f}",
+                            'lr': f"{current_lr:.6f}"
+                        })
 
-                return epoch_stats
+                        # 记录到TensorBoard
+                        self.writer.add_scalar('train/loss', loss.item(), self.global_step)
+                        self.writer.add_scalar('train/contrast_loss', loss_dict['contrast_loss'].item(),
+                                               self.global_step)
+                        self.writer.add_scalar('train/consistency_loss', loss_dict['consistency_loss'].item(),
+                                               self.global_step)
+                        self.writer.add_scalar('train/structure_loss', loss_dict['structure_loss'].item(),
+                                               self.global_step)
+                        self.writer.add_scalar('train/lr', current_lr, self.global_step)
+
+                        # 记录梯度范数（可选）
+                        if self.config.LOG_GRAD_NORM and batch_idx % (self.config.LOG_INTERVAL * 5) == 0:
+                            for name, param in self.graph_encoder.named_parameters():
+                                if param.requires_grad and param.grad is not None:
+                                    self.writer.add_histogram(f'grad/graph_encoder.{name}', param.grad,
+                                                              self.global_step)
+
+                        # 记录相似度矩阵（定期）
+                        if batch_idx % (self.config.LOG_INTERVAL * 10) == 0 and 'similarity' in loss_dict:
+                            self.writer.add_figure(
+                                'train/similarity_matrix',
+                                self._plot_similarity_matrix(loss_dict['similarity'].cpu().numpy()),
+                                self.global_step
+                            )
+
+            except Exception as e:
+                # 捕获并记录训练过程中的任何错误
+                logger.error(f"处理批次 {batch_idx} 时出错: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+                # 增加跳过批次计数
+                epoch_stats['skipped_batches'] += 1
+
+                # 更新进度条
+                if self.is_master:
+                    pbar.update(1)
+
+                # 如果错误率太高，提前终止epoch
+                if epoch_stats['skipped_batches'] > len(train_loader) * 0.3:  # 超过30%批次出错
+                    logger.error(f"错误批次过多 ({epoch_stats['skipped_batches']}), 提前结束epoch")
+                    break
+
+        # 关闭进度条
+        if self.is_master:
+            pbar.close()
+
+        # 计算平均统计信息
+        if epoch_stats['batch_count'] > 0:
+            for key in epoch_stats:
+                if key not in ['batch_count', 'skipped_batches']:
+                    epoch_stats[key] /= epoch_stats['batch_count']
+
+        # 记录epoch级别的统计信息
+        if self.is_master and epoch_stats['batch_count'] > 0:
+            # 记录跳过的批次比例
+            skip_ratio = epoch_stats['skipped_batches'] / len(train_loader)
+            self.writer.add_scalar('train/skipped_batch_ratio', skip_ratio, epoch)
+
+            # 记录训练进度
+            progress = (epoch + 1) / self.config.EPOCHS
+            self.writer.add_scalar('train/progress', progress, epoch)
+
+            # 添加训练统计信息的摘要
+            logger.info(f"Epoch {epoch + 1} 统计: 损失={epoch_stats['loss']:.4f}, "
+                        f"对比损失={epoch_stats['contrast_loss']:.4f}, "
+                        f"跳过批次率={skip_ratio:.2%}")
+
+        return epoch_stats
 
     def validate(self, val_loader):
         """
@@ -1311,9 +1417,35 @@ class ProteinMultiModalTrainer:
             logger.info("训练完成！")
             self.writer.close()
 
+
+class ProteinGraphDataset(InMemoryDataset):
+    def __init__(self, data_list):
+        super().__init__(None, None, None, None)
+
+        # 确保data_list是列表类型，且每个元素是Data对象
+        if isinstance(data_list, list):
+            self.data_list = data_list
+        else:
+            # 如果不是列表，尝试转换为列表
+            self.data_list = [data_list]
+
+        # 正确设置数据和切片
+        self.data, self.slices = self.collate(self.data_list)
+
+    def len(self):
+        return len(self.data_list)
+
+    def get(self, idx):
+        # 确保返回正确的Data对象
+        if idx < len(self.data_list):
+            return self.data_list[idx]
+        else:
+            raise IndexError(f"索引 {idx} 超出范围 (0-{len(self.data_list) - 1})")
+
+
 def setup_data_loaders(config):
     """
-    设置数据加载器
+    设置数据加载器 - 使用自定义ProteinData处理字符串字段
 
     参数:
         config: 配置对象
@@ -1324,6 +1456,23 @@ def setup_data_loaders(config):
     from torch_geometric.data import InMemoryDataset
     from torch_geometric.loader import DataLoader
     import random
+
+    # 创建数据集类
+    class ProteinGraphDataset(InMemoryDataset):
+        def __init__(self, data_list):
+            super().__init__(None, None, None, None)
+            # 确保所有数据都是ProteinData类型
+            self.data_list = [
+                convert_to_protein_data(item) if not isinstance(item, ProteinData) else item
+                for item in data_list
+            ]
+
+        def len(self):
+            return len(self.data_list)
+
+        def get(self, idx):
+            return self.data_list[idx]
+
     # 提取数据
     try:
         logger.info(f"从 {config.CACHE_DIR} 加载数据...")
@@ -1331,13 +1480,16 @@ def setup_data_loaders(config):
         val_data = torch.load(config.VAL_CACHE)
         test_data = torch.load(config.TEST_CACHE)
 
+        # 确保数据是列表格式
+        train_data = train_data if isinstance(train_data, list) else [train_data]
+        val_data = val_data if isinstance(val_data, list) else [val_data]
+        test_data = test_data if isinstance(test_data, list) else [test_data]
 
-        use_subset = config.USE_SUBSET
-        if use_subset:
-            random.seed(42)  # 保证采样可复现
+        # 使用子集（如配置）
+        if config.USE_SUBSET:
+            random.seed(42)  # 保证可复现性
             subset_ratio = config.SUBSET_RATIO
 
-            # 采样数据
             train_size = max(int(len(train_data) * subset_ratio), 100)
             val_size = max(int(len(val_data) * subset_ratio), 50)
             test_size = max(int(len(test_data) * subset_ratio), 50)
@@ -1357,12 +1509,7 @@ def setup_data_loaders(config):
         logger.error(f"数据加载失败: {e}")
         raise
 
-    # 创建InMemoryDataset
-    class ProteinGraphDataset(InMemoryDataset):
-        def __init__(self, data_list):
-            super().__init__(None, None, None, None)
-            self.data, self.slices = self.collate(data_list)
-
+    # 创建数据集
     train_dataset = ProteinGraphDataset(train_data)
     val_dataset = ProteinGraphDataset(val_data)
     test_dataset = ProteinGraphDataset(test_data)
@@ -1391,7 +1538,7 @@ def setup_data_loaders(config):
         val_sampler = None
         test_sampler = None
 
-    # 创建数据加载器
+    # 创建数据加载器 - 不需要自定义collate_fn
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
@@ -1421,6 +1568,24 @@ def setup_data_loaders(config):
 
     return train_loader, val_loader, test_loader
 
+
+def convert_to_protein_data(data):
+    """确保完全分离字符串字段"""
+    if isinstance(data, ProteinData):
+        return data
+
+    # 获取所有字段
+    attrs = {k: data[k] for k in data.keys()}
+
+    # 创建ProteinData实例
+    protein_data = ProteinData(**attrs)
+
+    # 验证转换
+    assert hasattr(protein_data, 'x'), "缺少必要字段 x"
+    assert hasattr(protein_data, 'edge_index'), "缺少必要字段 edge_index"
+    return protein_data
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="蛋白质图-序列多模态融合训练")
@@ -1449,12 +1614,11 @@ def main():
 
     is_master = not config.USE_DISTRIBUTED or config.GLOBAL_RANK == 0
 
-    # 设置日志级别（仅主进程显示INFO及以上级别）
+    # 设置日志级别
     if is_master:
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     else:
-        logging.basicConfig(level=logging.WARNING,
-                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # 显示配置信息
     if is_master:
@@ -1477,6 +1641,36 @@ def main():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
+
+    # 验证一个数据样本（仅主进程）
+    if is_master:
+        try:
+            logger.info("验证数据格式...")
+            # 加载一个样本并检查
+            sample_data = torch.load(config.TRAIN_CACHE)
+            if isinstance(sample_data, list) and len(sample_data) > 0:
+                sample = sample_data[0]
+            else:
+                sample = sample_data
+
+            logger.info(f"数据类型: {type(sample)}")
+            logger.info(f"数据字段: {sample.keys()}")  # 调用keys()方法
+
+            # 测试转换为ProteinData
+            protein_sample = convert_to_protein_data(sample)
+            logger.info(f"转换后类型: {type(protein_sample)}")
+            logger.info(f"转换后字段: {protein_sample.keys()}")  # 调用keys()方法
+
+            # 创建小批次测试
+            from torch_geometric.data import Batch
+            mini_batch = Batch.from_data_list([protein_sample, protein_sample])
+            logger.info(f"批次测试成功: {mini_batch.num_graphs}个图")
+            logger.info("数据验证通过 ✓")
+        except Exception as e:
+            logger.error(f"数据验证失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise  # 验证失败时直接终止程序
 
     # 创建数据加载器
     train_loader, val_loader, test_loader = setup_data_loaders(config)
