@@ -10,8 +10,9 @@
 作者: wxhfy
 日期: 2025-03-29
 """
-
+import hashlib
 import os
+import pickle
 import time
 import torch
 import torch.nn as nn
@@ -670,6 +671,89 @@ class ProteinMultiModalTrainer:
         else:
             self.warmup_scheduler = None
 
+    def _get_dataset_name(self):
+        """从训练配置中获取当前数据集名称，用于定位分布式预计算的缓存目录"""
+        # 尝试从配置中获取数据集名称
+        if hasattr(self.config, "DATASET_NAME"):
+            return self.config.DATASET_NAME
+
+        # 尝试从数据路径中提取数据集名称
+        for attr in ["TRAIN_CACHE", "VAL_CACHE", "TEST_CACHE"]:
+            if hasattr(self.config, attr):
+                path = getattr(self.config, attr)
+                if path:
+                    # 提取文件名（不含扩展名）
+                    filename = os.path.basename(path)
+                    dataset_name = os.path.splitext(filename)[0]
+                    return dataset_name
+
+        return None
+
+    def _update_cache_stats(self, hits, requests):
+        """更新缓存统计信息"""
+        # 如果有内存缓存，更新其统计信息
+        if hasattr(self, 'embedding_cache') and self.embedding_cache is not None:
+            if not hasattr(self.embedding_cache, 'total_requests'):
+                self.embedding_cache.total_requests = 0
+            if not hasattr(self.embedding_cache, 'cache_hits'):
+                self.embedding_cache.cache_hits = 0
+
+            self.embedding_cache.total_requests += requests
+            self.embedding_cache.cache_hits += hits
+
+        # 保存全局统计
+        if not hasattr(self, '_cache_stats'):
+            self._cache_stats = {
+                "total_requests": 0,
+                "cache_hits": 0
+            }
+
+        self._cache_stats["total_requests"] += requests
+        self._cache_stats["cache_hits"] += hits
+
+    def _safe_compute_embeddings(self, esm_model, protein_tensor, config):
+        """安全计算ESMC嵌入，处理维度不匹配问题"""
+        try:
+            # 尝试直接计算
+            return esm_model.logits(protein_tensor, config)
+        except Exception as e:
+            error_msg = str(e)
+
+            # 处理维度错误
+            if "Wrong shape: expected 3 dims" in error_msg and "Received 4-dim tensor" in error_msg:
+                # 修复序列维度
+                sequence = protein_tensor.sequence
+
+                if sequence.dim() == 4:
+                    # [b, 1, s, d] -> [b, s, d]
+                    if sequence.shape[1] == 1:
+                        fixed_sequence = sequence.squeeze(1)
+                    else:
+                        # 对于其他形状，尝试更通用的方法
+                        b = sequence.shape[0]
+                        s = sequence.shape[2]
+                        fixed_sequence = sequence.reshape(b, s, -1)
+
+                    # 创建新的蛋白质张量
+                    fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
+                    logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
+
+                    # 重试
+                    return esm_model.logits(fixed_tensor, config)
+
+                # 处理其他维度问题
+                if sequence.dim() == 3:
+                    b, s, d = sequence.shape
+                    if s == 1:
+                        # [b, 1, d] -> [b, d]
+                        fixed_sequence = sequence.squeeze(1)
+                        fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
+                        logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
+                        return esm_model.logits(fixed_tensor, config)
+
+            # 无法处理的错误，重新抛出
+            raise
+
     def _get_esm_embedding(self, sequences, sequence_ids=None):
         """
         获取序列的ESM嵌入与注意力，优先使用缓存，无需序列长度对齐
@@ -684,17 +768,21 @@ class ProteinMultiModalTrainer:
         batch_embeddings = []
         batch_attentions = []
 
-        # 检查是否启用缓存
-        use_cache = hasattr(self, 'embedding_cache') and self.embedding_cache is not None
+        # 更高效地检查缓存可用性
+        embedding_cache = getattr(self, 'embedding_cache', None)
+        use_cache = embedding_cache is not None
 
-        # 准备序列ID
-        if sequence_ids is None and hasattr(self, 'current_batch_ids'):
-            sequence_ids = self.current_batch_ids
-        elif sequence_ids is None:
-            # 使用序列哈希作为ID
-            sequence_ids = [self._create_seq_hash(seq) for seq in sequences]
+        # 优化序列ID处理逻辑
+        if sequence_ids is None:
+            sequence_ids = getattr(self, 'current_batch_ids',
+                                   [self._create_seq_hash(seq) for seq in sequences])
 
-        # ESM氨基酸编码映射表
+        # 确保序列ID列表长度匹配
+        if len(sequence_ids) != len(sequences):
+            sequence_ids = [f"seq_{i}" for i in range(len(sequences))]
+            logger.warning(f"序列ID长度不匹配，使用默认ID")
+
+        # ESM氨基酸编码映射表 - 保持不变
         ESM_AA_MAP = {
             'A': 5, 'C': 23, 'D': 13, 'E': 9, 'F': 18,
             'G': 6, 'H': 21, 'I': 12, 'K': 15, 'L': 4,
@@ -703,39 +791,94 @@ class ProteinMultiModalTrainer:
             '_': 32, 'X': 32
         }
 
-        # 逐个处理序列
-        for seq_idx, (seq, seq_id) in enumerate(zip(sequences, sequence_ids)):
-            try:
-                # 尝试从缓存获取嵌入
-                if use_cache:
-                    cached_data = self.embedding_cache.get_embedding(seq_id=seq_id, sequence=seq)
+        # 收集需要计算的序列，优化批处理逻辑
+        compute_indices = []
+
+        # 第一阶段：尝试从缓存读取
+        if use_cache:
+            for seq_idx, (seq, seq_id) in enumerate(zip(sequences, sequence_ids)):
+                try:
+                    # 更高效的缓存检索 - 使用哈希
+                    seq_hash = self._create_seq_hash(seq)
+                    cached_data = None
+
+                    # 先通过ID查找
+                    if seq_id in embedding_cache.embedding_index:
+                        cache_entry = embedding_cache.embedding_index[seq_id]
+                        if os.path.exists(cache_entry["file"]):
+                            try:
+                                cached_data = torch.load(cache_entry["file"],
+                                                         map_location=torch.device('cpu'))
+                            except Exception as e:
+                                logger.warning(f"缓存文件读取失败: {e}")
+
+                    # 如果ID查找失败，尝试通过序列哈希查找
+                    if cached_data is None:
+                        embedding_file = os.path.join(embedding_cache.cache_dir, f"{seq_hash}.pt")
+                        if os.path.exists(embedding_file):
+                            try:
+                                cached_data = torch.load(embedding_file,
+                                                         map_location=torch.device('cpu'))
+                                # 自动更新索引
+                                embedding_cache.embedding_index[seq_id] = {
+                                    "hash": seq_hash,
+                                    "sequence": seq,
+                                    "file": embedding_file
+                                }
+                            except Exception as e:
+                                logger.warning(f"缓存文件读取失败: {e}")
+
+                    # 处理缓存命中
                     if cached_data is not None:
-                        # 成功从缓存获取
+                        # 记录缓存命中
+                        if hasattr(embedding_cache, 'cache_hits'):
+                            embedding_cache.cache_hits += 1
+                        if hasattr(embedding_cache, 'total_requests'):
+                            embedding_cache.total_requests += 1
+
+                        # 提取和处理嵌入
                         embeddings = cached_data["embedding"]
                         attention = cached_data.get("attention", None)
 
-                        # 处理嵌入维度
+                        # 统一处理嵌入维度
                         if embeddings.dim() == 4:
                             if embeddings.shape[0] == 1 and embeddings.shape[1] == 1:
                                 embeddings = embeddings.squeeze(1)
                             else:
-                                b, extra, s, d = embeddings.shape
-                                embeddings = embeddings.reshape(b, s, d)
+                                embeddings = embeddings.reshape(embeddings.shape[0],
+                                                                embeddings.shape[2],
+                                                                embeddings.shape[3])
 
-                        # 移动到当前设备
+                        # 移至当前设备并添加到批次
                         embeddings = embeddings.to(self.device)
+                        batch_embeddings.append(embeddings)
+
                         if attention is not None:
                             attention = attention.to(self.device)
-
-                        batch_embeddings.append(embeddings)
-                        if attention is not None:
                             batch_attentions.append(attention)
 
-                        # 跳过后续计算
                         continue
 
-                # 缓存未命中，需计算嵌入
-                # 序列预处理
+                # 处理各种异常情况
+                except Exception as e:
+                    logger.debug(f"缓存读取过程出错 (序列索引:{seq_idx}): {e}")
+
+                # 缓存未命中，添加到需计算列表
+                compute_indices.append(seq_idx)
+                # 统计缓存未命中
+                if hasattr(embedding_cache, 'total_requests'):
+                    embedding_cache.total_requests += 1
+        else:
+            # 缓存不可用，所有序列都需计算
+            compute_indices = list(range(len(sequences)))
+
+        # 第二阶段：计算未缓存的序列嵌入
+        for seq_idx in compute_indices:
+            seq = sequences[seq_idx]
+            seq_id = sequence_ids[seq_idx]
+
+            try:
+                # 序列预处理 - 确保有效序列
                 if not seq or len(seq) == 0:
                     seq = "A"
 
@@ -749,10 +892,8 @@ class ProteinMultiModalTrainer:
                     token_ids.append(ESM_AA_MAP.get(aa, ESM_AA_MAP['X']))
                 token_ids.append(2)  # EOS标记
 
-                # 转换为张量 - 不添加额外维度，避免4D输入问题
+                # 转换为张量 - 不添加额外维度
                 token_tensor = torch.tensor(token_ids, device=self.device)
-
-                # 创建ESM输入
                 protein_tensor = ESMProteinTensor(sequence=token_tensor)
 
                 with torch.no_grad():
@@ -767,13 +908,14 @@ class ProteinMultiModalTrainer:
                         # 提取嵌入
                         embeddings = logits_output.embeddings
 
-                        # 处理四维输出
+                        # 统一处理嵌入维度
                         if embeddings.dim() == 4:
                             if embeddings.shape[0] == 1 and embeddings.shape[1] == 1:
                                 embeddings = embeddings.squeeze(1)
                             else:
-                                b, extra, s, d = embeddings.shape
-                                embeddings = embeddings.reshape(b, s, d)
+                                embeddings = embeddings.reshape(embeddings.shape[0],
+                                                                embeddings.shape[2],
+                                                                embeddings.shape[3])
 
                         # 提取注意力信息
                         attention = None
@@ -782,29 +924,11 @@ class ProteinMultiModalTrainer:
                         elif hasattr(logits_output, 'attention_weights'):
                             attention = self._extract_attention(logits_output.attention_weights)
 
-                        # 保存到缓存（如果启用）
-                        if use_cache and attention is not None:
-                            # 创建缓存数据
-                            cache_data = {
-                                "embedding": embeddings.cpu().half(),  # 半精度存储
-                                "attention": attention.cpu().half(),
-                                "sequence": seq,
-                                "id": seq_id
-                            }
+                        # 保存到缓存（如果启用且计算成功）
+                        if use_cache:
+                            self._save_to_cache(embedding_cache, seq, seq_id, embeddings, attention)
 
-                            # 生成哈希并保存
-                            seq_hash = self._create_seq_hash(seq)
-                            embedding_file = os.path.join(self.embedding_cache.cache_dir, f"{seq_hash}.pt")
-                            torch.save(cache_data, embedding_file, _use_new_zipfile_serialization=True)
-
-                            # 更新索引
-                            self.embedding_cache.embedding_index[seq_id] = {
-                                "hash": seq_hash,
-                                "sequence": seq,
-                                "file": embedding_file
-                            }
-
-                        # 保存嵌入和注意力
+                        # 添加到批次
                         batch_embeddings.append(embeddings)
                         if attention is not None:
                             batch_attentions.append(attention)
@@ -812,10 +936,12 @@ class ProteinMultiModalTrainer:
                     except Exception as e:
                         logger.warning(f"ESM嵌入计算失败: {e}")
                         # 创建备用嵌入
-                        backup_embed = torch.zeros(1, len(token_ids), self.config.ESM_EMBEDDING_DIM, device=self.device)
+                        emb_dim = getattr(self.config, "ESM_EMBEDDING_DIM", 1280)  # 默认维度
+                        backup_embed = torch.zeros(1, len(token_ids), emb_dim, device=self.device)
                         batch_embeddings.append(backup_embed)
-                        # 创建备用注意力
-                        if batch_attentions:  # 只有当至少有一个成功提取的注意力时才添加备用
+
+                        # 创建均匀分布的备用注意力
+                        if batch_attentions:  # 只在有其他注意力时添加
                             backup_attn = torch.ones(1, len(token_ids) - 2, 1, device=self.device) / (
                                         len(token_ids) - 2)
                             batch_attentions.append(backup_attn)
@@ -823,37 +949,105 @@ class ProteinMultiModalTrainer:
             except Exception as outer_e:
                 logger.error(f"序列处理完全失败(索引:{seq_idx}): {outer_e}")
                 # 生成最小备用嵌入
-                backup_embed = torch.zeros(1, 10, self.config.ESM_EMBEDDING_DIM, device=self.device)
+                emb_dim = getattr(self.config, "ESM_EMBEDDING_DIM", 1280)  # 默认维度
+                backup_embed = torch.zeros(1, 10, emb_dim, device=self.device)
                 batch_embeddings.append(backup_embed)
 
-        # 返回处理结果 - 不进行长度对齐
+        # 第三阶段：处理结果
         if len(batch_embeddings) == 1:
+            # 单个序列处理
             result = batch_embeddings[0]
-            # 添加注意力属性（如果有）
             if batch_attentions:
                 result.attention = batch_attentions[0]
             return result
         else:
-            # 注意：此处不进行长度对齐，直接返回嵌入列表
+            # 批量序列处理
             result_list = batch_embeddings
-
-            # 如果提取了注意力，添加到相应的嵌入中
+            # 绑定注意力
             if batch_attentions and len(batch_attentions) == len(batch_embeddings):
                 for i, emb in enumerate(result_list):
                     emb.attention = batch_attentions[i]
-
             return result_list
+
+    def _save_to_cache(self, embedding_cache, seq, seq_id, embeddings, attention=None):
+        """
+        保存嵌入和注意力到缓存
+
+        参数:
+            embedding_cache: 嵌入缓存对象
+            seq: 蛋白质序列
+            seq_id: 序列ID
+            embeddings: 嵌入张量
+            attention: 注意力张量
+        """
+        try:
+            # 创建缓存数据 - 使用半精度降低存储空间
+            cache_data = {
+                "embedding": embeddings.detach().cpu().half(),  # 降低存储空间
+                "sequence": seq,
+                "id": seq_id,
+                "timestamp": time.time()  # 添加时间戳以便缓存管理
+            }
+
+            # 只有当注意力可用时才保存
+            if attention is not None:
+                cache_data["attention"] = attention.detach().cpu().half()
+
+            # 生成序列哈希和文件路径
+            seq_hash = self._create_seq_hash(seq)
+            embedding_file = os.path.join(embedding_cache.cache_dir, f"{seq_hash}.pt")
+
+            # 保存到文件
+            torch.save(cache_data, embedding_file, _use_new_zipfile_serialization=True)
+
+            # 更新索引
+            embedding_cache.embedding_index[seq_id] = {
+                "hash": seq_hash,
+                "sequence": seq,
+                "file": embedding_file,
+                "timestamp": cache_data["timestamp"]
+            }
+
+            # 定期保存索引
+            if random.random() < 0.05:  # 5%概率保存索引，避免过于频繁的IO
+                self._save_cache_index(embedding_cache)
+        except Exception as e:
+            logger.warning(f"缓存保存失败: {e}")
+
+    def _save_cache_index(self, embedding_cache):
+        """安全地保存缓存索引"""
+        try:
+            index_file = os.path.join(embedding_cache.cache_dir, "embedding_index.pkl")
+            with open(index_file, "wb") as f:
+                pickle.dump(embedding_cache.embedding_index, f)
+        except Exception as e:
+            logger.warning(f"索引保存失败: {e}")
 
     def _get_fused_embedding(self, graph_batch, sequences=None):
         """优化后的融合嵌入方法，支持缓存机制"""
+        # 0. 初始化缓存（如果未初始化）
+        if hasattr(self, 'config') and getattr(self.config, 'USE_EMBEDDING_CACHE', False) and not hasattr(self,
+                                                                                                          'embedding_cache'):
+            self._init_embedding_cache()
 
         # 1. 提取序列ID (用于缓存查找)
         sequence_ids = None
-        if hasattr(graph_batch, 'protein_id'):
-            if isinstance(graph_batch.protein_id, list):
-                sequence_ids = graph_batch.protein_id
-            else:
-                sequence_ids = [graph_batch.protein_id]
+        try:
+            if hasattr(graph_batch, 'protein_id'):
+                if isinstance(graph_batch.protein_id, list):
+                    sequence_ids = graph_batch.protein_id
+                else:
+                    sequence_ids = [graph_batch.protein_id]
+
+            # 如果批次中有string_data字段，尝试从中获取protein_id
+            elif hasattr(graph_batch, 'string_data') and 'protein_id' in graph_batch.string_data:
+                protein_id = graph_batch.string_data['protein_id']
+                if isinstance(protein_id, list):
+                    sequence_ids = protein_id
+                else:
+                    sequence_ids = [protein_id]
+        except Exception as e:
+            logger.debug(f"提取序列ID时出错: {e}")
 
         # 保存当前批次ID（用于其他方法）
         self.current_batch_ids = sequence_ids
@@ -862,25 +1056,186 @@ class ProteinMultiModalTrainer:
         if sequences is None:
             sequences = self._extract_sequences_from_graphs(graph_batch)
 
+        # 检查序列有效性
+        if not sequences or len(sequences) == 0:
+            logger.warning("无有效序列，使用默认序列")
+            sequences = ["A" * 10]  # 默认序列
+
         # 3. 获取序列ESM嵌入和注意力权重，优先使用缓存
         seq_embeddings = self._get_esm_embedding(sequences, sequence_ids)
 
         # 4. 提取当前序列的注意力用于图编码
         current_esm_attention = None
-        if self.config.ESM_GUIDANCE and hasattr(seq_embeddings, 'attention'):
+        if getattr(self, 'use_esm_guidance', False) and hasattr(seq_embeddings, 'attention'):
             current_esm_attention = seq_embeddings.attention
 
         # 5. 使用当前序列注意力指导图编码
-        node_embeddings, graph_embedding, attention_weights = self.graph_encoder(
-            x=graph_batch.x,
-            edge_index=graph_batch.edge_index,
-            edge_attr=graph_batch.edge_attr if hasattr(graph_batch, 'edge_attr') else None,
-            edge_type=graph_batch.edge_type if hasattr(graph_batch, 'edge_type') else None,
-            batch=graph_batch.batch,
-            esm_attention=current_esm_attention  # 使用当前批次的注意力
-        )
+        try:
+            node_embeddings, graph_embedding, attention_weights = self.graph_encoder(
+                x=graph_batch.x,
+                edge_index=graph_batch.edge_index,
+                edge_attr=graph_batch.edge_attr if hasattr(graph_batch, 'edge_attr') else None,
+                edge_type=graph_batch.edge_type if hasattr(graph_batch, 'edge_type') else None,
+                batch=graph_batch.batch,
+                esm_attention=current_esm_attention  # 使用当前批次的注意力
+            )
+        except Exception as e:
+            logger.error(f"图编码器处理失败: {e}")
+            # 创建备用嵌入
+            batch_size = 1
+            if hasattr(graph_batch, 'num_graphs'):
+                batch_size = graph_batch.num_graphs
+            elif hasattr(graph_batch, 'batch') and graph_batch.batch is not None:
+                batch_size = int(graph_batch.batch.max()) + 1
+
+            # 备用图嵌入
+            output_dim = getattr(self.config, "OUTPUT_DIM", 512)
+            graph_embedding = torch.zeros(batch_size, output_dim, device=self.device)
+            node_embeddings = None
+            attention_weights = None
 
         # 6. 处理序列嵌入 (池化等)
+        try:
+            if seq_embeddings.dim() == 3:  # [batch_size, seq_len, dim]
+                # 使用首尾池化: [CLS] token + [EOS] token + 平均池化
+                cls_tokens = seq_embeddings[:, 0, :]  # [CLS] token
+                eos_tokens = seq_embeddings[:, -1, :]  # [EOS] token
+                avg_tokens = seq_embeddings.mean(dim=1)  # 平均池化
+
+                # 组合表示 (平均聚合)
+                pooled_seq_emb = (cls_tokens + eos_tokens + avg_tokens) / 3.0  # [batch_size, dim]
+            else:
+                # 单个序列处理
+                cls_token = seq_embeddings[0, 0, :]
+                eos_token = seq_embeddings[0, -1, :]
+                avg_token = seq_embeddings[0].mean(dim=0)
+
+                pooled_seq_emb = (cls_token + eos_token + avg_token) / 3.0
+                pooled_seq_emb = pooled_seq_emb.unsqueeze(0)  # [1, dim]
+        except Exception as e:
+            logger.error(f"序列嵌入池化失败: {e}")
+            # 创建备用池化嵌入
+            esm_dim = getattr(self.config, "ESM_EMBEDDING_DIM", 1280)
+            batch_size = graph_embedding.size(0)
+            pooled_seq_emb = torch.zeros(batch_size, esm_dim, device=self.device)
+
+        # 7. 映射与融合
+        try:
+            graph_latent = self.latent_mapper(graph_embedding)
+            fused_embedding = self.fusion_module(pooled_seq_emb, graph_latent)
+        except Exception as e:
+            logger.error(f"嵌入融合失败: {e}")
+            # 创建备用嵌入
+            fusion_dim = getattr(self.config, "FUSION_OUTPUT_DIM", 1024)
+            batch_size = graph_embedding.size(0)
+            graph_latent = torch.zeros_like(pooled_seq_emb)
+            fused_embedding = torch.zeros(batch_size, fusion_dim, device=self.device)
+
+        # 8. 统计缓存命中率
+        self._log_cache_stats()
+
+        return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
+
+    def _init_embedding_cache(self):
+        """初始化嵌入缓存"""
+        try:
+            # 获取缓存目录
+            cache_dir = getattr(self.config, 'EMBEDDING_CACHE_DIR', 'data/esm_embeddings')
+
+            # 创建缓存目录
+            os.makedirs(cache_dir, exist_ok=True)
+
+            # 创建缓存结构
+            self.embedding_cache = type('EmbeddingCache', (), {
+                'cache_dir': cache_dir,
+                'embedding_index': {},
+                'cache_hits': 0,
+                'total_requests': 0
+            })
+
+            # 加载缓存索引
+            index_file = os.path.join(cache_dir, "embedding_index.pkl")
+            if os.path.exists(index_file):
+                try:
+                    with open(index_file, "rb") as f:
+                        self.embedding_cache.embedding_index = pickle.load(f)
+                    logger.info(f"加载了嵌入缓存索引，包含{len(self.embedding_cache.embedding_index)}条记录")
+                except Exception as e:
+                    logger.warning(f"加载缓存索引失败: {e}, 使用空索引")
+
+            # 设置缓存验证标志
+            self.embedding_cache.validated = False
+
+            logger.info(f"初始化ESM嵌入缓存: {cache_dir}")
+            return True
+        except Exception as e:
+            logger.warning(f"初始化缓存失败: {e}")
+            self.embedding_cache = None
+            return False
+
+    def _log_cache_stats(self):
+        """记录缓存统计信息"""
+        # 避免频繁记录，仅在特定步骤记录
+        should_log = (hasattr(self, 'global_step') and
+                      self.global_step % getattr(self.config, 'LOG_INTERVAL', 10) == 0 and
+                      getattr(self, 'is_master', True))
+
+        if should_log and hasattr(self, 'embedding_cache') and self.embedding_cache is not None:
+            hits = getattr(self.embedding_cache, 'cache_hits', 0)
+            total = getattr(self.embedding_cache, 'total_requests', 0)
+
+            if total > 0:
+                hit_rate = (hits / total) * 100
+                logger.info(f"ESM嵌入缓存命中率: {hit_rate:.1f}%, 命中/总数: {hits}/{total}")
+
+                # 记录到TensorBoard
+                if hasattr(self, 'writer') and self.writer is not None:
+                    self.writer.add_scalar('cache/hit_rate', hit_rate, self.global_step)
+                    self.writer.add_scalar('cache/hits', hits, self.global_step)
+                    self.writer.add_scalar('cache/total_requests', total, self.global_step)
+
+    def _extract_sequence_ids(self, graph_batch):
+        """从图批次中提取序列ID，支持多种数据格式"""
+        sequence_ids = None
+
+        # 检查protein_id字段
+        if hasattr(graph_batch, 'protein_id'):
+            if isinstance(graph_batch.protein_id, list):
+                sequence_ids = graph_batch.protein_id
+            else:
+                sequence_ids = [graph_batch.protein_id]
+
+        # 检查其他可能的ID字段
+        elif hasattr(graph_batch, 'id') or hasattr(graph_batch, 'ids'):
+            id_field = getattr(graph_batch, 'id', None) or getattr(graph_batch, 'ids', None)
+            if isinstance(id_field, list):
+                sequence_ids = id_field
+            else:
+                sequence_ids = [id_field]
+
+        # 检查string_data中的ID
+        elif hasattr(graph_batch, 'string_data'):
+            for key in ['protein_id', 'id', 'ids', 'sequence_id']:
+                if key in graph_batch.string_data:
+                    value = graph_batch.string_data[key]
+                    if isinstance(value, list):
+                        sequence_ids = value
+                    else:
+                        sequence_ids = [value]
+                    break
+
+        # 如果仍然没有ID，使用序列哈希
+        if sequence_ids is None and hasattr(graph_batch, 'sequence'):
+            sequences = graph_batch.sequence
+            if isinstance(sequences, list):
+                sequence_ids = [self._create_seq_hash(seq) for seq in sequences]
+            elif isinstance(sequences, str):
+                sequence_ids = [self._create_seq_hash(sequences)]
+
+        return sequence_ids
+
+    def _pool_sequence_embeddings(self, seq_embeddings):
+        """从序列嵌入中提取池化表示"""
         if seq_embeddings.dim() == 3:  # [batch_size, seq_len, dim]
             # 使用首尾池化: [CLS] token + [EOS] token + 平均池化
             cls_tokens = seq_embeddings[:, 0, :]  # [CLS] token
@@ -898,19 +1253,13 @@ class ProteinMultiModalTrainer:
             pooled_seq_emb = (cls_token + eos_token + avg_token) / 3.0
             pooled_seq_emb = pooled_seq_emb.unsqueeze(0)  # [1, dim]
 
-        # 7. 映射与融合
-        graph_latent = self.latent_mapper(graph_embedding)
-        fused_embedding = self.fusion_module(pooled_seq_emb, graph_latent)
+        return pooled_seq_emb
 
-        # 8. 如果启用缓存统计，记录命中率
-        if hasattr(self, 'embedding_cache') and self.embedding_cache is not None:
-            if hasattr(self, 'global_step') and self.global_step % 10 == 0:
-                stats = self.embedding_cache.get_stats()
-                hit_rate = stats["hit_rate"] * 100
-                logger.info(
-                    f"嵌入缓存命中率: {hit_rate:.1f}%, 命中/总数: {stats['cache_hits']}/{stats['total_requests']}")
-
-        return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
+    def _create_seq_hash(self, sequence):
+        """为序列创建哈希值"""
+        if not sequence:
+            return hashlib.md5("empty".encode()).hexdigest()
+        return hashlib.md5(sequence.encode()).hexdigest()
 
     def _extract_sequences_from_graphs(self, graphs_batch):
         """
