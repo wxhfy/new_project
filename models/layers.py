@@ -680,7 +680,7 @@ class EdgeUpdateModule(nn.Module):
                 ) for _ in range(edge_types)
             ])
         else:
-            # 统一的边更新网络
+            # 统一的边更新网络 - 这里使用self.edge_update
             self.edge_update = nn.Sequential(
                 nn.Linear(node_dim * 2 + edge_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
@@ -711,6 +711,7 @@ class EdgeUpdateModule(nn.Module):
         src_features = x[src]  # [num_edges, node_dim]
         dst_features = x[dst]  # [num_edges, node_dim]
 
+        # 更新边特征
         if self.edge_types is not None and edge_type is not None:
             # 初始化结果张量
             updated_edge_attr = torch.zeros_like(edge_attr)
@@ -732,11 +733,10 @@ class EdgeUpdateModule(nn.Module):
             # 拼接源节点、目标节点和当前边特征
             combined = torch.cat([src_features, dst_features, edge_attr], dim=1)
 
-            # 更新边特征
+            # 更新边特征 - 使用self.edge_update而不是self.edge_updater
             updated_edge_attr = self.edge_update(combined)
 
         return updated_edge_attr
-
 
 class StructureAwareAttention(nn.Module):
     """
