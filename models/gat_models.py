@@ -125,11 +125,25 @@ class ProteinGATv2Encoder(nn.Module):
             # 不同类型边的嵌入映射
             self.edge_type_embeddings = nn.Embedding(edge_types, hidden_dim // 4)
 
-            # 使用新的边特征处理器
-            self.edge_processor = EdgeFeatureProcessor(
+            # 添加这段代码：为每种边类型创建单独的编码器
+            self.edge_encoders = nn.ModuleList([
+                nn.Linear(edge_input_dim, hidden_dim // 2) for _ in range(edge_types)
+            ])
+
+            # 保留原有的通用边特征处理器
+            self.edge_processor = EdgeProcessor(
                 edge_dim=edge_input_dim,
                 hidden_dim=hidden_dim,
-                dropout=dropout
+                edge_types=edge_types,
+                dropout=dropout,
+                use_heterogeneous=self.use_heterogeneous_edges
+            )
+
+            # 新增：备用的统一边编码器，避免在非异质边模式下尝试访问时出错
+            self.edge_encoder = nn.Sequential(
+                nn.Linear(edge_input_dim + edge_types, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                self.activation
             )
         else:
             # 统一边特征处理
@@ -282,37 +296,9 @@ class ProteinGATv2Encoder(nn.Module):
         h = self.node_encoder(x)
 
         # 处理边特征
+        # 在forward方法中:
         if edge_attr is not None:
-            if self.use_heterogeneous_edges and edge_type is not None:
-                # 分别处理不同类型的边
-                edge_features_list = []
-                for t in range(self.edge_types):
-                    mask = (edge_type == t)
-                    if mask.sum() > 0:
-                        # 边特征变换
-                        edge_feats = self.edge_encoders[t](edge_attr[mask])
-                        # 获取边类型嵌入并扩展
-                        edge_type_emb = self.edge_type_embeddings(torch.tensor([t], device=edge_attr.device))
-                        type_emb_expanded = edge_type_emb.expand(edge_feats.size(0), -1)
-                        # 拼接边特征和类型嵌入
-                        edge_feats = torch.cat([edge_feats, type_emb_expanded], dim=-1)
-                        edge_features_list.append((mask, edge_feats))
-
-                # 合并不同类型的边特征
-                edge_features = torch.zeros(edge_attr.size(0), self.hidden_dim // 2, device=edge_attr.device)
-                for mask, feats in edge_features_list:
-                    edge_features[mask] = feats
-            else:
-                # 统一处理所有边
-                if edge_type is not None:
-                    # 将边类型转为one-hot向量
-                    edge_type_onehot = F.one_hot(edge_type, num_classes=self.edge_types).float()
-                    # 拼接边特征和类型
-                    edge_input = torch.cat([edge_attr, edge_type_onehot], dim=-1)
-                else:
-                    edge_input = edge_attr
-
-                edge_features = self.edge_encoder(edge_input)
+            edge_features = self.edge_processor(edge_attr, edge_type)
         else:
             edge_features = None
 
@@ -591,15 +577,30 @@ class EdgeFeatureProcessor(nn.Module):
         返回:
             edge_features (torch.Tensor): 处理后的边特征 [num_edges, hidden_dim//2]
         """
+        # 检查输入维度
+        if edge_attr.size(1) < self.edge_dim:
+            # 处理维度不足的情况
+            padding = torch.zeros(edge_attr.size(0), self.edge_dim - edge_attr.size(1),
+                                  device=edge_attr.device)
+            edge_attr = torch.cat([edge_attr, padding], dim=1)
+        elif edge_attr.size(1) > self.edge_dim:
+            # 维度过多时截断
+            edge_attr = edge_attr[:, :self.edge_dim]
+
+        # 确保至少有4+2+2维特征可用
+        min_required = 8
+        if edge_attr.size(1) < min_required:
+            # 使用简单线性变换
+            return nn.Linear(edge_attr.size(1), self.hidden_dim // 2).to(edge_attr.device)(edge_attr)
+
         # 分离不同类型的特征
         interaction_type = edge_attr[:, :4]  # 相互作用类型
-        distance = edge_attr[:, 4:5]  # 空间距离
-        strength = edge_attr[:, 5:6]  # 相互作用强度
+        distance_strength = edge_attr[:, 4:6]  # 空间距离和强度
         direction = edge_attr[:, 6:8]  # 方向向量
 
         # 编码各部分特征
         interaction_features = self.interaction_encoder(interaction_type)
-        metric_features = self.metric_encoder(torch.cat([distance, strength], dim=-1))
+        metric_features = self.metric_encoder(distance_strength)
         direction_features = self.direction_encoder(direction)
 
         # 合并所有特征
@@ -609,6 +610,54 @@ class EdgeFeatureProcessor(nn.Module):
         edge_features = self.output_transform(combined)
 
         return edge_features
+
+
+class EdgeProcessor(nn.Module):
+    """统一的边处理接口"""
+
+    def __init__(self, edge_dim, hidden_dim, edge_types, dropout=0.1, use_heterogeneous=True):
+        super(EdgeProcessor, self).__init__()
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+        self.edge_types = edge_types
+        self.use_heterogeneous = use_heterogeneous
+
+        if use_heterogeneous:
+            # 异质边处理
+            self.edge_type_embeddings = nn.Embedding(edge_types, hidden_dim // 4)
+            self.edge_encoders = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(edge_dim, hidden_dim // 2),
+                    nn.LayerNorm(hidden_dim // 2),
+                    nn.GELU()
+                ) for _ in range(edge_types)
+            ])
+        else:
+            # 同质边处理
+            self.edge_encoder = nn.Sequential(
+                nn.Linear(edge_dim, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.GELU()
+            )
+
+    def forward(self, edge_attr, edge_type=None):
+        """处理边特征"""
+        if self.use_heterogeneous and edge_type is not None:
+            # 处理异质边
+            result = torch.zeros(edge_attr.size(0), self.hidden_dim // 2, device=edge_attr.device)
+
+            for t in range(self.edge_types):
+                mask = (edge_type == t)
+                if not mask.any():
+                    continue
+
+                edge_feats = self.edge_encoders[t](edge_attr[mask])
+                result[mask] = edge_feats
+
+            return result
+        else:
+            # 处理同质边
+            return self.edge_encoder(edge_attr)
 
 # 新增: 相对位置编码器
 class RelativePositionEncoder(nn.Module):
