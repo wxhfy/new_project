@@ -422,7 +422,11 @@ class ProteinMultiModalTrainer:
         self.config = config
         self.device = config.DEVICE
         self.fp16_training = config.FP16_TRAINING
+        # 安全获取批处理大小，并提供默认值
         self.batch_size = config.BATCH_SIZE
+        if self.batch_size is None or self.batch_size <= 0:
+            self.batch_size = 64
+            logger.warning(f"无效的批处理大小，使用默认值: {self.batch_size}")
         self.log_dir = config.LOG_DIR
 
         # 是否为分布式训练主进程
@@ -471,45 +475,70 @@ class ProteinMultiModalTrainer:
         """初始化模型组件"""
         logger.info("初始化模型组件...")
 
-        # 1. 初始化GAT图编码器
-        self.graph_encoder = ProteinGATv2Encoder(
-            node_input_dim=self.config.NODE_INPUT_DIM,
-            edge_input_dim=self.config.EDGE_INPUT_DIM,
-            hidden_dim=self.config.HIDDEN_DIM,
-            output_dim=self.config.OUTPUT_DIM,
-            num_layers=self.config.NUM_LAYERS,
-            num_heads=self.config.NUM_HEADS,
-            edge_types=self.config.EDGE_TYPES,
-            dropout=self.config.DROPOUT,
-            use_pos_encoding=self.config.USE_POS_ENCODING,
-            use_heterogeneous_edges=self.config.USE_HETEROGENEOUS_EDGES,
-            use_edge_pruning=self.config.USE_EDGE_PRUNING,
-            esm_guidance=self.config.ESM_GUIDANCE,
-            activation='gelu'
-        ).to(self.device)
+        # 1. 初始化GAT图编码器 - 根据数据结构优化参数
+        try:
+            # 尝试动态确定输入维度
+            node_input_dim = self.config.NODE_INPUT_DIM
+            edge_input_dim = self.config.EDGE_INPUT_DIM
 
-        # 2. ESM模型初始化（修改此部分）
+            # 是否使用位置编码 - 根据数据结构调整
+            use_pos_encoding = False  # 默认关闭，因为数据中不包含pos信息
+
+            self.graph_encoder = ProteinGATv2Encoder(
+                node_input_dim=node_input_dim,
+                edge_input_dim=edge_input_dim,
+                hidden_dim=self.config.HIDDEN_DIM,
+                output_dim=self.config.OUTPUT_DIM,
+                num_layers=self.config.NUM_LAYERS,
+                num_heads=self.config.NUM_HEADS,
+                edge_types=self.config.EDGE_TYPES,
+                dropout=self.config.DROPOUT,
+                use_pos_encoding=use_pos_encoding,  # 禁用位置编码，因为数据中没有pos信息
+                use_heterogeneous_edges=self.config.USE_HETEROGENEOUS_EDGES,
+                use_edge_pruning=self.config.USE_EDGE_PRUNING,
+                esm_guidance=self.config.ESM_GUIDANCE,  # 启用ESM注意力引导
+                activation='gelu'
+            ).to(self.device)
+
+            logger.info(f"图编码器初始化成功 - 节点特征维度: {node_input_dim}, 边特征维度: {edge_input_dim}")
+        except Exception as e:
+            logger.error(f"图编码器初始化失败: {e}")
+            raise
+
+        # 2. ESM模型初始化
         logger.info(f"初始化ESM模型: {self.config.ESM_MODEL_NAME}")
         try:
             # 加载模型
             self.esm_model = ESMC.from_pretrained(self.config.ESM_MODEL_NAME, device=self.device)
             logger.info(f"ESM模型成功加载: {self.config.ESM_MODEL_NAME}")
 
-            # 跳过模型测试，避免维度错误
-            logger.info("ESM模型已加载，跳过测试阶段以避免维度错误")
-
-            # 打印模型信息供调试
+            # 维度检查和调试信息
             if hasattr(self.esm_model, "embedding_dim"):
                 logger.info(f"ESM模型嵌入维度: {self.esm_model.embedding_dim}")
+                # 更新配置中的ESM嵌入维度（如果不一致）
+                if self.config.ESM_EMBEDDING_DIM != self.esm_model.embedding_dim:
+                    logger.warning(
+                        f"更新ESM嵌入维度: {self.config.ESM_EMBEDDING_DIM} -> {self.esm_model.embedding_dim}")
+                    self.config.ESM_EMBEDDING_DIM = self.esm_model.embedding_dim
             else:
                 logger.info("ESM模型嵌入维度未知，使用配置中的默认值")
+
+            # 保存ESM引导标志
+            self.use_esm_guidance = self.config.ESM_GUIDANCE
+
+            # 初始化ESM注意力存储属性
+            self.current_esm_attention = None
+
         except Exception as e:
             logger.error(f"ESM模型加载失败: {e}")
             logger.error(f"环境变量: ESM_CACHE_DIR={os.environ.get('ESM_CACHE_DIR')}")
             logger.error(f"模型名称: {self.config.ESM_MODEL_NAME}")
+            # 降级处理 - 禁用ESM引导
+            self.use_esm_guidance = False
+            logger.warning("由于ESM模型加载失败，已禁用ESM引导功能")
             raise
 
-        # 3. 潜空间映射器
+        # 3. 潜空间映射器 - 将图嵌入映射到与ESM兼容的空间
         self.latent_mapper = ProteinLatentMapper(
             input_dim=self.config.OUTPUT_DIM,
             latent_dim=self.config.ESM_EMBEDDING_DIM,
@@ -517,13 +546,13 @@ class ProteinMultiModalTrainer:
             dropout=self.config.DROPOUT
         ).to(self.device)
 
-        # 4. 对比学习头
+        # 4. 对比学习头 - 促进模态间对齐
         self.contrast_head = CrossModalContrastiveHead(
             embedding_dim=self.config.ESM_EMBEDDING_DIM,
             temperature=self.config.TEMPERATURE
         ).to(self.device)
 
-        # 5. 序列-结构融合模块
+        # 5. 序列-结构融合模块 - 整合两种模态的信息
         self.fusion_module = SequenceStructureFusion(
             seq_dim=self.config.ESM_EMBEDDING_DIM,
             graph_dim=self.config.ESM_EMBEDDING_DIM,  # 使用映射后的维度
@@ -578,6 +607,12 @@ class ProteinMultiModalTrainer:
             pytorch_total_params += sum(p.numel() for p in self.contrast_head.parameters() if p.requires_grad)
             pytorch_total_params += sum(p.numel() for p in self.fusion_module.parameters() if p.requires_grad)
             logger.info(f"模型总参数量: {pytorch_total_params / 1e6:.2f}M")
+
+            # 打印ESM引导状态
+            if self.use_esm_guidance:
+                logger.info("已启用ESM注意力引导机制")
+            else:
+                logger.info("未启用ESM注意力引导机制")
 
     def _init_optimizers(self):
         """初始化优化器和学习率调度器"""
@@ -787,89 +822,98 @@ class ProteinMultiModalTrainer:
 
     def _extract_sequences_from_graphs(self, graphs_batch):
         """
-        从图批次中提取序列
+        增强版：从图批次中提取序列，提高健壮性和准确性
 
         参数:
             graphs_batch: 图数据批次
-
         返回:
             list: 氨基酸序列列表
         """
         sequences = []
 
-        # 首先检查是否有sequence字段，并是否已是列表形式
+        # 策略1：直接从sequence属性获取（最优先）
         if hasattr(graphs_batch, "sequence") and isinstance(graphs_batch.sequence, list):
-            return graphs_batch.sequence
+            return [seq if seq and isinstance(seq, str) else 'A' for seq in graphs_batch.sequence]
 
-        # 否则，需要从图节点特征中提取
+        # 策略2：从节点特征重建序列
         num_graphs = getattr(graphs_batch, "num_graphs", 1)
+
+        # 定义氨基酸映射表（从索引到字母）
+        aa_map = 'ACDEFGHIKLMNPQRSTVWY'
 
         for i in range(num_graphs):
             # 获取当前图的节点掩码
             if hasattr(graphs_batch, "batch") and graphs_batch.batch is not None:
                 mask = graphs_batch.batch == i
                 # 提取节点特征
-                x = graphs_batch.x[mask]
+                x_i = graphs_batch.x[mask]
             else:
                 # 如果没有batch属性，假设只有一个图
-                x = graphs_batch.x
+                x_i = graphs_batch.x
 
-            # 尝试不同方式提取序列
+            # 尝试多种方法从特征中提取氨基酸序列
             sequence = None
-
-            # 尝试从节点特征中提取氨基酸信息
             try:
-                # 假设前20维是氨基酸的one-hot编码
-                aa_indices = torch.argmax(x[:, :20], dim=1).cpu().numpy()
-                aa_map = 'ACDEFGHIKLMNPQRSTVWY'
-                sequence = ''.join([aa_map[idx] for idx in aa_indices if idx < len(aa_map)])
-            except:
-                # 如果无法从节点特征提取，使用占位符
-                sequence = 'A' * x.shape[0]  # 使用序列长度的"A"占位
+                # 方法1：假设前20维是氨基酸的one-hot编码
+                if x_i.shape[1] >= 20:
+                    aa_indices = torch.argmax(x_i[:, :20], dim=1).cpu().numpy()
+                    sequence = ''.join([aa_map[idx] if idx < len(aa_map) else 'X' for idx in aa_indices])
+
+                # 方法2：如果方法1失败，使用全部特征的最大值索引
+                if not sequence or len(sequence) == 0:
+                    aa_indices = torch.argmax(x_i, dim=1).cpu().numpy() % len(aa_map)
+                    sequence = ''.join([aa_map[idx] for idx in aa_indices])
+
+                # 验证序列的合理性
+                if not sequence or len(sequence) != x_i.shape[0]:
+                    # 长度不匹配，使用占位符
+                    sequence = 'A' * x_i.shape[0]
+
+            except Exception as e:
+                logger.warning(f"序列重建失败: {e}，使用默认序列")
+                # 使用占位符
+                sequence = 'A' * max(1, x_i.shape[0])  # 至少有一个氨基酸
 
             sequences.append(sequence)
 
         return sequences
 
     def _get_fused_embedding(self, graph_batch, sequences=None):
-        """
-        获取图嵌入和序列嵌入的融合表示
+        """优化后的融合嵌入方法"""
 
-        参数:
-            graph_batch: 图数据批次
-            sequences (list, optional): 氨基酸序列列表，如果为None则从图中提取
+        # 1. 首先提取序列
+        if sequences is None:
+            sequences = self._extract_sequences_from_graphs(graph_batch)
 
-        返回:
-            tuple: (图嵌入, 序列嵌入, 图潜空间嵌入, 融合嵌入)
-        """
-        # 1. 获取图嵌入
-        node_embeddings, graph_embedding, _ = self.graph_encoder(
+        # 2. 获取序列ESM嵌入和注意力权重
+        seq_embeddings = self._get_esm_embedding(sequences)
+
+        # 3. 提取当前序列的注意力用于图编码
+        current_esm_attention = None
+        if self.config.ESM_GUIDANCE and hasattr(seq_embeddings, 'attention'):
+            current_esm_attention = seq_embeddings.attention
+
+        # 4. 使用当前序列注意力指导图编码
+        node_embeddings, graph_embedding, attention_weights = self.graph_encoder(
             x=graph_batch.x,
             edge_index=graph_batch.edge_index,
             edge_attr=graph_batch.edge_attr if hasattr(graph_batch, 'edge_attr') else None,
             edge_type=graph_batch.edge_type if hasattr(graph_batch, 'edge_type') else None,
-            pos=graph_batch.pos if hasattr(graph_batch, 'pos') else None,
-            batch=graph_batch.batch
+            batch=graph_batch.batch,
+            esm_attention=current_esm_attention  # 使用当前批次的注意力
         )
 
-        # 2. 从图中提取序列或使用提供的序列
-        if sequences is None:
-            sequences = self._extract_sequences_from_graphs(graph_batch)
-
-        # 3. 获取序列ESM嵌入
-        seq_embeddings = self._get_esm_embedding(sequences)
-
-        # 如果是批次中有多个序列，取每个序列的表示
+        # 5. 处理序列嵌入 (池化等)
         if seq_embeddings.dim() == 3:  # [batch_size, seq_len, dim]
             # 使用首尾池化: [CLS] token + [EOS] token + 平均池化
             cls_tokens = seq_embeddings[:, 0, :]  # [CLS] token
             eos_tokens = seq_embeddings[:, -1, :]  # [EOS] token
             avg_tokens = seq_embeddings.mean(dim=1)  # 平均池化
 
-            # 组合表示
+            # 组合表示 (平均聚合)
             pooled_seq_emb = (cls_tokens + eos_tokens + avg_tokens) / 3.0  # [batch_size, dim]
         else:
-            # 单个序列
+            # 单个序列处理
             cls_token = seq_embeddings[0, 0, :]
             eos_token = seq_embeddings[0, -1, :]
             avg_token = seq_embeddings[0].mean(dim=0)
@@ -877,10 +921,8 @@ class ProteinMultiModalTrainer:
             pooled_seq_emb = (cls_token + eos_token + avg_token) / 3.0
             pooled_seq_emb = pooled_seq_emb.unsqueeze(0)  # [1, dim]
 
-        # 4. 将图嵌入映射到序列空间
+        # 6. 映射与融合
         graph_latent = self.latent_mapper(graph_embedding)
-
-        # 5. 序列-结构融合
         fused_embedding = self.fusion_module(pooled_seq_emb, graph_latent)
 
         return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
@@ -1760,18 +1802,23 @@ def setup_data_loaders(config):
     返回:
         tuple: (训练加载器, 验证加载器, 测试加载器)
     """
-    # 确保批处理大小有效
-    batch_size = getattr(config, "BATCH_SIZE", 32)
-    if batch_size is None or batch_size <= 0:
-        logger.warning(f"无效的批处理大小: {batch_size}，使用默认值 32")
-        batch_size = 32
-        config.BATCH_SIZE = batch_size
+    # 确保批处理大小有效 - 使用局部变量而不是修改配置
+    config_batch_size = getattr(config, "BATCH_SIZE", 256)
+    effective_batch_size = 128  # 默认值
 
-    eval_batch_size = getattr(config, "EVAL_BATCH_SIZE", batch_size)
-    if eval_batch_size is None or eval_batch_size <= 0:
-        logger.warning(f"无效的评估批处理大小: {eval_batch_size}，使用默认值 {batch_size}")
-        eval_batch_size = batch_size
-        config.EVAL_BATCH_SIZE = eval_batch_size
+    if config_batch_size is not None and config_batch_size > 0:
+        effective_batch_size = config_batch_size
+    else:
+        logger.warning(f"无效的批处理大小: {config_batch_size}，使用默认值 {effective_batch_size}")
+
+    # 处理评估批处理大小
+    config_eval_batch_size = getattr(config, "EVAL_BATCH_SIZE", effective_batch_size)
+    effective_eval_batch_size = effective_batch_size
+
+    if config_eval_batch_size is not None and config_eval_batch_size > 0:
+        effective_eval_batch_size = config_eval_batch_size
+    else:
+        logger.warning(f"无效的评估批处理大小: {config_eval_batch_size}，使用默认值 {effective_eval_batch_size}")
 
     # 创建数据集
     logger.info("创建数据集...")
@@ -1823,12 +1870,11 @@ def setup_data_loaders(config):
         val_sampler = None
         test_sampler = None
 
-    # 创建数据加载器
-    logger.info("创建数据加载器...")
+    # 创建数据加载器，使用局部变量而不是config.BATCH_SIZE
     try:
         train_loader = ProteinDataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,  # 使用局部变量
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             num_workers=getattr(config, "NUM_WORKERS", 0)
@@ -1836,7 +1882,7 @@ def setup_data_loaders(config):
 
         val_loader = ProteinDataLoader(
             val_dataset,
-            batch_size=eval_batch_size,
+            batch_size=effective_eval_batch_size,  # 使用局部变量
             shuffle=False,
             sampler=val_sampler,
             num_workers=getattr(config, "NUM_WORKERS", 0)
@@ -1844,7 +1890,7 @@ def setup_data_loaders(config):
 
         test_loader = ProteinDataLoader(
             test_dataset,
-            batch_size=eval_batch_size,
+            batch_size=effective_eval_batch_size,  # 使用局部变量
             shuffle=False,
             sampler=test_sampler,
             num_workers=getattr(config, "NUM_WORKERS", 0)
@@ -1852,6 +1898,7 @@ def setup_data_loaders(config):
 
         logger.info(
             f"数据加载器创建成功 - 训练批次: {len(train_loader)}, 验证批次: {len(val_loader)}, 测试批次: {len(test_loader)}")
+        logger.info(f"使用的批处理大小 - 训练: {effective_batch_size}, 评估: {effective_eval_batch_size}")
 
         return train_loader, val_loader, test_loader
 
@@ -1865,7 +1912,7 @@ def setup_data_loaders(config):
 
         # 创建空数据集
         empty_dataset = ProteinDataset(config.TRAIN_CACHE)
-        empty_loader = ProteinDataLoader(empty_dataset, batch_size=batch_size, shuffle=False)
+        empty_loader = ProteinDataLoader(empty_dataset, batch_size=effective_batch_size, shuffle=False)
 
         return empty_loader, empty_loader, empty_loader
 
@@ -1923,7 +1970,12 @@ def main():
             logger.info(f"全局进程排名: {config.GLOBAL_RANK}")
             logger.info(f"本地进程排名: {config.LOCAL_RANK}")
         logger.info(f"混合精度训练: {config.FP16_TRAINING}")
-        logger.info(f"批大小: {config.BATCH_SIZE}")
+        if config._batch_size is None:
+            if config.USE_DISTRIBUTED and config.NUM_GPUS > 0:
+                config._batch_size = max(1, config.GLOBAL_BATCH_SIZE // config.NUM_GPUS)
+            else:
+                config._batch_size = config.GLOBAL_BATCH_SIZE
+        logger.info(f"批大小: {config.BATCH_SIZE or config.GLOBAL_BATCH_SIZE}")
         logger.info(f"GPU数量: {config.NUM_GPUS}")
 
     # 设置种子确保可重复性

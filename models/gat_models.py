@@ -55,9 +55,9 @@ class ProteinGATv2Encoder(nn.Module):
             num_heads=4,
             edge_types=4,  # 修改为4种边类型
             dropout=0.2,
-            use_pos_encoding=True,
+            use_pos_encoding=False,
             use_heterogeneous_edges=True,
-            use_edge_pruning=False,
+            use_edge_pruning=True,
             esm_guidance=True,
             activation='gelu',
     ):
@@ -622,6 +622,13 @@ class EdgeProcessor(nn.Module):
         self.edge_types = edge_types
         self.use_heterogeneous = use_heterogeneous
 
+        # 总是创建通用边编码器（作为备用）
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU()
+        )
+
         if use_heterogeneous:
             # 异质边处理
             self.edge_type_embeddings = nn.Embedding(edge_types, hidden_dim // 4)
@@ -632,33 +639,51 @@ class EdgeProcessor(nn.Module):
                     nn.GELU()
                 ) for _ in range(edge_types)
             ])
-        else:
-            # 同质边处理
-            self.edge_encoder = nn.Sequential(
-                nn.Linear(edge_dim, hidden_dim // 2),
-                nn.LayerNorm(hidden_dim // 2),
-                nn.GELU()
-            )
 
     def forward(self, edge_attr, edge_type=None):
         """处理边特征"""
+        # 处理可能的空输入
+        if edge_attr is None:
+            return None
+
+        # 检查输入维度
+        if edge_attr.size(1) < self.edge_dim:
+            # 处理维度不足的情况
+            padding = torch.zeros(edge_attr.size(0), self.edge_dim - edge_attr.size(1),
+                                  device=edge_attr.device)
+            edge_attr = torch.cat([edge_attr, padding], dim=1)
+        elif edge_attr.size(1) > self.edge_dim:
+            # 维度过多时截断
+            edge_attr = edge_attr[:, :self.edge_dim]
+
+        # 首先尝试异质边处理
         if self.use_heterogeneous and edge_type is not None:
-            # 处理异质边
-            result = torch.zeros(edge_attr.size(0), self.hidden_dim // 2, device=edge_attr.device)
+            try:
+                # 处理异质边
+                result = torch.zeros(edge_attr.size(0), self.hidden_dim // 2, device=edge_attr.device)
 
-            for t in range(self.edge_types):
-                mask = (edge_type == t)
-                if not mask.any():
-                    continue
+                # 统计有效边数量，确保至少处理了一条边
+                processed_edges = 0
 
-                edge_feats = self.edge_encoders[t](edge_attr[mask])
-                result[mask] = edge_feats
+                for t in range(self.edge_types):
+                    mask = (edge_type == t)
+                    if not mask.any():
+                        continue
 
-            return result
-        else:
-            # 处理同质边
-            return self.edge_encoder(edge_attr)
+                    edge_feats = self.edge_encoders[t](edge_attr[mask])
+                    result[mask] = edge_feats
+                    processed_edges += mask.sum().item()
 
+                # 如果所有边都已处理，返回结果
+                if processed_edges > 0:
+                    return result
+                # 否则回退到通用处理
+            except Exception as e:
+                import logging
+                logging.warning(f"异质边处理失败，回退到通用处理: {e}")
+
+        # 通用边处理（作为回退选项）
+        return self.edge_encoder(edge_attr)
 # 新增: 相对位置编码器
 class RelativePositionEncoder(nn.Module):
     """
