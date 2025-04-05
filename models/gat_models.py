@@ -14,10 +14,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
-from torch_geometric.utils import softmax, to_dense_batch
-from torch_scatter import scatter_add, scatter_mean
 
 from .layers import MLPLayer, HeterogeneousGATv2Layer, EdgeUpdateModule, GATv2ConvLayer, DynamicEdgePruning
 from .readout import AttentiveReadout, HierarchicalReadout
@@ -51,17 +47,17 @@ class ProteinGATv2Encoder(nn.Module):
 
     def __init__(
             self,
-            node_input_dim,
-            edge_input_dim,
+            node_input_dim,  # 现在是35
+            edge_input_dim,  # 现在是8
             hidden_dim=128,
             output_dim=128,
             num_layers=3,
             num_heads=4,
-            edge_types=2,
+            edge_types=4,  # 修改为4种边类型
             dropout=0.2,
             use_pos_encoding=True,
             use_heterogeneous_edges=True,
-            use_edge_pruning=False,  # 新增参数
+            use_edge_pruning=False,
             esm_guidance=True,
             activation='gelu',
     ):
@@ -91,7 +87,7 @@ class ProteinGATv2Encoder(nn.Module):
 
         # =============== 特征处理模块 ===============
 
-        # 相对位置编码 - 新增
+        # 相对位置编码
         if self.use_pos_encoding:
             self.pos_encoder = RelativePositionEncoder(
                 hidden_dim=hidden_dim // 2,
@@ -128,18 +124,17 @@ class ProteinGATv2Encoder(nn.Module):
         if self.use_heterogeneous_edges:
             # 不同类型边的嵌入映射
             self.edge_type_embeddings = nn.Embedding(edge_types, hidden_dim // 4)
-            # 针对不同类型边的特征变换
-            self.edge_encoders = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(edge_input_dim, hidden_dim // 2),
-                    nn.LayerNorm(hidden_dim // 2),
-                    self.activation
-                ) for _ in range(edge_types)
-            ])
+
+            # 使用新的边特征处理器
+            self.edge_processor = EdgeFeatureProcessor(
+                edge_dim=edge_input_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
         else:
             # 统一边特征处理
             self.edge_encoder = nn.Sequential(
-                nn.Linear(edge_input_dim + edge_types, hidden_dim // 2),  # 加入one-hot边类型
+                nn.Linear(edge_input_dim, hidden_dim // 2),
                 nn.LayerNorm(hidden_dim // 2),
                 self.activation
             )
@@ -249,27 +244,26 @@ class ProteinGATv2Encoder(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
+    # 修改图编码器的前向传播函数，支持ESM指导
     def forward(
             self,
             x,
             edge_index,
             edge_attr=None,
             edge_type=None,
-            pos=None,
             batch=None,
-            esm_attention=None
+            esm_attention=None  # 新增：ESM注意力参数
     ):
         """
-        前向传递
+        前向传递，支持ESM序列注意力指导
 
         参数:
             x (torch.Tensor): 节点特征 [num_nodes, node_input_dim]
             edge_index (torch.LongTensor): 图的边连接 [2, num_edges]
             edge_attr (torch.Tensor): 边特征 [num_edges, edge_input_dim]
             edge_type (torch.LongTensor): 边类型索引 [num_edges]
-            pos (torch.Tensor): 节点坐标 [num_nodes, 3]
             batch (torch.LongTensor): 批处理索引 [num_nodes]
-            esm_attention (torch.Tensor): ESM注意力分数 [num_nodes, 1]
+            esm_attention (torch.Tensor): ESM注意力分数 [num_nodes, 1]，用于指导图注意力
 
         返回:
             node_embeddings (torch.Tensor): 节点级嵌入 [num_nodes, output_dim]
@@ -281,52 +275,37 @@ class ProteinGATv2Encoder(nn.Module):
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
         # =============== 特征预处理 ===============
-
         # 物化属性标准化
         x = self.property_normalizer(x)
-
-        # 计算相对位置编码（如果启用）
-        if self.use_pos_encoding and pos is not None:
-            pos_encoding = self.pos_encoder(pos, edge_index, batch)
-            # 拼接位置编码和节点特征
-            x = torch.cat([x, pos_encoding], dim=-1)
 
         # 节点特征初始编码
         h = self.node_encoder(x)
 
-
+        # 处理边特征
         if edge_attr is not None:
             if self.use_heterogeneous_edges and edge_type is not None:
-                # 针对不同类型边，分别处理特征
+                # 分别处理不同类型的边
                 edge_features_list = []
                 for t in range(self.edge_types):
                     mask = (edge_type == t)
                     if mask.sum() > 0:
                         # 边特征变换
                         edge_feats = self.edge_encoders[t](edge_attr[mask])
-                        # 获取边类型嵌入
+                        # 获取边类型嵌入并扩展
                         edge_type_emb = self.edge_type_embeddings(torch.tensor([t], device=edge_attr.device))
-                        # 拼接边类型嵌入和特征
-                        edge_feats = torch.cat([
-                            edge_feats,
-                            edge_type_emb.expand(edge_feats.size(0), -1)
-                        ], dim=-1)
+                        type_emb_expanded = edge_type_emb.expand(edge_feats.size(0), -1)
+                        # 拼接边特征和类型嵌入
+                        edge_feats = torch.cat([edge_feats, type_emb_expanded], dim=-1)
                         edge_features_list.append((mask, edge_feats))
 
-                # 初始化完整边特征张量
-                edge_features = torch.zeros(
-                    edge_attr.size(0),
-                    self.hidden_dim // 2,
-                    device=edge_attr.device
-                )
-
-                # 填入各类型边的特征
+                # 合并不同类型的边特征
+                edge_features = torch.zeros(edge_attr.size(0), self.hidden_dim // 2, device=edge_attr.device)
                 for mask, feats in edge_features_list:
                     edge_features[mask] = feats
             else:
                 # 统一处理所有边
-                # 将边类型转为独热向量
                 if edge_type is not None:
+                    # 将边类型转为one-hot向量
                     edge_type_onehot = F.one_hot(edge_type, num_classes=self.edge_types).float()
                     # 拼接边特征和类型
                     edge_input = torch.cat([edge_attr, edge_type_onehot], dim=-1)
@@ -341,8 +320,8 @@ class ProteinGATv2Encoder(nn.Module):
         if self.use_edge_pruning and edge_features is not None:
             edge_mask, _ = self.edge_pruning(edge_features)
             edge_features = edge_features * edge_mask
-        # =============== 图卷积处理 ===============
 
+        # =============== 图卷积处理 ===============
         # 存储每一层的特征
         layer_features = []
 
@@ -351,17 +330,26 @@ class ProteinGATv2Encoder(nn.Module):
 
         # 通过图卷积层
         for i, (conv, edge_updater) in enumerate(zip(self.convs, self.edge_updaters)):
-            if self.use_heterogeneous_edges:
-                # 使用异质边注意力层
-                h_new = conv(h, edge_index, edge_type, current_edge_features)
+            # 如果是最后一层且提供了ESM注意力，则用于指导
+            if i == len(self.convs) - 1 and self.esm_guidance and esm_attention is not None:
+                # 集成ESM注意力到图结构注意力机制
+                if self.use_heterogeneous_edges:
+                    h_new = conv(h, edge_index, edge_type, current_edge_features, esm_attention=esm_attention)
+                else:
+                    h_new = conv(h, edge_index, current_edge_features, esm_attention=esm_attention)
             else:
-                # 使用标准GATv2层
-                h_new = conv(h, edge_index, current_edge_features)
+                # 常规前向传播
+                if self.use_heterogeneous_edges:
+                    h_new = conv(h, edge_index, edge_type, current_edge_features)
+                else:
+                    h_new = conv(h, edge_index, current_edge_features)
 
             # 边特征更新
             if current_edge_features is not None:
-                if self.use_heterogeneous_edges:
-                    current_edge_features = edge_updater(h, edge_index, edge_type, current_edge_features)
+                if self.use_heterogeneous_edges and edge_type is not None:
+                    current_edge_features = edge_updater(
+                        h, edge_index, current_edge_features, edge_type=edge_type
+                    )
                 else:
                     current_edge_features = edge_updater(h, edge_index, current_edge_features)
 
@@ -375,7 +363,6 @@ class ProteinGATv2Encoder(nn.Module):
         layer_features.append(h)
 
         # =============== 多尺度特征聚合 ===============
-
         # 多尺度特征聚合
         if len(layer_features) > 1:
             # 拼接所有层特征
@@ -386,18 +373,14 @@ class ProteinGATv2Encoder(nn.Module):
 
             # 加权聚合各层特征
             weighted_features = 0
-            start_idx = 0
             for i, feat in enumerate(layer_features):
-                feat_dim = feat.size(-1)
                 weight = layer_weights[:, i].unsqueeze(-1)
                 weighted_features += weight * feat
-                start_idx += feat_dim
 
-            # 融合特征
+            # 特征融合
             h = self.feature_fusion(multi_scale_features) + weighted_features
 
         # =============== 节点表示和图级表示 ===============
-
         # 节点级嵌入
         node_embeddings = h
 
@@ -414,7 +397,7 @@ class ProteinGATv2Encoder(nn.Module):
             graph_embedding = self.readout(node_embeddings, batch, node_weights=guided_attention)
         else:
             # 标准读出
-            graph_embedding = self.readout(node_embeddings, batch)
+            graph_embedding = self.readout(node_embeddings, batch, node_weights=residue_scores)
 
         return node_embeddings, graph_embedding, residue_scores
 
@@ -472,13 +455,13 @@ class ProteinGATv2Encoder(nn.Module):
             return node_embeddings_list, graph_embedding
 
     def _batch_protein_graphs(self, protein_graphs, device):
-        """高效的批处理方法"""
+        """高效的批处理方法，确保正确处理35维节点特征和8维边特征"""
         # 预分配必要容量
         total_nodes = sum(graph.num_nodes for graph in protein_graphs)
         total_edges = sum(graph.num_edges for graph in protein_graphs)
 
-        # 初始化批数据结构
-        x = torch.zeros((total_nodes, self.node_input_dim), device=device)
+        # 初始化批数据结构 - 确保维度正确
+        x = torch.zeros((total_nodes, self.node_input_dim), device=device)  # 35维
         edge_index = torch.zeros((2, total_edges), dtype=torch.long, device=device)
         batch = torch.zeros(total_nodes, dtype=torch.long, device=device)
         ptr = torch.zeros(len(protein_graphs) + 1, dtype=torch.long, device=device)
@@ -488,7 +471,6 @@ class ProteinGATv2Encoder(nn.Module):
                                                                                               'edge_attr') else None
         edge_type = torch.zeros(total_edges, dtype=torch.long, device=device) if hasattr(protein_graphs[0],
                                                                                          'edge_type') else None
-        pos = torch.zeros((total_nodes, 3), device=device) if hasattr(protein_graphs[0], 'pos') else None
 
         # 填充数据
         node_offset = 0
@@ -517,9 +499,6 @@ class ProteinGATv2Encoder(nn.Module):
             if edge_type is not None and hasattr(graph, 'edge_type'):
                 edge_type[edge_offset:edge_offset + num_edges] = graph.edge_type.to(device)
 
-            if pos is not None and hasattr(graph, 'pos'):
-                pos[node_offset:node_offset + num_nodes] = graph.pos.to(device)
-
             node_offset += num_nodes
             edge_offset += num_edges
 
@@ -540,9 +519,6 @@ class ProteinGATv2Encoder(nn.Module):
         if edge_type is not None:
             batch_data['edge_type'] = edge_type[:edge_offset]
 
-        if pos is not None:
-            batch_data['pos'] = pos
-
         return batch_data
 
     def _split_batch_outputs(self, node_embeddings, residue_scores, ptr):
@@ -559,6 +535,80 @@ class ProteinGATv2Encoder(nn.Module):
 
         return node_embeddings_list, residue_scores_list
 
+
+class EdgeFeatureProcessor(nn.Module):
+    """
+    处理8维边特征的专用模块
+
+    特征维度明细：
+    - 相互作用类型（4维one-hot编码）
+    - 空间距离（1维）
+    - 相互作用强度（1维）
+    - 方向向量（2维）
+    """
+
+    def __init__(self, edge_dim=8, hidden_dim=64, dropout=0.1):
+        super(EdgeFeatureProcessor, self).__init__()
+
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+
+        # 相互作用类型编码器
+        self.interaction_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU()
+        )
+
+        # 距离和强度编码器
+        self.metric_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU()
+        )
+
+        # 方向编码器
+        self.direction_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU()
+        )
+
+        # 输出变换
+        self.output_transform = nn.Sequential(
+            nn.Linear(hidden_dim * 3 // 4, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, edge_attr):
+        """
+        处理8维边特征
+
+        参数:
+            edge_attr (torch.Tensor): 边特征 [num_edges, 8]
+
+        返回:
+            edge_features (torch.Tensor): 处理后的边特征 [num_edges, hidden_dim//2]
+        """
+        # 分离不同类型的特征
+        interaction_type = edge_attr[:, :4]  # 相互作用类型
+        distance = edge_attr[:, 4:5]  # 空间距离
+        strength = edge_attr[:, 5:6]  # 相互作用强度
+        direction = edge_attr[:, 6:8]  # 方向向量
+
+        # 编码各部分特征
+        interaction_features = self.interaction_encoder(interaction_type)
+        metric_features = self.metric_encoder(torch.cat([distance, strength], dim=-1))
+        direction_features = self.direction_encoder(direction)
+
+        # 合并所有特征
+        combined = torch.cat([interaction_features, metric_features, direction_features], dim=-1)
+
+        # 最终变换
+        edge_features = self.output_transform(combined)
+
+        return edge_features
 
 # 新增: 相对位置编码器
 class RelativePositionEncoder(nn.Module):
@@ -640,63 +690,60 @@ class RelativePositionEncoder(nn.Module):
         return position_embeddings
 
 
-# 新增: 物化属性标准化器
 class PropertyNormalizer(nn.Module):
-    """物化属性标准化器，通过分箱和归一化处理氨基酸特性"""
+    """针对35维蛋白质特征向量的标准化器"""
 
     def __init__(self, num_bins=10):
         super(PropertyNormalizer, self).__init__()
         self.num_bins = num_bins
 
-        # 记录各属性的统计信息，用于归一化
+        # 为各类属性设置合适的归一化范围
         self.register_buffer('hydropathy_range', torch.tensor([-4.5, 4.5]))
-        self.register_buffer('charge_range', torch.tensor([-1.0, 1.0]))
+        self.register_buffer('charge_range', torch.tensor([-2.0, 2.0]))
         self.register_buffer('weight_range', torch.tensor([75.0, 204.0]))
+        self.register_buffer('volume_range', torch.tensor([60.0, 230.0]))
+        self.register_buffer('sasa_range', torch.tensor([0.0, 1.0]))
+        self.register_buffer('plddt_range', torch.tensor([0.0, 100.0]))
 
     def forward(self, x):
         """
-        标准化蛋白质物化属性
+        标准化蛋白质理化和结构特性
 
         参数:
-            x (torch.Tensor): 节点特征 [num_nodes, node_input_dim]
+            x (torch.Tensor): 节点特征 [num_nodes, 35]
 
         返回:
-            x_normalized (torch.Tensor): 标准化后的节点特征
+            x_normalized (torch.Tensor): 标准化后的节点特征 [num_nodes, 35]
         """
-        # 假设特征的前几列分别是: hydropathy, charge, molecular_weight等
-        # 根据实际数据格式调整索引
-        batch_size = x.size(0)
-        device = x.device
-
         # 深拷贝输入，避免修改原始数据
         x_normalized = x.clone()
 
-        # 疏水性分箱归一化 (假设在索引0)
-        if x.size(1) > 0:
-            hydropathy = x[:, 0]
-            x_normalized[:, 0] = self._bin_and_normalize(
-                hydropathy,
-                self.hydropathy_range[0],
-                self.hydropathy_range[1]
-            )
+        # 根据特征布局进行标准化，特征维度分布：
+        # [0-19]: BLOSUM62编码 - 无需归一化，已经是标准化分数
+        # [20-22]: 空间坐标 - 假设已经归一化
+        # [23]: 疏水性
+        x_normalized[:, 23] = self._bin_and_normalize(x[:, 23], self.hydropathy_range[0], self.hydropathy_range[1])
 
-        # 电荷分箱归一化 (假设在索引1)
-        if x.size(1) > 1:
-            charge = x[:, 1]
-            x_normalized[:, 1] = self._bin_and_normalize(
-                charge,
-                self.charge_range[0],
-                self.charge_range[1]
-            )
+        # [24]: 电荷
+        x_normalized[:, 24] = self._bin_and_normalize(x[:, 24], self.charge_range[0], self.charge_range[1])
 
-        # 分子量分箱归一化 (假设在索引3)
-        if x.size(1) > 3:
-            weight = x[:, 3]
-            x_normalized[:, 3] = self._bin_and_normalize(
-                weight,
-                self.weight_range[0],
-                self.weight_range[1]
-            )
+        # [25]: 分子量
+        x_normalized[:, 25] = self._bin_and_normalize(x[:, 25], self.weight_range[0], self.weight_range[1])
+
+        # [26]: 体积
+        x_normalized[:, 26] = self._bin_and_normalize(x[:, 26], self.volume_range[0], self.volume_range[1])
+
+        # [27-28]: 柔性和芳香性 - 这些已经是归一化值
+
+        # [29-31]: 二级结构编码 - 已经是one-hot编码，无需归一化
+
+        # [32]: 溶剂可及性
+        x_normalized[:, 32] = self._bin_and_normalize(x[:, 32], self.sasa_range[0], self.sasa_range[1])
+
+        # [33]: 侧链柔性 - 已经归一化
+
+        # [34]: pLDDT质量评分
+        x_normalized[:, 34] = self._bin_and_normalize(x[:, 34], self.plddt_range[0], self.plddt_range[1])
 
         return x_normalized
 
@@ -706,13 +753,14 @@ class PropertyNormalizer(nn.Module):
         values_clipped = torch.clamp(values, min=min_val, max=max_val)
 
         # 归一化到[0,1]
-        values_norm = (values_clipped - min_val) / (max_val - min_val)
+        values_norm = (values_clipped - min_val) / (max_val - min_val + 1e-6)
 
         # 分箱 (可选)
-        values_binned = torch.floor(values_norm * self.num_bins) / self.num_bins
-
-        return values_binned
-
+        if self.num_bins > 1:
+            values_binned = torch.floor(values_norm * self.num_bins) / self.num_bins
+            return values_binned
+        else:
+            return values_norm
 
 # 针对与ESM编码器对齐的潜空间映射器
 class ProteinLatentMapper(nn.Module):

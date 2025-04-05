@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """
 增强型蛋白质图神经网络基础层组件
 
 该模块实现了针对蛋白质设计与抗菌肽(AMPs)生成的专用图神经网络层组件，
-包括异质边处理、物化属性感知、结构敏感注意力等先进特性。
+包括异质边处理、物化属性感知、结构敏感注意力等先进特性，
+并新增了ESM注意力引导机制，实现了序列模型和结构模型的深度融合。
 
 作者: wxhfy
-日期: 2025-03-29
+日期: 2025-04-05
 """
 
 import math
@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, MessagePassing
 from torch_geometric.utils import softmax, add_self_loops
 from torch_scatter import scatter_add, scatter_mean, scatter_max
+
+from statistical import logger
 
 
 class GATv2ConvLayer(nn.Module):
@@ -90,14 +92,15 @@ class GATv2ConvLayer(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, edge_index, edge_attr=None):
+    def forward(self, x, edge_index, edge_attr=None, esm_attention=None):
         """
-        前向传递
+        前向传递，支持ESM注意力引导
 
         参数:
             x (torch.Tensor): 节点特征 [num_nodes, in_channels]
             edge_index (torch.LongTensor): 边连接 [2, num_edges]
             edge_attr (torch.Tensor, optional): 边特征 [num_edges, edge_dim]
+            esm_attention (torch.Tensor, optional): ESM注意力分数 [num_nodes, 1]
 
         返回:
             out (torch.Tensor): 更新的节点特征 [num_nodes, out_channels]
@@ -128,7 +131,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
     异质边GATv2层，针对不同类型的边使用不同的注意力计算机制
 
     为肽键和空间边设计分离的注意力计算通道，通过门控机制融合不同类型边的信息。
-    特别适合处理蛋白质中的多种相互作用类型。
+    特别适合处理蛋白质中的多种相互作用类型，支持ESM注意力引导机制。
 
     参数:
         in_channels (int): 输入特征维度
@@ -139,6 +142,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
         dropout (float, optional): Dropout率
         use_layer_norm (bool, optional): 是否使用层归一化
         activation (str, optional): 激活函数类型 ('relu', 'gelu', 'leaky_relu')
+        esm_guidance (bool, optional): 是否启用ESM注意力引导
     """
 
     def __init__(
@@ -151,6 +155,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
             dropout=0.2,
             use_layer_norm=True,
             activation='gelu',
+            esm_guidance=False,
             **kwargs
     ):
         super(HeterogeneousGATv2Layer, self).__init__(aggr='add', node_dim=0, **kwargs)
@@ -161,6 +166,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
         self.edge_types = edge_types
         self.edge_dim = edge_dim
         self.use_layer_norm = use_layer_norm
+        self.esm_guidance = esm_guidance
 
         # 维度计算
         self.head_dim = out_channels // heads
@@ -193,6 +199,18 @@ class HeterogeneousGATv2Layer(MessagePassing):
         self.gate_scale = nn.Parameter(torch.Tensor(1))
         nn.init.constant_(self.gate_scale, 5.0)  # 控制门控的软硬程度
 
+        # ESM注意力引导相关参数
+        if esm_guidance:
+            # ESM注意力融合权重（可学习）
+            self.esm_weight = nn.Parameter(torch.Tensor(1))
+            nn.init.constant_(self.esm_weight, 0.5)  # 初始化为0.5，平衡图注意力和ESM注意力
+
+            # ESM注意力投影 - 将单一通道注意力扩展到多头
+            self.esm_proj = nn.Sequential(
+                nn.Linear(1, heads),
+                nn.Sigmoid()
+            )
+
         # 输出投影
         self.output_proj = nn.Linear(self.head_dim * heads, out_channels)
 
@@ -214,21 +232,29 @@ class HeterogeneousGATv2Layer(MessagePassing):
         # 残差投影
         self.res_proj = nn.Linear(in_channels, out_channels)
 
-    def forward(self, x, edge_index, edge_type, edge_attr=None):
+    def forward(self, x, edge_index, edge_type=None, edge_attr=None, esm_attention=None):
         """
-        前向传递
+        前向传递，支持ESM注意力引导
 
         参数:
             x (torch.Tensor): 节点特征 [num_nodes, in_channels]
             edge_index (torch.LongTensor): 边连接 [2, num_edges]
             edge_type (torch.LongTensor): 边类型索引 [num_edges]
             edge_attr (torch.Tensor, optional): 边特征 [num_edges, edge_dim]
+            esm_attention (torch.Tensor, optional): ESM注意力分数 [num_nodes, 1]
 
         返回:
             out (torch.Tensor): 更新的节点特征 [num_nodes, out_channels]
         """
         # 残差连接
         res = self.res_proj(x)
+
+        # 存储ESM注意力以在消息传递中使用
+        self._esm_attention = esm_attention if self.esm_guidance else None
+
+        # 边类型处理 - 如果未提供，假定所有边都是同一类型
+        if edge_type is None:
+            edge_type = torch.zeros(edge_index.size(1), device=edge_index.device, dtype=torch.long)
 
         # 消息传递
         out = self.propagate(
@@ -259,7 +285,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
 
     def message(self, x_i, x_j, edge_type, edge_attr, index, ptr, size_i):
         """
-        计算每条边上的消息
+        计算每条边上的消息，集成ESM注意力引导
 
         参数:
             x_i (torch.Tensor): 目标节点特征
@@ -275,6 +301,18 @@ class HeterogeneousGATv2Layer(MessagePassing):
 
         # 每个边类型的消息
         messages = torch.zeros(num_edges, self.heads, self.head_dim, device=x_i.device)
+
+        # 获取目标节点索引，用于后续ESM注意力处理
+        target_nodes = index
+
+        # 如果提供了ESM注意力且启用了ESM引导
+        if self._esm_attention is not None and self.esm_guidance:
+            # 提取对应目标节点的ESM注意力
+            node_esm_attention = self._esm_attention[target_nodes]  # [num_edges, 1]
+            # 投影到多头格式
+            esm_att_weights = self.esm_proj(node_esm_attention)  # [num_edges, heads]
+        else:
+            esm_att_weights = None
 
         # 对每种类型分别计算注意力和消息
         for t in range(num_types):
@@ -305,6 +343,14 @@ class HeterogeneousGATv2Layer(MessagePassing):
             alpha = torch.cat([q_i, k_j], dim=-1)
             alpha = self.att_layers[t](alpha.view(-1, 2 * self.head_dim)).view(-1, self.heads, 1)
 
+            # 集成ESM注意力（如果启用）
+            if esm_att_weights is not None:
+                curr_esm_weights = esm_att_weights[curr_indices].unsqueeze(-1)  # [curr_edges, heads, 1]
+                # 自适应融合系数
+                esm_weight_factor = torch.sigmoid(self.esm_weight)  # 将权重映射到0-1
+                # 融合图注意力和ESM注意力
+                alpha = (1 - esm_weight_factor) * alpha + esm_weight_factor * curr_esm_weights
+
             # 边类型特定的门控权重
             gate = torch.sigmoid(self.gate_weights[t] * self.gate_scale).view(1, self.heads, 1)
 
@@ -328,6 +374,93 @@ class HeterogeneousGATv2Layer(MessagePassing):
             aggr_out (torch.Tensor): 聚合后的消息 [num_nodes, heads*head_dim]
         """
         return aggr_out
+
+
+class ESMAttentionExtractor:
+    """
+    从ESM模型中提取注意力权重，用于指导图编码器
+    """
+
+    def __init__(self, esm_model, layer_idx=-1):
+        """
+        初始化注意力提取器
+
+        参数:
+            esm_model: ESM模型实例
+            layer_idx: 提取哪一层的注意力，默认为最后一层
+        """
+        self.esm_model = esm_model
+        self.layer_idx = layer_idx
+        self.hooks = []
+        self.attention_weights = None
+
+        # 注册钩子函数以捕获注意力权重
+        self._register_hooks()
+
+    def _register_hooks(self):
+        """注册钩子函数来捕获指定层的注意力权重"""
+        if not hasattr(self.esm_model, "layers"):
+            logger.warning("ESM模型结构不支持注意力提取，使用备选方法")
+            return
+
+        # 移除现有钩子
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+
+        # 确定目标层
+        if self.layer_idx == -1:
+            target_layer = self.esm_model.layers[-1].attention
+        else:
+            target_layer = self.esm_model.layers[self.layer_idx].attention
+
+        # 注册钩子
+        def attention_hook(module, input, output):
+            # 提取注意力权重
+            # 对于ESMC模型，注意力输出通常是(batch_size, num_heads, seq_len, seq_len)
+            self.attention_weights = output[1]  # 假设attention_weights是输出元组的第二个元素
+
+        # 添加钩子
+        self.hooks.append(target_layer.register_forward_hook(attention_hook))
+
+    def extract_attention(self, seq_embeddings):
+        """
+        从ESM嵌入中提取注意力权重
+
+        参数:
+            seq_embeddings: ESM序列嵌入，形状为[batch_size, seq_len, dim]
+
+        返回:
+            torch.Tensor: 提取的注意力权重 [batch_size, seq_len]
+        """
+        batch_size = seq_embeddings.shape[0]
+        seq_len = seq_embeddings.shape[1]
+
+        # 尝试直接从钩子获取注意力权重
+        if self.attention_weights is not None:
+            # 对多头注意力取平均
+            attn = self.attention_weights.mean(dim=1)  # [batch_size, seq_len, seq_len]
+
+            # 使用[CLS]注意力权重作为每个token的重要性
+            token_importance = attn[:, 0, 1:]  # 排除[CLS]自身，取第一行
+
+            # 规范化注意力权重
+            token_importance = F.softmax(token_importance, dim=-1)
+
+            return token_importance.unsqueeze(-1)  # [batch_size, seq_len-1, 1]
+
+        # 备选方法：从嵌入向量计算自注意力
+        else:
+            # 计算嵌入向量的L2范数作为注意力权重
+            token_norms = torch.norm(seq_embeddings, dim=-1)  # [batch_size, seq_len]
+
+            # 忽略特殊标记（第一个和最后一个）
+            token_norms = token_norms[:, 1:-1]  # [batch_size, seq_len-2]
+
+            # 归一化
+            token_importance = F.softmax(token_norms, dim=-1)
+
+            return token_importance.unsqueeze(-1)  # [batch_size, seq_len-2, 1]
 
 
 class MLPLayer(nn.Module):
