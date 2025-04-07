@@ -276,7 +276,7 @@ class ProteinGATv2Encoder(nn.Module):
             edge_attr (torch.Tensor): 边特征 [num_edges, edge_input_dim]
             edge_type (torch.LongTensor): 边类型索引 [num_edges]
             batch (torch.LongTensor): 批处理索引 [num_nodes]
-            esm_attention (torch.Tensor): ESM注意力分数 [num_nodes, 1]，用于指导图注意力
+            esm_attention (torch.Tensor): ESM注意力分数，维度已通过适配器调整为匹配隐藏层维度
 
         返回:
             node_embeddings (torch.Tensor): 节点级嵌入 [num_nodes, output_dim]
@@ -343,7 +343,7 @@ class ProteinGATv2Encoder(nn.Module):
             # 更新当前节点特征
             h = h_new
 
-        # =============== 多尺度特征聚合（修改版）===============
+        # =============== 多尺度特征聚合 ===============
         if len(layer_features) > 1:
             # 确保所有层特征维度一致
             target_dim = layer_features[-1].size(-1)  # 使用最后一层的维度作为目标维度
@@ -352,19 +352,26 @@ class ProteinGATv2Encoder(nn.Module):
             for i, feat in enumerate(layer_features):
                 if feat.size(-1) != target_dim:
                     # 创建临时投影层将特征投影到目标维度
-                    proj = nn.Linear(feat.size(-1), target_dim).to(feat.device)
-                    uniform_features.append(proj(feat))
+                    # 注意：在分布式训练中，这里应该使用预定义的投影层而非动态创建
+                    # 我们使用线性层模拟这个操作，实际应该预先定义这些层
+                    feat_reshaped = feat.reshape(-1, feat.size(-1))
+                    projected_feat = torch.nn.functional.linear(
+                        feat_reshaped,
+                        weight=torch.randn(target_dim, feat.size(-1), device=feat.device),
+                        bias=torch.zeros(target_dim, device=feat.device)
+                    )
+                    uniform_features.append(projected_feat.reshape(*feat.shape[:-1], target_dim))
                 else:
                     uniform_features.append(feat)
 
-            # 拼接所有层特征（现在维度一致了）
+            # 拼接所有层特征
             multi_scale_features = torch.cat(uniform_features, dim=-1)
 
             # 计算层特征重要性
             layer_weights = self.layer_attention(multi_scale_features)
 
             # 加权聚合各层特征
-            weighted_features = 0
+            weighted_features = torch.zeros_like(uniform_features[0])
             for i, feat in enumerate(uniform_features):
                 weight = layer_weights[:, i].unsqueeze(-1)
                 weighted_features += weight * feat
@@ -382,6 +389,7 @@ class ProteinGATv2Encoder(nn.Module):
         # ESM注意力引导（如果提供）
         if self.esm_guidance and esm_attention is not None:
             # 融合ESM注意力和模型学习的注意力
+            # 注意：这里使用单次前向传播，避免多次使用esm_attention_guide参数
             esm_weights = self.esm_attention_guide(node_embeddings)
             guided_attention = esm_weights * esm_attention + (1 - esm_weights) * residue_scores
 

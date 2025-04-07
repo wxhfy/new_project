@@ -552,6 +552,9 @@ class ProteinMultiModalTrainer:
             dropout=self.config.FUSION_DROPOUT
         ).to(self.device)
 
+        # 新增: 预定义ESM注意力维度适配器，避免动态创建
+        self.esm_attention_adapter = nn.Linear(1, self.config.HIDDEN_DIM).to(self.device)
+
         # 分布式训练设置
         if self.config.USE_DISTRIBUTED:
             # 同步BN层
@@ -584,29 +587,45 @@ class ProteinMultiModalTrainer:
                 self.graph_encoder,
                 device_ids=[self.config.LOCAL_RANK],
                 output_device=self.config.LOCAL_RANK,
-                find_unused_parameters=True  # 添加此参数
             )
 
             self.latent_mapper = DDP(
                 self.latent_mapper,
                 device_ids=[self.config.LOCAL_RANK],
                 output_device=self.config.LOCAL_RANK,
-                find_unused_parameters=True  # 添加此参数
             )
 
             self.contrast_head = DDP(
                 self.contrast_head,
                 device_ids=[self.config.LOCAL_RANK],
                 output_device=self.config.LOCAL_RANK,
-                find_unused_parameters=True  # 添加此参数
             )
 
             self.fusion_module = DDP(
                 self.fusion_module,
                 device_ids=[self.config.LOCAL_RANK],
                 output_device=self.config.LOCAL_RANK,
-                find_unused_parameters=True  # 添加此参数
             )
+
+            # 新增: 将注意力适配器也包装为DDP模型
+            self.esm_attention_adapter = DDP(
+                self.esm_attention_adapter,
+                device_ids=[self.config.LOCAL_RANK],
+                output_device=self.config.LOCAL_RANK,
+            )
+
+            # 新增: 启用静态图模式，解决参数重用问题
+            logger.info("为DDP模型启用静态图模式...")
+            for model_name, model in [
+                ("graph_encoder", self.graph_encoder),
+                ("latent_mapper", self.latent_mapper),
+                ("contrast_head", self.contrast_head),
+                ("fusion_module", self.fusion_module),
+                ("esm_attention_adapter", self.esm_attention_adapter)
+            ]:
+                if hasattr(model, "_set_static_graph"):
+                    model._set_static_graph()
+                    logger.info(f"已为{model_name}启用静态图模式")
 
         # 打印模型信息
         if self.is_master:
@@ -614,6 +633,8 @@ class ProteinMultiModalTrainer:
             pytorch_total_params += sum(p.numel() for p in self.latent_mapper.parameters() if p.requires_grad)
             pytorch_total_params += sum(p.numel() for p in self.contrast_head.parameters() if p.requires_grad)
             pytorch_total_params += sum(p.numel() for p in self.fusion_module.parameters() if p.requires_grad)
+            pytorch_total_params += sum(
+                p.numel() for p in self.esm_attention_adapter.parameters() if p.requires_grad)  # 新增
             logger.info(f"模型总参数量: {pytorch_total_params / 1e6:.2f}M")
 
             # 打印ESM引导状态
@@ -1078,48 +1099,40 @@ class ProteinMultiModalTrainer:
                 elif hasattr(seq_embeddings, 'attention'):
                     current_esm_attention = seq_embeddings.attention
 
-                # 【关键改动】处理注意力维度
+                # 处理注意力维度 - 使用预定义适配器
                 if current_esm_attention is not None:
                     attention_dim = current_esm_attention.size(-1)  # 获取原始维度
                     target_dim = self.config.HIDDEN_DIM  # 目标维度（GAT隐藏层维度）
 
+                    # 使用预定义的适配器进行维度转换
                     if attention_dim != target_dim:
-                        logger.info(f"ESM注意力维度预处理: {attention_dim} -> {target_dim}")
-
-                        # 创建临时维度转换层
-                        temp_adapter = nn.Linear(attention_dim, target_dim).to(self.device)
-
-                        # 保存原始形状并进行维度转换
+                        logger.info(f"使用预定义适配器处理ESM注意力: {attention_dim} -> {target_dim}")
+                        # 保存原始形状
                         orig_shape = current_esm_attention.shape
-                        flattened = current_esm_attention.reshape(-1, attention_dim)
-                        adapted = temp_adapter(flattened)
-                        current_esm_attention = adapted.reshape(*orig_shape[:-1], target_dim)
+                        # 分离注意力梯度
+                        with torch.no_grad():
+                            # 重塑为二维张量
+                            flattened = current_esm_attention.reshape(-1, attention_dim)
+                            # 使用预定义适配器转换维度
+                            adapted = self.esm_attention_adapter(flattened)
+                            # 恢复原始形状
+                            current_esm_attention = adapted.reshape(*orig_shape[:-1], target_dim)
 
-                        logger.info(f"ESM注意力维度调整完成: {current_esm_attention.shape}")
-
-            # 5. 使用图编码器处理图数据
+            # 5. 使用图编码器处理图数据 - 一次性执行前向传播
             try:
-                node_embeddings, graph_embedding, attention_weights = self.graph_encoder(
-                    x=graph_batch.x,
-                    edge_index=graph_batch.edge_index,
-                    edge_attr=graph_batch.edge_attr if hasattr(graph_batch, 'edge_attr') else None,
-                    edge_type=graph_batch.edge_type if hasattr(graph_batch, 'edge_type') else None,
-                    batch=graph_batch.batch,
-                    esm_attention=current_esm_attention  # 传入预处理后的注意力
-                )
+                with torch.set_grad_enabled(True):  # 确保梯度流动
+                    node_embeddings, graph_embedding, attention_weights = self.graph_encoder(
+                        x=graph_batch.x,
+                        edge_index=graph_batch.edge_index,
+                        edge_attr=graph_batch.edge_attr if hasattr(graph_batch, 'edge_attr') else None,
+                        edge_type=graph_batch.edge_type if hasattr(graph_batch, 'edge_type') else None,
+                        batch=graph_batch.batch,
+                        esm_attention=current_esm_attention  # 传入预处理后的注意力
+                    )
             except Exception as e:
                 logger.error(f"图编码器处理失败: {e}")
                 logger.error(traceback.format_exc())
-
-                # 创建备用图嵌入
-                batch_size = 1
-                if hasattr(graph_batch, 'num_graphs'):
-                    batch_size = graph_batch.num_graphs
-                elif hasattr(graph_batch, 'batch') and graph_batch.batch is not None:
-                    batch_size = int(graph_batch.batch.max()) + 1
-
-                graph_embedding = torch.zeros(batch_size, self.config.OUTPUT_DIM, device=self.device)
-                node_embeddings = None
+                raise RuntimeError(f"图编码器处理失败: {e}")
 
             # 6. 池化序列嵌入
             try:
@@ -1127,10 +1140,7 @@ class ProteinMultiModalTrainer:
             except Exception as e:
                 logger.error(f"序列嵌入池化失败: {e}")
                 logger.error(traceback.format_exc())
-
-                # 创建备用序列嵌入
-                batch_size = graph_embedding.size(0)
-                pooled_seq_emb = torch.zeros(batch_size, self.config.ESM_EMBEDDING_DIM, device=self.device)
+                raise RuntimeError(f"序列嵌入池化失败: {e}")
 
             # 7. 映射与融合
             try:
@@ -1144,26 +1154,23 @@ class ProteinMultiModalTrainer:
                 if graph_latent.dim() > 2:
                     graph_latent = graph_latent.reshape(graph_latent.size(0), -1)
 
-                logger.info(f"融合前维度 - 图潜变量: {graph_latent.shape}, 序列嵌入: {pooled_seq_emb.shape}")
+                # logger.info(f"融合前维度 - 图潜变量: {graph_latent.shape}, 序列嵌入: {pooled_seq_emb.shape}")
 
-                # 修改：使用交叉注意力融合模块执行融合
+                # 使用交叉注意力融合模块执行融合
                 fused_embedding = self.fusion_module(pooled_seq_emb, graph_latent)
 
             except Exception as e:
                 logger.error(f"嵌入融合失败: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+                raise RuntimeError(f"嵌入融合失败: {e}")
 
-                # 重新抛出异常以终止处理
-                raise RuntimeError(f"嵌入融合失败，终止处理: {e}")
             return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
         except Exception as e:
             logger.error(f"融合嵌入获取失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
-
-            # 重新抛出异常以终止处理
-            raise RuntimeError(f"嵌入融合失败，终止处理: {e}")
+            raise RuntimeError(f"嵌入融合失败: {e}")
 
 
     def _init_embedding_cache(self):
