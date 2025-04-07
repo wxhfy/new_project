@@ -16,6 +16,8 @@ import os
 import torch
 from datetime import datetime
 
+from sympy import false
+
 
 class Config:
     """配置类，包含所有训练和模型参数"""
@@ -45,32 +47,23 @@ class Config:
     # 使用实际项目根目录
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # 然后定义其他依赖于BASE_DIR的路径
-    DATA_DIR = os.path.join(BASE_DIR, "pdb_kg_data", "FILTERED", "pyg_graphs")
     OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", EXPERIMENT_NAME)
     MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
     LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
     RESULT_DIR = os.path.join(OUTPUT_DIR, "results")
-    CACHE_DIR = os.path.join(BASE_DIR, "cache")
+    CACHE_DIR = os.path.join(BASE_DIR, "data")
 
     # 创建必要的目录
     for directory in [MODEL_DIR, LOG_DIR, RESULT_DIR, CACHE_DIR]:
         os.makedirs(directory, exist_ok=True)
 
     # =============== 数据配置 ===============
-    PYG_GRAPH_FILES = [
-
-    ]
-    # PyG图数据文件路径
-    for i in range(9):
-        PYG_GRAPH_FILES.append(os.path.join(DATA_DIR, f"filtered_batch_{i}.pt"))
-
-
     # 数据处理参数
     MAX_SEQ_LENGTH = 512
     PLDDT_THRESHOLD = 70.0  # AlphaFold质量阈值
     SAMPLES_PER_LENGTH = 10000  # 每个长度取样本数量
     TRAIN_VAL_TEST_SPLIT = [0.7, 0.2, 0.1]  # 训练:验证:测试比例
-    USE_SUBSET = True
+    USE_SUBSET = False
     SUBSET_RATIO = 0.1
 
     # 训练数据缓存文件
@@ -80,16 +73,48 @@ class Config:
 
     # =============== 图结构配置 ===============
     # 边类型定义
-    EDGE_TYPES = 2  # 肽键(0), 空间连接(1)
-    EDGE_TYPE_NAMES = ["peptide", "spatial"]
+    EDGE_TYPES = 4  # 肽键(0), 氢键(1), 离子(2), 疏水(3)
+    EDGE_TYPE_NAMES = ["peptide", "hydrogen_bond", "ionic", "hydrophobic"]
+
+    # 边类型映射字典
+    EDGE_TYPE_MAP = {
+        "peptide": 0,  # 肽键连接
+        "hydrogen_bond": 1,  # 氢键相互作用
+        "ionic": 2,  # 离子相互作用(盐桥)
+        "hydrophobic": 3  # 疏水相互作用
+    }
 
     # 图数据结构参数
-    NODE_INPUT_DIM = 35  # 预计的节点特征维度
-    EDGE_INPUT_DIM = 8  # 预计的边特征维度
+    NODE_INPUT_DIM = 35  # 节点特征维度
+    EDGE_INPUT_DIM = 8  # 边特征维度
+
+    # 节点特征维度说明 (35维)
+    NODE_FEATURE_INDICES = {
+        "blosum62": slice(0, 20),  # BLOSUM62编码：20维
+        "position": slice(20, 23),  # 3D坐标：3维
+        "hydropathy": 23,  # 疏水性：1维
+        "charge": 24,  # 电荷：1维
+        "molecular_weight": 25,  # 分子量：1维
+        "volume": 26,  # 体积：1维
+        "flexibility": 27,  # 柔性：1维
+        "aromaticity": 28,  # 芳香性：1维
+        "secondary_structure": slice(29, 32),  # 二级结构编码：3维
+        "sasa": 32,  # 溶剂可及性：1维
+        "side_chain_flexibility": 33,  # 侧链柔性：1维
+        "plddt": 34  # pLDDT质量评分：1维
+    }
+
+    # 边特征维度说明 (8维)
+    EDGE_FEATURE_INDICES = {
+        "interaction_type": slice(0, 4),  # 相互作用类型：4维one-hot
+        "distance": 4,  # 空间距离：1维
+        "strength": 5,  # 相互作用强度：1维
+        "direction": slice(6, 8)  # 方向向量：2维
+    }
 
     # =============== ESM配置 ===============
-    ESM_MODEL_PATH = "/home/fyh0106/project/encoder/esm/esmc_300m_2024_12_v0.pth"
-    ESM_MODEL_NAME = "esmc_300m"
+    ESM_MODEL_PATH = "/home/fyh0106/project/encoder/esm/esmc_600m_2024_12_v0.pth"
+    ESM_MODEL_NAME = "esmc_600m"
     ESM_EMBEDDING_DIM = 1152
     USE_ESM_ATTENTION = True
     ESM_ATTENTION_LAYER = -1  # 使用最后一层的注意力
@@ -98,10 +123,10 @@ class Config:
     ESM_SHARDED = True  # 是否在多个GPU上分片ESM模型
 
     # =============== 图模型配置 ===============
-    HIDDEN_DIM = 256
-    OUTPUT_DIM = 512  # 最终图表示维度
+    HIDDEN_DIM = 1152
+    OUTPUT_DIM = 1152  # 最终图表示维度
     NUM_LAYERS = 3  # GAT层数
-    NUM_HEADS = 8  # 注意力头数
+    NUM_HEADS = 16  # 注意力头数
     DROPOUT = 0.2
 
     # 特性开关
@@ -111,9 +136,9 @@ class Config:
     ESM_GUIDANCE = True  # ESM注意力引导
 
     # =============== 融合模块配置 ===============
-    FUSION_HIDDEN_DIM = 512
-    FUSION_OUTPUT_DIM = 512
-    FUSION_NUM_HEADS = 8
+    FUSION_HIDDEN_DIM = 1152
+    FUSION_OUTPUT_DIM = 1152
+    FUSION_NUM_HEADS = 16
     FUSION_NUM_LAYERS = 3
     FUSION_DROPOUT = 0.1
 
@@ -121,17 +146,24 @@ class Config:
     EPOCHS = 100
 
     # 批次大小设置（分布式训练）
-    GLOBAL_BATCH_SIZE = 128  # 全局批次大小
+    GLOBAL_BATCH_SIZE = 512  # 全局批次大小
+    _batch_size = None  # 添加私有变量存储计算结果
 
     # 每个GPU的批次大小会自动计算: GLOBAL_BATCH_SIZE // NUM_GPUS (如果NUM_GPUS > 0)
     @property
     def BATCH_SIZE(self):
-        if not hasattr(self, '_batch_size'):
+        """计算每个GPU的批处理大小"""
+        if self._batch_size is None:
             if self.USE_DISTRIBUTED and self.NUM_GPUS > 0:
                 self._batch_size = max(1, self.GLOBAL_BATCH_SIZE // self.NUM_GPUS)
             else:
                 self._batch_size = self.GLOBAL_BATCH_SIZE
         return self._batch_size
+
+    # 添加setter方法允许外部设置批处理大小
+    @BATCH_SIZE.setter
+    def BATCH_SIZE(self, value):
+        self._batch_size = value
 
     EVAL_BATCH_SIZE = 64  # 验证和测试时的批次大小
     ACCUMULATION_STEPS = 1  # 梯度累积步数，可进一步增大有效批次大小
@@ -189,6 +221,7 @@ class Config:
 
     def __init__(self, **kwargs):
         """允许通过kwargs覆盖默认配置"""
+        self._batch_size = None
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)

@@ -1277,6 +1277,184 @@ class SequenceStructureFusion(nn.Module):
         return fused
 
 
+class CrossModalAttentionBlock(nn.Module):
+    """
+    跨模态交叉注意力模块
+
+    允许两种模态通过注意力机制相互交换和增强信息
+    """
+
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super(CrossModalAttentionBlock, self).__init__()
+
+        self.dim = dim
+        self.num_heads = num_heads
+
+        # 序列→结构注意力
+        self.seq_to_graph_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 结构→序列注意力
+        self.graph_to_seq_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 层归一化
+        self.norm_seq1 = nn.LayerNorm(dim)
+        self.norm_seq2 = nn.LayerNorm(dim)
+        self.norm_graph1 = nn.LayerNorm(dim)
+        self.norm_graph2 = nn.LayerNorm(dim)
+
+        # 前馈网络
+        self.seq_ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
+        self.graph_ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, seq_emb, graph_emb):
+        """
+        前向传播
+
+        参数:
+            seq_emb (torch.Tensor): 序列嵌入 [batch_size, 1, dim]
+            graph_emb (torch.Tensor): 图嵌入 [batch_size, 1, dim]
+
+        返回:
+            seq_out (torch.Tensor): 增强的序列嵌入 [batch_size, 1, dim]
+            graph_out (torch.Tensor): 增强的图嵌入 [batch_size, 1, dim]
+        """
+        # 序列→结构注意力
+        graph_attn, _ = self.seq_to_graph_attn(
+            query=graph_emb,
+            key=seq_emb,
+            value=seq_emb
+        )
+        graph_res = graph_emb + self.dropout(graph_attn)
+        graph_res = self.norm_graph1(graph_res)
+
+        # 结构→序列注意力
+        seq_attn, _ = self.graph_to_seq_attn(
+            query=seq_emb,
+            key=graph_emb,
+            value=graph_emb
+        )
+        seq_res = seq_emb + self.dropout(seq_attn)
+        seq_res = self.norm_seq1(seq_res)
+
+        # 前馈网络
+        seq_out = seq_res + self.dropout(self.seq_ffn(seq_res))
+        seq_out = self.norm_seq2(seq_out)
+
+        graph_out = graph_res + self.dropout(self.graph_ffn(graph_res))
+        graph_out = self.norm_graph2(graph_out)
+
+        return seq_out, graph_out
+
+
+class CrossAttentionFusion(nn.Module):
+    """
+    交叉注意力融合模块
+
+    通过多层交叉注意力机制融合ESM序列嵌入和图嵌入，保持原始维度
+    """
+
+    def __init__(
+            self,
+            embedding_dim=1152,
+            num_heads=8,
+            num_layers=2,
+            dropout=0.1
+    ):
+        super(CrossAttentionFusion, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # 多层交叉注意力
+        self.cross_layers = nn.ModuleList([
+            CrossModalAttentionBlock(
+                dim=embedding_dim,
+                num_heads=num_heads,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+
+        # 输出融合层 - 自适应融合
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.Sigmoid()
+        )
+
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+
+    def forward(self, seq_embedding, graph_embedding):
+        """
+        前向传播
+
+        参数:
+            seq_embedding (torch.Tensor): 序列嵌入 [batch_size, embedding_dim]
+            graph_embedding (torch.Tensor): 图嵌入 [batch_size, embedding_dim]
+
+        返回:
+            fused_embedding (torch.Tensor): 融合嵌入 [batch_size, embedding_dim]
+        """
+        # 在CrossAttentionFusion的forward方法开始处添加
+        assert seq_embedding.size(-1) == graph_embedding.size(-1) == self.embedding_dim, \
+            f"维度不匹配: seq={seq_embedding.size(-1)}, graph={graph_embedding.size(-1)}, expected={self.embedding_dim}"
+        # 添加序列维度
+        seq_emb = seq_embedding.unsqueeze(1)  # [batch_size, 1, embedding_dim]
+        graph_emb = graph_embedding.unsqueeze(1)  # [batch_size, 1, embedding_dim]
+
+        # 保存原始嵌入用于残差连接
+        seq_orig = seq_emb
+        graph_orig = graph_emb
+
+        # 多层交叉注意力处理
+        for layer in self.cross_layers:
+            seq_emb, graph_emb = layer(seq_emb, graph_emb)
+
+        # 添加残差连接
+        seq_emb = seq_emb + seq_orig
+        graph_emb = graph_emb + graph_orig
+
+        # 移除序列维度
+        seq_emb = seq_emb.squeeze(1)  # [batch_size, embedding_dim]
+        graph_emb = graph_emb.squeeze(1)  # [batch_size, embedding_dim]
+
+        # 自适应门控融合
+        concat_emb = torch.cat([seq_emb, graph_emb], dim=-1)
+        gate = self.fusion_gate(concat_emb)
+        fused_emb = gate * seq_emb + (1 - gate) * graph_emb
+
+        # 最终输出投影
+        fused_embedding = self.output_proj(fused_emb)
+
+        return fused_embedding
+
+
 class BimodalCrossAttentionBlock(nn.Module):
     """
     双模态交叉注意力模块

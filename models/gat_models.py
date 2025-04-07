@@ -258,7 +258,6 @@ class ProteinGATv2Encoder(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    # 修改图编码器的前向传播函数，支持ESM指导
     def forward(
             self,
             x,
@@ -266,7 +265,7 @@ class ProteinGATv2Encoder(nn.Module):
             edge_attr=None,
             edge_type=None,
             batch=None,
-            esm_attention=None  # 新增：ESM注意力参数
+            esm_attention=None  # ESM注意力参数
     ):
         """
         前向传递，支持ESM序列注意力指导
@@ -296,7 +295,6 @@ class ProteinGATv2Encoder(nn.Module):
         h = self.node_encoder(x)
 
         # 处理边特征
-        # 在forward方法中:
         if edge_attr is not None:
             edge_features = self.edge_processor(edge_attr, edge_type)
         else:
@@ -339,27 +337,35 @@ class ProteinGATv2Encoder(nn.Module):
                 else:
                     current_edge_features = edge_updater(h, edge_index, current_edge_features)
 
-            # 存储中间层特征
-            if i < len(self.convs) - 1:
-                layer_features.append(h_new)
+            # 存储各层特征
+            layer_features.append(h_new)
 
+            # 更新当前节点特征
             h = h_new
 
-        # 最后一层特征
-        layer_features.append(h)
-
-        # =============== 多尺度特征聚合 ===============
-        # 多尺度特征聚合
+        # =============== 多尺度特征聚合（修改版）===============
         if len(layer_features) > 1:
-            # 拼接所有层特征
-            multi_scale_features = torch.cat(layer_features, dim=-1)
+            # 确保所有层特征维度一致
+            target_dim = layer_features[-1].size(-1)  # 使用最后一层的维度作为目标维度
+            uniform_features = []
+
+            for i, feat in enumerate(layer_features):
+                if feat.size(-1) != target_dim:
+                    # 创建临时投影层将特征投影到目标维度
+                    proj = nn.Linear(feat.size(-1), target_dim).to(feat.device)
+                    uniform_features.append(proj(feat))
+                else:
+                    uniform_features.append(feat)
+
+            # 拼接所有层特征（现在维度一致了）
+            multi_scale_features = torch.cat(uniform_features, dim=-1)
 
             # 计算层特征重要性
             layer_weights = self.layer_attention(multi_scale_features)
 
             # 加权聚合各层特征
             weighted_features = 0
-            for i, feat in enumerate(layer_features):
+            for i, feat in enumerate(uniform_features):
                 weight = layer_weights[:, i].unsqueeze(-1)
                 weighted_features += weight * feat
 

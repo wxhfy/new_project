@@ -2,13 +2,13 @@
 # 蛋白质图-序列多模态融合训练启动脚本
 
 # 设置环境变量
-export CUDA_VISIBLE_DEVICES=0,3  # 使用的GPU设备
+export CUDA_VISIBLE_DEVICES=0,1,2  # 使用的GPU设备
 export OMP_NUM_THREADS=20  # 设置OpenMP线程数
 
 # 训练参数
 CONFIG_FILE="utils/config.py"  # 配置文件路径
 OUTPUT_DIR="outputs/multimodal"  # 输出目录
-NUM_GPUS=2  # GPU数量
+NUM_GPUS=3  # GPU数量
 LOG_FILE="${OUTPUT_DIR}/train_log_$(date '+%Y%m%d_%H%M%S').log"  # 日志文件
 
 
@@ -46,17 +46,6 @@ run_multi() {
         --config $CONFIG_FILE \
         2>&1 | tee -a "${LOG_FILE}"
 
-    # 如果torchrun不可用或出错，回退到原始方法并修正参数格式
-    if [ $? -ne 0 ]; then
-        log "torchrun失败，尝试使用torch.distributed.launch替代方案..."
-        python -m torch.distributed.launch \
-            --nproc_per_node=$NUM_GPUS \
-            --master_port=$(( 29500 + RANDOM % 1000 )) \
-            train_embed.py \
-            --config $CONFIG_FILE \
-            --local_rank=\$LOCAL_RANK \
-            2>&1 | tee -a "${LOG_FILE}"
-    fi
 }
 
 # 多GPU训练 - 原始分布式启动方法（备用）

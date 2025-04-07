@@ -36,9 +36,9 @@ from models.gat_models import (
     ProteinGATv2Encoder,
     ProteinLatentMapper,
     CrossModalContrastiveHead,
-    ResidualBlock
+
 )
-from models.layers import SequenceStructureFusion
+from models.layers import CrossAttentionFusion
 from utils.config import Config
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProteinTensor, LogitsConfig
@@ -139,6 +139,7 @@ class ProteinBatch:
     """处理批次中的多个ProteinData对象"""
 
     def __init__(self, data_list):
+        self.edge_index = None
         self.num_graphs = len(data_list)
         self.batch = torch.zeros(0, dtype=torch.long)
 
@@ -544,13 +545,10 @@ class ProteinMultiModalTrainer:
         ).to(self.device)
 
         # 5. 序列-结构融合模块 - 整合两种模态的信息
-        self.fusion_module = SequenceStructureFusion(
-            seq_dim=self.config.ESM_EMBEDDING_DIM,
-            graph_dim=self.config.ESM_EMBEDDING_DIM,  # 使用映射后的维度
-            output_dim=self.config.FUSION_OUTPUT_DIM,
-            hidden_dim=self.config.FUSION_HIDDEN_DIM,
-            num_heads=self.config.FUSION_NUM_HEADS,
-            num_layers=self.config.FUSION_NUM_LAYERS,
+        self.fusion_module = CrossAttentionFusion(
+            embedding_dim=self.config.ESM_EMBEDDING_DIM,  # 1152
+            num_heads=self.config.FUSION_NUM_HEADS,  # 建议使用8或16
+            num_layers=self.config.FUSION_NUM_LAYERS,  # 建议使用2或3
             dropout=self.config.FUSION_DROPOUT
         ).to(self.device)
 
@@ -582,7 +580,6 @@ class ProteinMultiModalTrainer:
             # 注册钩子
             actual_fusion_module.register_forward_hook(ensure_all_params_used)
             # 封装为DDP模型
-            # 在_init_models方法中寻找DDP初始化代码
             self.graph_encoder = DDP(
                 self.graph_encoder,
                 device_ids=[self.config.LOCAL_RANK],
@@ -1149,42 +1146,26 @@ class ProteinMultiModalTrainer:
 
                 logger.info(f"融合前维度 - 图潜变量: {graph_latent.shape}, 序列嵌入: {pooled_seq_emb.shape}")
 
-                # 执行融合
+                # 修改：使用交叉注意力融合模块执行融合
                 fused_embedding = self.fusion_module(pooled_seq_emb, graph_latent)
 
             except Exception as e:
                 logger.error(f"嵌入融合失败: {e}")
+                import traceback
                 logger.error(traceback.format_exc())
 
-                # 创建备用融合嵌入
-                batch_size = graph_embedding.size(0)
-                fused_embedding = torch.zeros(batch_size, self.config.FUSION_OUTPUT_DIM, device=self.device)
-
+                # 重新抛出异常以终止处理
+                raise RuntimeError(f"嵌入融合失败，终止处理: {e}")
             return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
-
         except Exception as e:
-            logger.error(f"融合嵌入处理出错: {e}")
+            logger.error(f"融合嵌入获取失败: {e}")
+            import traceback
             logger.error(traceback.format_exc())
 
-            # 创建备用输出
-            batch_size = 1
-            if hasattr(graph_batch, 'num_graphs'):
-                batch_size = graph_batch.num_graphs
-            elif hasattr(graph_batch, 'batch') and graph_batch.batch is not None:
-                batch_size = int(graph_batch.batch.max()) + 1
+            # 重新抛出异常以终止处理
+            raise RuntimeError(f"嵌入融合失败，终止处理: {e}")
 
-            # 使用配置维度参数
-            output_dim = self.config.OUTPUT_DIM
-            esm_dim = self.config.ESM_EMBEDDING_DIM
-            fusion_dim = self.config.FUSION_OUTPUT_DIM
 
-            # 创建备用嵌入
-            graph_embedding = torch.zeros(batch_size, output_dim, device=self.device)
-            pooled_seq_emb = torch.zeros(batch_size, esm_dim, device=self.device)
-            graph_latent = torch.zeros(batch_size, esm_dim, device=self.device)
-            fused_embedding = torch.zeros(batch_size, fusion_dim, device=self.device)
-
-            return graph_embedding, pooled_seq_emb, graph_latent, fused_embedding
     def _init_embedding_cache(self):
         """初始化嵌入缓存"""
         try:
