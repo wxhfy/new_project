@@ -23,15 +23,13 @@ import numpy as np
 import argparse
 import logging
 import random
-from pathlib import Path
-import seaborn as sns
-from matplotlib import pyplot as plt
+
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
-import traceback
+
 from models.gat_models import (
     ProteinGATv2Encoder,
     ProteinLatentMapper,
@@ -421,6 +419,7 @@ class ProteinMultiModalTrainer:
         参数:
             config: 配置对象
         """
+        self.use_esm_guidance = None
         self.embedding_cache = None
         self.config = config
         self.device = config.DEVICE
@@ -476,6 +475,7 @@ class ProteinMultiModalTrainer:
 
     def _init_models(self):
         """初始化模型组件"""
+
         logger.info("初始化模型组件...")
 
         # 1. 初始化GAT图编码器 - 根据数据结构优化参数
@@ -564,7 +564,7 @@ class ProteinMultiModalTrainer:
                 self.fusion_module = nn.SyncBatchNorm.convert_sync_batchnorm(self.fusion_module)
 
             # 为融合模块添加前向钩子，确保所有参数都参与计算
-            def ensure_all_params_used(module, input, output):
+            def ensure_all_params_used(module, input,output):
                 # 获取所有参数并执行一个不影响结果的操作
                 params_sum = 0
                 for param in module.parameters():
@@ -1815,185 +1815,6 @@ class ProteinMultiModalTrainer:
 
         return test_stats
 
-    def _plot_similarity_matrix(self, similarity_matrix):
-        """
-        绘制相似度矩阵热图
-
-        参数:
-            similarity_matrix: 相似度矩阵
-
-        返回:
-            matplotlib.figure.Figure: 热图图形
-        """
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-
-        fig, ax = plt.subplots(figsize=(8, 8))
-        sns.heatmap(
-            similarity_matrix,
-            annot=False,
-            cmap='viridis',
-            vmin=-1,
-            vmax=1,
-            ax=ax
-        )
-        ax.set_title("Graph-Sequence Similarity Matrix")
-        ax.set_xlabel("Sequence Embeddings")
-        ax.set_ylabel("Graph Latent Embeddings")
-
-        return fig
-
-    def _visualize_embeddings(self, embeddings, method='tsne', n_components=2):
-        """
-        可视化嵌入向量
-
-        参数:
-            embeddings (dict): 包含不同类型嵌入的字典
-            method (str): 降维方法，'tsne'或'pca'
-            n_components (int): 降维后的维度
-
-        返回:
-            tuple: (图表, 嵌入2D投影)
-        """
-        import matplotlib.pyplot as plt
-        from sklearn.manifold import TSNE
-        from sklearn.decomposition import PCA
-
-        # 设置字体为黑体，支持显示中文
-        plt.rcParams['font.sans-serif'] = ['SimHei']
-        plt.rcParams['axes.unicode_minus'] = False
-
-        # 选择降维方法
-        if method == 'tsne':
-            reducer = TSNE(n_components=n_components, random_state=42)
-        else:
-            reducer = PCA(n_components=n_components)
-
-        # 创建大图表
-        fig, axs = plt.subplots(2, 2, figsize=(16, 12))
-        axs = axs.flatten()
-
-        # 存储投影结果
-        projections = {}
-
-        # 为每种嵌入类型创建子图
-        for i, (name, data) in enumerate([
-            ('图结构嵌入', embeddings['graph']),
-            ('序列嵌入', embeddings['seq']),
-            ('图潜空间嵌入', embeddings['graph_latent']),
-            ('融合嵌入', embeddings['fused'])
-        ]):
-            # 降维
-            embedding_2d = reducer.fit_transform(data)
-            projections[name] = embedding_2d
-
-            # 绘制散点图
-            scatter = axs[i].scatter(
-                embedding_2d[:, 0],
-                embedding_2d[:, 1],
-                c=range(len(data)),  # 使用索引作为颜色
-                cmap='viridis',
-                alpha=0.7,
-                s=50
-            )
-
-            axs[i].set_title(f"{name}投影 ({method.upper()})")
-            axs[i].set_xlabel("分量1")
-            axs[i].set_ylabel("分量2")
-            axs[i].grid(True, linestyle='--', alpha=0.7)
-
-            # 添加颜色条
-            plt.colorbar(scatter, ax=axs[i], label='样本索引')
-
-        plt.tight_layout()
-
-        return fig, projections
-
-    def _visualize_test_results(self, test_stats):
-        """
-        可视化测试结果并保存图表
-
-        参数:
-            test_stats (dict): 测试统计信息
-        """
-        # 如果没有嵌入数据，返回
-        if not test_stats['embeddings']:
-            logger.warning("无嵌入数据可供可视化")
-            return
-
-        try:
-            # 合并所有批次的嵌入
-            all_embeddings = {
-                'graph': torch.cat([e['graph'] for e in test_stats['embeddings']]),
-                'seq': torch.cat([e['seq'] for e in test_stats['embeddings']]),
-                'graph_latent': torch.cat([e['graph_latent'] for e in test_stats['embeddings']]),
-                'fused': torch.cat([e['fused'] for e in test_stats['embeddings']])
-            }
-
-            # 转换为NumPy数组
-            for key in all_embeddings:
-                all_embeddings[key] = all_embeddings[key].numpy()
-
-            # 限制可视化样本数，避免过多消耗资源
-            max_viz_samples = 1000
-            if all_embeddings['graph'].shape[0] > max_viz_samples:
-                indices = np.random.choice(all_embeddings['graph'].shape[0], max_viz_samples, replace=False)
-                for key in all_embeddings:
-                    all_embeddings[key] = all_embeddings[key][indices]
-                test_stats['sequences'] = [test_stats['sequences'][i] for i in indices]
-
-                # TSNE可视化
-                logger.info("生成t-SNE可视化...")
-                tsne_fig, tsne_proj = self._visualize_embeddings(all_embeddings, method='tsne')
-                self.writer.add_figure('test/tsne_visualization', tsne_fig, self.global_step)
-
-                # PCA可视化
-                logger.info("生成PCA可视化...")
-                pca_fig, pca_proj = self._visualize_embeddings(all_embeddings, method='pca')
-                self.writer.add_figure('test/pca_visualization', pca_fig, self.global_step)
-
-                # 计算相似度矩阵
-                logger.info("计算模态间相似度矩阵...")
-                # 计算图-序列相似度
-                graph_seq_sim = np.corrcoef(all_embeddings['graph'], all_embeddings['seq'])
-                # 计算潜空间-序列相似度
-                latent_sim = np.corrcoef(all_embeddings['graph_latent'], all_embeddings['seq'])
-
-                # 绘制相似度矩阵
-                sim_fig, axs = plt.subplots(1, 2, figsize=(18, 8))
-
-                # 只显示交叉相关部分
-                graph_seq_part = graph_seq_sim[:len(all_embeddings['graph']), len(all_embeddings['graph']):]
-                latent_seq_part = latent_sim[:len(all_embeddings['graph_latent']), len(all_embeddings['graph_latent']):]
-
-                sns.heatmap(graph_seq_part, cmap='coolwarm', ax=axs[0], vmin=-1, vmax=1)
-                axs[0].set_title("图结构-序列相似度矩阵")
-
-                sns.heatmap(latent_seq_part, cmap='coolwarm', ax=axs[1], vmin=-1, vmax=1)
-                axs[1].set_title("潜空间-序列相似度矩阵")
-
-                self.writer.add_figure('test/similarity_matrices', sim_fig, self.global_step)
-
-                # 保存测试结果
-                logger.info("保存测试结果和嵌入表示...")
-                embeddings_dir = os.path.join(self.config.RESULT_DIR, f"embeddings_epoch_{self.current_epoch}")
-                os.makedirs(embeddings_dir, exist_ok=True)
-
-                np.savez(
-                    os.path.join(embeddings_dir, "embeddings.npz"),
-                    graph=all_embeddings['graph'],
-                    seq=all_embeddings['seq'],
-                    graph_latent=all_embeddings['graph_latent'],
-                    fused=all_embeddings['fused'],
-                    sequences=np.array(test_stats['sequences'], dtype=object)
-                )
-
-                logger.info(f"嵌入和可视化结果保存到 {embeddings_dir}")
-
-        except Exception as e:
-            logger.error(f"可视化过程出错: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
 
     def save_checkpoint(self, metrics, is_best=False):
         """
