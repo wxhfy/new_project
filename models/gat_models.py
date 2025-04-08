@@ -283,6 +283,30 @@ class ProteinGATv2Encoder(nn.Module):
             graph_embedding (torch.Tensor): 图级嵌入 [batch_size, output_dim]
             residue_scores (torch.Tensor): 残基重要性分数 [num_nodes, 1]
         """
+        # 边索引有效性验证
+        if edge_index.size(1) > 0:  # 确保有边存在
+            num_nodes = x.size(0)
+
+            # 检测无效边
+            valid_edge_mask = (edge_index[0] < num_nodes) & (edge_index[1] < num_nodes) & \
+                              (edge_index[0] >= 0) & (edge_index[1] >= 0)
+
+            # 如果发现无效边，进行过滤
+            if not valid_edge_mask.all():
+                invalid_count = (~valid_edge_mask).sum().item()
+                import logging
+                logging.warning(f"检测到{invalid_count}条无效边索引，将被过滤")
+
+                # 过滤边索引和相关属性
+                edge_index = edge_index[:, valid_edge_mask]
+                if edge_attr is not None:
+                    edge_attr = edge_attr[valid_edge_mask]
+                if edge_type is not None:
+                    edge_type = edge_type[valid_edge_mask]
+
+        # 确保批索引存在
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
         # 处理批索引
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
