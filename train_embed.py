@@ -1172,6 +1172,37 @@ class ProteinMultiModalTrainer:
             logger.error(traceback.format_exc())
             raise RuntimeError(f"嵌入融合失败: {e}")
 
+    def _ensure_edge_type_consistency(self, edge_index, edge_type):
+        """确保边类型与边索引的一致性"""
+        if edge_type is None or edge_index.size(1) == 0:
+            return edge_type
+
+        # 确保边类型数量与边索引匹配
+        if edge_type.size(0) != edge_index.size(1):
+            import logging
+            logging.warning(f"边类型数量({edge_type.size(0)})与边数量({edge_index.size(1)})不匹配")
+
+            # 如果边类型少于边数量，使用默认类型补齐
+            if edge_type.size(0) < edge_index.size(1):
+                padding = torch.zeros(
+                    edge_index.size(1) - edge_type.size(0),
+                    dtype=edge_type.dtype,
+                    device=edge_type.device
+                )
+                edge_type = torch.cat([edge_type, padding], dim=0)
+            else:
+                # 如果边类型多于边数量，截断多余部分
+                edge_type = edge_type[:edge_index.size(1)]
+
+        # 确保边类型在有效范围内
+        if self.config.EDGE_TYPES > 0:  # 如果配置了边类型数量
+            if edge_type.max() >= self.config.EDGE_TYPES:
+                import logging
+                logging.warning(f"边类型最大值({edge_type.max().item()})超出配置的边类型数量({self.config.EDGE_TYPES})")
+                # 将超出范围的边类型设为0
+                edge_type = torch.clamp(edge_type, 0, self.config.EDGE_TYPES - 1)
+
+        return edge_type
 
     def _init_embedding_cache(self):
         """初始化嵌入缓存"""
@@ -1497,6 +1528,7 @@ class ProteinMultiModalTrainer:
         返回:
             dict: 训练统计信息
         """
+
         self.graph_encoder.train()
         self.latent_mapper.train()
         self.contrast_head.train()

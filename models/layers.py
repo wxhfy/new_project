@@ -284,62 +284,91 @@ class HeterogeneousGATv2Layer(MessagePassing):
         return out
 
     def message(self, x_i, x_j, edge_type, edge_attr, index, ptr, size_i):
-        """安全的消息传递，增加边类型检查和空边处理"""
+        """优化的异质边消息传递函数，正确处理空掩码边界情况"""
         # 初始化结果张量
-        num_edges, num_types = edge_type.size(0), self.edge_types
+        num_edges = edge_type.size(0)
+        num_types = self.edge_types
 
-        # 每个边类型的消息
+        # 处理边数为零的特殊情况
+        if num_edges == 0:
+            # 明确指定维度，避免在reshape时推断维度
+            return torch.zeros(0, self.heads * self.head_dim, device=x_i.device)
+
+        # 创建消息存储张量
         messages = torch.zeros(num_edges, self.heads, self.head_dim, device=x_i.device)
 
-        # 获取目标节点索引
+        # 目标节点索引
         target_nodes = index
 
-        # ESM注意力处理（保持原有逻辑）
+        # ESM注意力处理
         if self._esm_attention is not None and self.esm_guidance:
-            # 确保索引安全
-            safe_target_nodes = torch.clamp(target_nodes, 0, self._esm_attention.size(0) - 1)
-            node_esm_attention = self._esm_attention[safe_target_nodes]
+            node_esm_attention = self._esm_attention[target_nodes]
             esm_att_weights = self.esm_proj(node_esm_attention)
         else:
             esm_att_weights = None
 
-        # 对每种类型分别计算注意力和消息
+        # 对每种类型的边分别处理
+        processed_edges = 0  # 跟踪已处理的边数
+
         for t in range(num_types):
-            try:
-                # 选择当前类型的边
-                mask = (edge_type == t)
+            # 获取当前类型的边掩码
+            mask = (edge_type == t)
+            mask_sum = mask.sum().item()
 
-                # 关键修复：安全检查，确保至少有一条边
-                if not mask.any():
-                    continue  # 没有此类型的边，跳过处理
+            # 关键修复：安全检查，确保此类型有边存在
+            if mask_sum == 0:
+                continue  # 跳过不存在的边类型
 
-                # 获取当前类型的边索引
-                curr_indices = torch.where(mask)[0]
-                curr_count = curr_indices.size(0)
+            processed_edges += mask_sum  # 更新处理边数
 
-                # 安全性检查：索引边界验证
-                max_index = curr_indices.max().item() if curr_count > 0 else -1
-                if max_index >= num_edges:
-                    # 处理越界情况，裁剪索引
-                    curr_indices = curr_indices[curr_indices < num_edges]
+            # 获取当前类型边的源节点和目标节点特征
+            # 使用 masked_select 并 reshape，避免直接布尔索引，更安全
+            curr_x_i = x_i.masked_select(
+                mask.view(-1, 1).expand(-1, x_i.size(1))
+            ).view(mask_sum, x_i.size(1))
 
-                # 如果无有效边，跳过
-                if curr_indices.size(0) == 0:
-                    continue
+            curr_x_j = x_j.masked_select(
+                mask.view(-1, 1).expand(-1, x_j.size(1))
+            ).view(mask_sum, x_j.size(1))
 
-                # 获取当前类型边的源节点和目标节点
-                curr_x_i = x_i[curr_indices]  # 目标节点
-                curr_x_j = x_j[curr_indices]  # 源节点
+            # 投影查询、键、值
+            query_i = self.linear_q[t](curr_x_i).view(mask_sum, self.heads, self.head_dim)
+            key_j = self.linear_k[t](curr_x_j).view(mask_sum, self.heads, self.head_dim)
+            value_j = self.linear_v[t](curr_x_j).view(mask_sum, self.heads, self.head_dim)
 
-                # 后续消息传递处理（原有逻辑）...
+            # 边特征处理
+            if edge_attr is not None and self.edge_encoders is not None:
+                curr_edge_attr = edge_attr.masked_select(
+                    mask.view(-1, 1).expand(-1, edge_attr.size(1))
+                ).view(mask_sum, edge_attr.size(1))
 
-            except Exception as e:
-                # 降级处理：记录错误但不中断训练
-                import logging
-                logging.warning(f"处理边类型{t}时出错: {e}")
-                raise e
+                edge_feature = self.edge_encoders[t](curr_edge_attr).view(mask_sum, self.heads, self.head_dim)
+                value_j = value_j + edge_feature
 
-        return messages.view(num_edges, -1)
+            # 计算注意力分数
+            alpha = (query_i * key_j).sum(dim=-1) / math.sqrt(self.head_dim)
+
+            # ESM注意力融合
+            if esm_att_weights is not None:
+                curr_esm_weights = esm_att_weights.masked_select(
+                    mask.view(-1, 1).expand(-1, esm_att_weights.size(1))
+                ).view(mask_sum, esm_att_weights.size(1))
+                alpha = alpha * curr_esm_weights
+
+            # 类型门控权重
+            gate_weight = torch.sigmoid(self.gate_scale * self.gate_weights[t]).view(1, self.heads, 1)
+
+            # 计算加权消息
+            curr_messages = gate_weight * value_j
+
+            # 将消息放回结果张量
+            messages.masked_scatter_(
+                mask.view(-1, 1, 1).expand(-1, self.heads, self.head_dim),
+                curr_messages
+            )
+
+        # 重塑消息张量 - 避免使用view(-1)不确定维度
+        return messages.reshape(num_edges, self.heads * self.head_dim)
 
     def update(self, aggr_out):
         """

@@ -307,9 +307,6 @@ class ProteinGATv2Encoder(nn.Module):
         # 确保批索引存在
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        # 处理批索引
-        if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
         # =============== 特征预处理 ===============
         # 物化属性标准化
@@ -317,6 +314,25 @@ class ProteinGATv2Encoder(nn.Module):
 
         # 节点特征初始编码
         h = self.node_encoder(x)
+
+        # 1. 节点特征预处理
+        # 物化属性标准化
+        x = self.property_normalizer(x)
+
+        # 节点特征初始编码
+        h = self.node_encoder(x)
+
+        # 2. 边特征处理
+        # 确保边索引符合图结构
+        if edge_index.size(1) > 0:
+            # 优化: 只进行边界检查，不过滤
+            # 这样保留所有边，而边处理逻辑会在内部处理边界情况
+            max_node_idx = x.size(0) - 1
+            if edge_index.max() > max_node_idx or edge_index.min() < 0:
+                import logging
+                logging.warning(f"边索引范围异常：最大值 {edge_index.max().item()}，"
+                                f"最小值 {edge_index.min().item()}，"
+                                f"节点范围应为 [0, {max_node_idx}]")
 
         # 处理边特征
         if edge_attr is not None:
