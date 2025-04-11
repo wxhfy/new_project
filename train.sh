@@ -2,7 +2,7 @@
 # 蛋白质图-序列多模态融合训练启动脚本
 
 # 设置环境变量
-export CUDA_VISIBLE_DEVICES=0,1,2  # 使用的GPU设备
+export CUDA_VISIBLE_DEVICES=1,2,3  # 使用的GPU设备
 export OMP_NUM_THREADS=20  # 设置OpenMP线程数
 
 # 训练参数

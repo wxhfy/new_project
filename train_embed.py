@@ -43,7 +43,6 @@ from esm.sdk.api import ESMProteinTensor, LogitsConfig
 
 os.environ["INFRA_PROVIDER"] = "True"
 os.environ["ESM_CACHE_DIR"] = "data/weight"  # 指定包含模型文件的目录
-
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -132,6 +131,124 @@ class ProteinData:
         return new_obj
 
 
+def _merge_node_attributes(data_list):
+    """先处理所有节点属性，确保一致性"""
+    result = {
+        'x': [],
+        'batch': [],
+        'ptr': [0]
+    }
+
+    node_offset = 0
+
+    for i, data in enumerate(data_list):
+        if not hasattr(data, 'x') or data.x is None:
+            continue
+
+        num_nodes = data.x.size(0)
+
+        # 添加节点特征
+        result['x'].append(data.x)
+
+        # 添加批次索引
+        result['batch'].append(torch.full((num_nodes,), i, dtype=torch.long))
+
+        # 更新节点偏移
+        node_offset += num_nodes
+        result['ptr'].append(node_offset)
+
+    # 合并张量
+    if result['x']:
+        result['x'] = torch.cat(result['x'], dim=0)
+        result['batch'] = torch.cat(result['batch'], dim=0)
+    else:
+        # 空批次处理
+        result['x'] = torch.zeros((0, 35))  # 假设特征是35维
+        result['batch'] = torch.zeros(0, dtype=torch.long)
+
+    result['ptr'] = torch.tensor(result['ptr'], dtype=torch.long)
+
+    return result
+
+
+def _merge_edge_attributes(data_list, ptr):
+    """处理边属性，使用正确的节点偏移"""
+    result = {
+        'edge_index': [],
+        'edge_attr': [],
+        'edge_type': []
+    }
+
+    has_edge_attr = all(hasattr(d, 'edge_attr') and d.edge_attr is not None
+                        for d in data_list if hasattr(d, 'edge_index'))
+
+    has_edge_type = all(hasattr(d, 'edge_type') and d.edge_type is not None
+                        for d in data_list if hasattr(d, 'edge_index'))
+
+    # 处理每个图的边
+    for i, data in enumerate(data_list):
+        if not hasattr(data, 'edge_index') or data.edge_index is None:
+            continue
+
+        # 获取节点偏移
+        node_offset = ptr[i].item()
+
+        # 本地边验证和过滤
+        num_nodes_i = ptr[i + 1] - ptr[i]
+        edge_index = data.edge_index.clone()
+        valid_mask = (edge_index[0] < num_nodes_i) & (edge_index[1] < num_nodes_i) & \
+                     (edge_index[0] >= 0) & (edge_index[1] >= 0)
+
+        if not valid_mask.all():
+            # 过滤无效边
+            edge_index = edge_index[:, valid_mask]
+            if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+                edge_attr_i = data.edge_attr[valid_mask]
+            else:
+                edge_attr_i = None
+
+            if hasattr(data, 'edge_type') and data.edge_type is not None:
+                edge_type_i = data.edge_type[valid_mask]
+            else:
+                edge_type_i = None
+        else:
+            edge_attr_i = data.edge_attr if hasattr(data, 'edge_attr') else None
+            edge_type_i = data.edge_type if hasattr(data, 'edge_type') else None
+
+        # 应用节点偏移
+        edge_index[0] += node_offset
+        edge_index[1] += node_offset
+
+        # 添加到结果
+        result['edge_index'].append(edge_index)
+
+        if edge_attr_i is not None:
+            result['edge_attr'].append(edge_attr_i)
+
+        if edge_type_i is not None:
+            result['edge_type'].append(edge_type_i)
+
+    # 合并边张量
+    if result['edge_index']:
+        result['edge_index'] = torch.cat(result['edge_index'], dim=1)
+
+        if result['edge_attr']:
+            result['edge_attr'] = torch.cat(result['edge_attr'], dim=0)
+        else:
+            del result['edge_attr']
+
+        if result['edge_type']:
+            result['edge_type'] = torch.cat(result['edge_type'], dim=0)
+        else:
+            del result['edge_type']
+    else:
+        del result['edge_index']
+        del result['edge_attr']
+        del result['edge_type']
+
+    return result
+
+
 class ProteinBatch:
     """处理批次中的多个ProteinData对象"""
 
@@ -139,128 +256,12 @@ class ProteinBatch:
         self.num_graphs = len(data_list)
 
         # 按照正确顺序处理节点和边
-        node_attributes = self._merge_node_attributes(data_list)
-        edge_attributes = self._merge_edge_attributes(data_list, node_attributes['ptr'])
+        node_attributes = _merge_node_attributes(data_list)
+        edge_attributes = _merge_edge_attributes(data_list, node_attributes['ptr'])
 
         # 将所有属性设置为类属性
         for k, v in {**node_attributes, **edge_attributes}.items():
             setattr(self, k, v)
-
-    def _merge_node_attributes(self, data_list):
-        """先处理所有节点属性，确保一致性"""
-        result = {
-            'x': [],
-            'batch': [],
-            'ptr': [0]
-        }
-
-        node_offset = 0
-
-        for i, data in enumerate(data_list):
-            if not hasattr(data, 'x') or data.x is None:
-                continue
-
-            num_nodes = data.x.size(0)
-
-            # 添加节点特征
-            result['x'].append(data.x)
-
-            # 添加批次索引
-            result['batch'].append(torch.full((num_nodes,), i, dtype=torch.long))
-
-            # 更新节点偏移
-            node_offset += num_nodes
-            result['ptr'].append(node_offset)
-
-        # 合并张量
-        if result['x']:
-            result['x'] = torch.cat(result['x'], dim=0)
-            result['batch'] = torch.cat(result['batch'], dim=0)
-        else:
-            # 空批次处理
-            result['x'] = torch.zeros((0, 35))  # 假设特征是35维
-            result['batch'] = torch.zeros(0, dtype=torch.long)
-
-        result['ptr'] = torch.tensor(result['ptr'], dtype=torch.long)
-
-        return result
-
-    def _merge_edge_attributes(self, data_list, ptr):
-        """处理边属性，使用正确的节点偏移"""
-        result = {
-            'edge_index': [],
-            'edge_attr': [],
-            'edge_type': []
-        }
-
-        has_edge_attr = all(hasattr(d, 'edge_attr') and d.edge_attr is not None
-                            for d in data_list if hasattr(d, 'edge_index'))
-
-        has_edge_type = all(hasattr(d, 'edge_type') and d.edge_type is not None
-                            for d in data_list if hasattr(d, 'edge_index'))
-
-        # 处理每个图的边
-        for i, data in enumerate(data_list):
-            if not hasattr(data, 'edge_index') or data.edge_index is None:
-                continue
-
-            # 获取节点偏移
-            node_offset = ptr[i].item()
-
-            # 本地边验证和过滤
-            num_nodes_i = ptr[i + 1] - ptr[i]
-            edge_index = data.edge_index.clone()
-            valid_mask = (edge_index[0] < num_nodes_i) & (edge_index[1] < num_nodes_i) & \
-                         (edge_index[0] >= 0) & (edge_index[1] >= 0)
-
-            if not valid_mask.all():
-                # 过滤无效边
-                edge_index = edge_index[:, valid_mask]
-                if hasattr(data, 'edge_attr') and data.edge_attr is not None:
-                    edge_attr_i = data.edge_attr[valid_mask]
-                else:
-                    edge_attr_i = None
-
-                if hasattr(data, 'edge_type') and data.edge_type is not None:
-                    edge_type_i = data.edge_type[valid_mask]
-                else:
-                    edge_type_i = None
-            else:
-                edge_attr_i = data.edge_attr if hasattr(data, 'edge_attr') else None
-                edge_type_i = data.edge_type if hasattr(data, 'edge_type') else None
-
-            # 应用节点偏移
-            edge_index[0] += node_offset
-            edge_index[1] += node_offset
-
-            # 添加到结果
-            result['edge_index'].append(edge_index)
-
-            if edge_attr_i is not None:
-                result['edge_attr'].append(edge_attr_i)
-
-            if edge_type_i is not None:
-                result['edge_type'].append(edge_type_i)
-
-        # 合并边张量
-        if result['edge_index']:
-            result['edge_index'] = torch.cat(result['edge_index'], dim=1)
-
-            if result['edge_attr']:
-                result['edge_attr'] = torch.cat(result['edge_attr'], dim=0)
-            else:
-                del result['edge_attr']
-
-            if result['edge_type']:
-                result['edge_type'] = torch.cat(result['edge_type'], dim=0)
-            else:
-                del result['edge_type']
-        else:
-            del result['edge_index']
-            del result['edge_attr']
-            del result['edge_type']
-
-        return result
 
     def to(self, device):
         """将所有张量移至指定设备"""
@@ -307,6 +308,16 @@ def convert_data_format(data):
 
 
 # 新增：自定义数据集类
+def _create_default_data():
+    """创建一个默认的空数据对象"""
+    # 创建一个最小的图对象
+    protein_data = ProteinData()
+    protein_data.x = torch.zeros((1, 20), dtype=torch.float)  # 一个节点，20维特征
+    protein_data.edge_index = torch.zeros((2, 0), dtype=torch.long)  # 空边
+    protein_data.string_data["sequence"] = "A"  # 最小序列
+    return protein_data
+
+
 class ProteinDataset:
     """处理蛋白质图数据的数据集，兼容不同版本的PyG"""
 
@@ -321,16 +332,7 @@ class ProteinDataset:
         if not self.data_list:
             logger.warning(f"从 {data_path} 加载的数据为空，创建一个包含占位元素的列表")
             # 创建一个仅包含默认元素的数据列表作为后备
-            self.data_list = [self._create_default_data()]
-
-    def _create_default_data(self):
-        """创建一个默认的空数据对象"""
-        # 创建一个最小的图对象
-        protein_data = ProteinData()
-        protein_data.x = torch.zeros((1, 20), dtype=torch.float)  # 一个节点，20维特征
-        protein_data.edge_index = torch.zeros((2, 0), dtype=torch.long)  # 空边
-        protein_data.string_data["sequence"] = "A"  # 最小序列
-        return protein_data
+            self.data_list = [_create_default_data()]
 
     def _load_and_process(self):
         """加载数据并处理成兼容格式"""
@@ -398,7 +400,7 @@ class ProteinDataset:
             return self.data_list[idx]
         else:
             logger.warning(f"索引越界: {idx}，返回默认数据")
-            return self._create_default_data()
+            return _create_default_data()
 
 
 # 修复 ProteinDataLoader 类
@@ -485,6 +487,224 @@ class ProteinDataLoader:
                 continue
 
 
+def _create_seq_hash(sequence):
+    """为序列创建哈希值"""
+    if not sequence:
+        return hashlib.md5("empty".encode()).hexdigest()
+    return hashlib.md5(sequence.encode()).hexdigest()
+
+
+def _extract_sequences_from_graphs(graphs_batch):
+    """
+    增强版：从图批次中提取序列，提高健壮性和准确性
+
+    参数:
+        graphs_batch: 图数据批次
+    返回:
+        list: 氨基酸序列列表
+    """
+    sequences = []
+
+    # 策略1：直接从sequence属性获取（最优先）
+    if hasattr(graphs_batch, "sequence") and isinstance(graphs_batch.sequence, list):
+        return [seq if seq and isinstance(seq, str) else 'A' for seq in graphs_batch.sequence]
+
+    # 策略2：从节点特征重建序列
+    num_graphs = getattr(graphs_batch, "num_graphs", 1)
+
+    # 定义氨基酸映射表（从索引到字母）
+    aa_map = 'ACDEFGHIKLMNPQRSTVWY'
+
+    for i in range(num_graphs):
+        # 获取当前图的节点掩码
+        if hasattr(graphs_batch, "batch") and graphs_batch.batch is not None:
+            mask = graphs_batch.batch == i
+            # 提取节点特征
+            x_i = graphs_batch.x[mask]
+        else:
+            # 如果没有batch属性，假设只有一个图
+            x_i = graphs_batch.x
+
+        # 尝试多种方法从特征中提取氨基酸序列
+        sequence = None
+        try:
+            # 方法1：假设前20维是氨基酸的one-hot编码
+            if x_i.shape[1] >= 20:
+                aa_indices = torch.argmax(x_i[:, :20], dim=1).cpu().numpy()
+                sequence = ''.join([aa_map[idx] if idx < len(aa_map) else 'X' for idx in aa_indices])
+
+            # 方法2：如果方法1失败，使用全部特征的最大值索引
+            if not sequence or len(sequence) == 0:
+                aa_indices = torch.argmax(x_i, dim=1).cpu().numpy() % len(aa_map)
+                sequence = ''.join([aa_map[idx] for idx in aa_indices])
+
+            # 验证序列的合理性
+            if not sequence or len(sequence) != x_i.shape[0]:
+                # 长度不匹配，使用占位符
+                sequence = 'A' * x_i.shape[0]
+
+        except Exception as e:
+            logger.warning(f"序列重建失败: {e}，使用默认序列")
+            # 使用占位符
+            sequence = 'A' * max(1, x_i.shape[0])  # 至少有一个氨基酸
+
+        sequences.append(sequence)
+
+    return sequences
+
+
+def _extract_sequence_ids(graph_batch):
+    """从图批次中提取序列ID，支持多种数据格式"""
+    sequence_ids = None
+
+    # 检查protein_id字段
+    if hasattr(graph_batch, 'protein_id'):
+        if isinstance(graph_batch.protein_id, list):
+            sequence_ids = graph_batch.protein_id
+        else:
+            sequence_ids = [graph_batch.protein_id]
+
+    # 检查其他可能的ID字段
+    elif hasattr(graph_batch, 'id') or hasattr(graph_batch, 'ids'):
+        id_field = getattr(graph_batch, 'id', None) or getattr(graph_batch, 'ids', None)
+        if isinstance(id_field, list):
+            sequence_ids = id_field
+        else:
+            sequence_ids = [id_field]
+
+    # 检查string_data中的ID
+    elif hasattr(graph_batch, 'string_data'):
+        for key in ['protein_id', 'id', 'ids', 'sequence_id']:
+            if key in graph_batch.string_data:
+                value = graph_batch.string_data[key]
+                if isinstance(value, list):
+                    sequence_ids = value
+                else:
+                    sequence_ids = [value]
+                break
+
+    # 如果仍然没有ID，使用序列哈希
+    if sequence_ids is None and hasattr(graph_batch, 'sequence'):
+        sequences = graph_batch.sequence
+        if isinstance(sequences, list):
+            sequence_ids = [_create_seq_hash(seq) for seq in sequences]
+        elif isinstance(sequences, str):
+            sequence_ids = [_create_seq_hash(sequences)]
+
+    return sequence_ids
+
+
+def _save_cache_index(embedding_cache):
+    """安全地保存缓存索引"""
+    try:
+        index_file = os.path.join(embedding_cache.cache_dir, "embedding_index.pkl")
+        with open(index_file, "wb") as f:
+            pickle.dump(embedding_cache.embedding_index, f)
+    except Exception as e:
+        logger.warning(f"索引保存失败: {e}")
+
+
+def _safe_compute_embeddings(esm_model, protein_tensor, config):
+    """安全计算ESMC嵌入，处理维度不匹配问题"""
+    try:
+        # 尝试直接计算
+        return esm_model.logits(protein_tensor, config)
+    except Exception as e:
+        error_msg = str(e)
+
+        # 处理维度错误
+        if "Wrong shape: expected 3 dims" in error_msg and "Received 4-dim tensor" in error_msg:
+            # 修复序列维度
+            sequence = protein_tensor.sequence
+
+            if sequence.dim() == 4:
+                # [b, 1, s, d] -> [b, s, d]
+                if sequence.shape[1] == 1:
+                    fixed_sequence = sequence.squeeze(1)
+                else:
+                    # 对于其他形状，尝试更通用的方法
+                    b = sequence.shape[0]
+                    s = sequence.shape[2]
+                    fixed_sequence = sequence.reshape(b, s, -1)
+
+                # 创建新的蛋白质张量
+                fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
+                logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
+
+                # 重试
+                return esm_model.logits(fixed_tensor, config)
+
+            # 处理其他维度问题
+            if sequence.dim() == 3:
+                b, s, d = sequence.shape
+                if s == 1:
+                    # [b, 1, d] -> [b, d]
+                    fixed_sequence = sequence.squeeze(1)
+                    fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
+                    logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
+                    return esm_model.logits(fixed_tensor, config)
+
+        # 无法处理的错误，重新抛出
+        raise
+
+
+def _save_to_cache(embedding_cache, seq, seq_id, embeddings, attention=None):
+    """
+    保存嵌入和注意力到缓存
+
+    参数:
+        embedding_cache: 嵌入缓存对象
+        seq: 蛋白质序列
+        seq_id: 序列ID
+        embeddings: 嵌入张量
+        attention: 注意力张量
+    """
+    try:
+        # 创建缓存数据 - 使用半精度降低存储空间
+        cache_data = {
+            "embedding": embeddings.detach().cpu().half(),  # 降低存储空间
+            "sequence": seq,
+            "id": seq_id,
+            "timestamp": time.time()  # 添加时间戳以便缓存管理
+        }
+
+        # 只有当注意力可用时才保存
+        if attention is not None:
+            cache_data["attention"] = attention.detach().cpu().half()
+
+        # 生成序列哈希和文件路径
+        seq_hash = _create_seq_hash(seq)
+        embedding_file = os.path.join(embedding_cache.cache_dir, f"{seq_hash}.pt")
+
+        # 保存到文件
+        torch.save(cache_data, embedding_file, _use_new_zipfile_serialization=True)
+
+        # 更新索引
+        embedding_cache.embedding_index[seq_id] = {
+            "hash": seq_hash,
+            "sequence": seq,
+            "file": embedding_file,
+            "timestamp": cache_data["timestamp"]
+        }
+
+        # 定期保存索引
+        if random.random() < 0.05:  # 5%概率保存索引，避免过于频繁的IO
+            _save_cache_index(embedding_cache)
+    except Exception as e:
+        logger.warning(f"缓存保存失败: {e}")
+
+
+def _set_seed(seed):
+    """设置随机种子"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+
+
 class ProteinMultiModalTrainer:
     """蛋白质多模态融合训练器"""
 
@@ -495,6 +715,8 @@ class ProteinMultiModalTrainer:
         参数:
             config: 配置对象
         """
+        self.world_size = None
+        self._fusion_to_seq_proj = None
         self.use_esm_guidance = None
         self.embedding_cache = None
         self.config = config
@@ -511,7 +733,7 @@ class ProteinMultiModalTrainer:
         self.is_master = not config.USE_DISTRIBUTED or config.GLOBAL_RANK == 0
 
         # 设置随机种子
-        self._set_seed(config.SEED)
+        _set_seed(config.SEED)
 
         # 在主进程上创建TensorBoard写入器
         if self.is_master:
@@ -538,16 +760,6 @@ class ProteinMultiModalTrainer:
 
         # 新增: 最佳验证分数，用于早停
         self.best_validation_score = float('inf')
-
-    def _set_seed(self, seed):
-        """设置随机种子"""
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
 
     def _init_models(self):
         """初始化模型组件"""
@@ -825,49 +1037,6 @@ class ProteinMultiModalTrainer:
         self._cache_stats["total_requests"] += requests
         self._cache_stats["cache_hits"] += hits
 
-    def _safe_compute_embeddings(self, esm_model, protein_tensor, config):
-        """安全计算ESMC嵌入，处理维度不匹配问题"""
-        try:
-            # 尝试直接计算
-            return esm_model.logits(protein_tensor, config)
-        except Exception as e:
-            error_msg = str(e)
-
-            # 处理维度错误
-            if "Wrong shape: expected 3 dims" in error_msg and "Received 4-dim tensor" in error_msg:
-                # 修复序列维度
-                sequence = protein_tensor.sequence
-
-                if sequence.dim() == 4:
-                    # [b, 1, s, d] -> [b, s, d]
-                    if sequence.shape[1] == 1:
-                        fixed_sequence = sequence.squeeze(1)
-                    else:
-                        # 对于其他形状，尝试更通用的方法
-                        b = sequence.shape[0]
-                        s = sequence.shape[2]
-                        fixed_sequence = sequence.reshape(b, s, -1)
-
-                    # 创建新的蛋白质张量
-                    fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
-                    logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
-
-                    # 重试
-                    return esm_model.logits(fixed_tensor, config)
-
-                # 处理其他维度问题
-                if sequence.dim() == 3:
-                    b, s, d = sequence.shape
-                    if s == 1:
-                        # [b, 1, d] -> [b, d]
-                        fixed_sequence = sequence.squeeze(1)
-                        fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
-                        logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
-                        return esm_model.logits(fixed_tensor, config)
-
-            # 无法处理的错误，重新抛出
-            raise
-
     def _get_esm_embedding(self, sequences, sequence_ids=None):
         """
         获取序列的ESM嵌入与注意力，优先从缓存加载
@@ -992,7 +1161,7 @@ class ProteinMultiModalTrainer:
                 with torch.no_grad():
                     try:
                         # 安全计算嵌入
-                        logits_output = self._safe_compute_embeddings(
+                        logits_output = _safe_compute_embeddings(
                             self.esm_model,
                             protein_tensor,
                             LogitsConfig(sequence=True, return_embeddings=True)
@@ -1021,7 +1190,7 @@ class ProteinMultiModalTrainer:
 
                         # 保存到缓存
                         if use_cache:
-                            self._save_to_cache(seq, seq_id, embedding, attention)
+                            _save_to_cache(seq, seq_id, embedding, attention)
 
                         # 添加到批次
                         batch_embeddings.append(embedding)
@@ -1079,60 +1248,6 @@ class ProteinMultiModalTrainer:
 
             return batch_embeddings
 
-    def _save_to_cache(self, embedding_cache, seq, seq_id, embeddings, attention=None):
-        """
-        保存嵌入和注意力到缓存
-
-        参数:
-            embedding_cache: 嵌入缓存对象
-            seq: 蛋白质序列
-            seq_id: 序列ID
-            embeddings: 嵌入张量
-            attention: 注意力张量
-        """
-        try:
-            # 创建缓存数据 - 使用半精度降低存储空间
-            cache_data = {
-                "embedding": embeddings.detach().cpu().half(),  # 降低存储空间
-                "sequence": seq,
-                "id": seq_id,
-                "timestamp": time.time()  # 添加时间戳以便缓存管理
-            }
-
-            # 只有当注意力可用时才保存
-            if attention is not None:
-                cache_data["attention"] = attention.detach().cpu().half()
-
-            # 生成序列哈希和文件路径
-            seq_hash = self._create_seq_hash(seq)
-            embedding_file = os.path.join(embedding_cache.cache_dir, f"{seq_hash}.pt")
-
-            # 保存到文件
-            torch.save(cache_data, embedding_file, _use_new_zipfile_serialization=True)
-
-            # 更新索引
-            embedding_cache.embedding_index[seq_id] = {
-                "hash": seq_hash,
-                "sequence": seq,
-                "file": embedding_file,
-                "timestamp": cache_data["timestamp"]
-            }
-
-            # 定期保存索引
-            if random.random() < 0.05:  # 5%概率保存索引，避免过于频繁的IO
-                self._save_cache_index(embedding_cache)
-        except Exception as e:
-            logger.warning(f"缓存保存失败: {e}")
-
-    def _save_cache_index(self, embedding_cache):
-        """安全地保存缓存索引"""
-        try:
-            index_file = os.path.join(embedding_cache.cache_dir, "embedding_index.pkl")
-            with open(index_file, "wb") as f:
-                pickle.dump(embedding_cache.embedding_index, f)
-        except Exception as e:
-            logger.warning(f"索引保存失败: {e}")
-
     def _get_fused_embedding(self, graph_batch, sequences=None):
         """
         优化的序列-结构融合嵌入获取函数，解决维度不匹配问题
@@ -1160,7 +1275,7 @@ class ProteinMultiModalTrainer:
 
             # 2. 提取序列
             if sequences is None:
-                sequences = self._extract_sequences_from_graphs(graph_batch)
+                sequences = _extract_sequences_from_graphs(graph_batch)
 
             # 3. 获取序列ESM嵌入
             seq_embeddings = self._get_esm_embedding(sequences, sequence_ids)
@@ -1338,46 +1453,6 @@ class ProteinMultiModalTrainer:
                     self.writer.add_scalar('cache/hits', hits, self.global_step)
                     self.writer.add_scalar('cache/total_requests', total, self.global_step)
 
-    def _extract_sequence_ids(self, graph_batch):
-        """从图批次中提取序列ID，支持多种数据格式"""
-        sequence_ids = None
-
-        # 检查protein_id字段
-        if hasattr(graph_batch, 'protein_id'):
-            if isinstance(graph_batch.protein_id, list):
-                sequence_ids = graph_batch.protein_id
-            else:
-                sequence_ids = [graph_batch.protein_id]
-
-        # 检查其他可能的ID字段
-        elif hasattr(graph_batch, 'id') or hasattr(graph_batch, 'ids'):
-            id_field = getattr(graph_batch, 'id', None) or getattr(graph_batch, 'ids', None)
-            if isinstance(id_field, list):
-                sequence_ids = id_field
-            else:
-                sequence_ids = [id_field]
-
-        # 检查string_data中的ID
-        elif hasattr(graph_batch, 'string_data'):
-            for key in ['protein_id', 'id', 'ids', 'sequence_id']:
-                if key in graph_batch.string_data:
-                    value = graph_batch.string_data[key]
-                    if isinstance(value, list):
-                        sequence_ids = value
-                    else:
-                        sequence_ids = [value]
-                    break
-
-        # 如果仍然没有ID，使用序列哈希
-        if sequence_ids is None and hasattr(graph_batch, 'sequence'):
-            sequences = graph_batch.sequence
-            if isinstance(sequences, list):
-                sequence_ids = [self._create_seq_hash(seq) for seq in sequences]
-            elif isinstance(sequences, str):
-                sequence_ids = [self._create_seq_hash(sequences)]
-
-        return sequence_ids
-
     def _pool_sequence_embeddings(self, seq_embeddings):
         """序列嵌入池化，处理不同维度的输入"""
         try:
@@ -1440,69 +1515,6 @@ class ProteinMultiModalTrainer:
                 batch_size = seq_embeddings.size(0)
 
             return torch.zeros(batch_size, self.config.ESM_EMBEDDING_DIM, device=self.device)
-    def _create_seq_hash(self, sequence):
-        """为序列创建哈希值"""
-        if not sequence:
-            return hashlib.md5("empty".encode()).hexdigest()
-        return hashlib.md5(sequence.encode()).hexdigest()
-
-    def _extract_sequences_from_graphs(self, graphs_batch):
-        """
-        增强版：从图批次中提取序列，提高健壮性和准确性
-
-        参数:
-            graphs_batch: 图数据批次
-        返回:
-            list: 氨基酸序列列表
-        """
-        sequences = []
-
-        # 策略1：直接从sequence属性获取（最优先）
-        if hasattr(graphs_batch, "sequence") and isinstance(graphs_batch.sequence, list):
-            return [seq if seq and isinstance(seq, str) else 'A' for seq in graphs_batch.sequence]
-
-        # 策略2：从节点特征重建序列
-        num_graphs = getattr(graphs_batch, "num_graphs", 1)
-
-        # 定义氨基酸映射表（从索引到字母）
-        aa_map = 'ACDEFGHIKLMNPQRSTVWY'
-
-        for i in range(num_graphs):
-            # 获取当前图的节点掩码
-            if hasattr(graphs_batch, "batch") and graphs_batch.batch is not None:
-                mask = graphs_batch.batch == i
-                # 提取节点特征
-                x_i = graphs_batch.x[mask]
-            else:
-                # 如果没有batch属性，假设只有一个图
-                x_i = graphs_batch.x
-
-            # 尝试多种方法从特征中提取氨基酸序列
-            sequence = None
-            try:
-                # 方法1：假设前20维是氨基酸的one-hot编码
-                if x_i.shape[1] >= 20:
-                    aa_indices = torch.argmax(x_i[:, :20], dim=1).cpu().numpy()
-                    sequence = ''.join([aa_map[idx] if idx < len(aa_map) else 'X' for idx in aa_indices])
-
-                # 方法2：如果方法1失败，使用全部特征的最大值索引
-                if not sequence or len(sequence) == 0:
-                    aa_indices = torch.argmax(x_i, dim=1).cpu().numpy() % len(aa_map)
-                    sequence = ''.join([aa_map[idx] for idx in aa_indices])
-
-                # 验证序列的合理性
-                if not sequence or len(sequence) != x_i.shape[0]:
-                    # 长度不匹配，使用占位符
-                    sequence = 'A' * x_i.shape[0]
-
-            except Exception as e:
-                logger.warning(f"序列重建失败: {e}，使用默认序列")
-                # 使用占位符
-                sequence = 'A' * max(1, x_i.shape[0])  # 至少有一个氨基酸
-
-            sequences.append(sequence)
-
-        return sequences
 
     def protein_fusion_loss(self, graph_embedding, seq_embedding, graph_latent, fused_embedding, batch=None):
         """增强的蛋白质多模态融合损失函数"""
@@ -1834,7 +1846,7 @@ class ProteinMultiModalTrainer:
 
     def test(self, test_loader):
         """
-        在测试集上评估模型
+        在测试集上评估模型，添加了主动内存管理策略以避免张量累积和NCCL通信超时
 
         参数:
             test_loader: 测试数据加载器
@@ -1842,7 +1854,7 @@ class ProteinMultiModalTrainer:
         返回:
             dict: 测试统计信息
         """
-        # 与验证过程类似
+        # 设置模型为评估模式
         self.graph_encoder.eval()
         self.latent_mapper.eval()
         self.contrast_head.eval()
@@ -1859,6 +1871,13 @@ class ProteinMultiModalTrainer:
             'sequences': []
         }
 
+        # 测试前主动清理内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            logger.info("测试开始前已清理GPU内存")
+
         # 测试循环
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(test_loader, desc="测试中", disable=not self.is_master)):
@@ -1874,12 +1893,20 @@ class ProteinMultiModalTrainer:
                     # 将数据移到设备上
                     batch = batch.to(self.device)
 
+
                     # 提取序列
-                    sequences = self._extract_sequences_from_graphs(batch)
+                    sequences = _extract_sequences_from_graphs(batch)
+
+                    # 使用计时器监控长时间运行的操作
+                    start_time = time.time()
 
                     # 获取图嵌入和序列嵌入
                     graph_embedding, seq_embedding, graph_latent, fused_embedding = self._get_fused_embedding(batch,
                                                                                                               sequences)
+
+                    compute_time = time.time() - start_time
+                    if compute_time > 5.0 and self.is_master:  # 5秒阈值可调整
+                        logger.warning(f"批次 {batch_idx} 嵌入计算耗时较长: {compute_time:.2f}秒")
 
                     # 计算融合损失
                     loss, loss_dict = self.protein_fusion_loss(
@@ -1891,6 +1918,7 @@ class ProteinMultiModalTrainer:
 
                     # 保存嵌入和序列（仅在主进程上）
                     if self.is_master:
+                        # 使用CPU张量存储，避免GPU内存累积
                         test_stats['embeddings'].append({
                             'graph': graph_embedding.cpu(),
                             'seq': seq_embedding.cpu(),
@@ -1906,10 +1934,58 @@ class ProteinMultiModalTrainer:
                     test_stats['structure_loss'] += loss_dict['structure_loss'].item()
                     test_stats['batch_count'] += 1
 
+                    # 【关键优化】主动释放不再需要的张量
+                    del graph_embedding, seq_embedding, graph_latent, fused_embedding, loss, loss_dict
+
+                    # 【关键优化】定期执行内存清理
+                    if batch_idx % 10 == 0:  # 每10个批次清理一次内存
+                        torch.cuda.empty_cache()
+                        gc.collect()
+
+                        # 记录当前GPU内存状态 (仅主进程)
+                        if self.is_master and torch.cuda.is_available() and batch_idx % 50 == 0:
+                            mem_allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+                            mem_reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+                            logger.info(f"批次 {batch_idx} - GPU内存: 已分配 {mem_allocated:.1f}MB, "
+                                        f"已保留 {mem_reserved:.1f}MB")
+
+                except RuntimeError as e:
+                    # 特别处理可能的CUDA内存错误
+                    if "CUDA out of memory" in str(e):
+                        logger.error(f"批次 {batch_idx} 出现CUDA内存不足: {str(e)[:100]}")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        test_stats['skipped_batches'] += 1
+                        continue
+                    else:
+                        logger.error(f"测试批次 {batch_idx} 处理出错: {str(e)[:100]}")
+                        logger.error(traceback.format_exc())
+                        test_stats['skipped_batches'] += 1
+
+                        # 尝试清理内存并继续
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
                 except Exception as e:
-                    logger.error(f"测试批次 {batch_idx} 处理出错: {e}")
+                    logger.error(f"测试批次 {batch_idx} 处理出错: {str(e)[:100]}")
+                    logger.error(traceback.format_exc())
                     test_stats['skipped_batches'] += 1
+
+                    # 尝试清理内存并继续
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
                     continue
+
+                # 添加强制同步点，确保所有GPU处于相同状态
+                if hasattr(self, 'world_size') and self.world_size > 1:
+                    if batch_idx % 50 == 0:  # 每50批次同步一次
+                        try:
+                            torch.distributed.barrier()
+                        except Exception as e:
+                            logger.warning(f"分布式同步失败: {str(e)[:100]}")
 
         # 计算平均统计信息
         if test_stats['batch_count'] > 0:
@@ -1917,9 +1993,16 @@ class ProteinMultiModalTrainer:
                 if key not in ['batch_count', 'skipped_batches', 'embeddings', 'sequences']:
                     test_stats[key] /= test_stats['batch_count']
 
+        # 测试结束后清理内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        if self.is_master:
+            logger.info(f"测试完成: 共处理 {test_stats['batch_count']} 批次, "
+                        f"跳过 {test_stats['skipped_batches']} 批次")
 
         return test_stats
-
 
     def save_checkpoint(self, metrics, is_best=False):
         """
