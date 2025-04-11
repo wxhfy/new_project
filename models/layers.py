@@ -150,7 +150,7 @@ class HeterogeneousGATv2Layer(MessagePassing):
             in_channels,
             out_channels,
             heads=4,
-            edge_types=2,
+            edge_types=4,
             edge_dim=None,
             dropout=0.2,
             use_layer_norm=True,
