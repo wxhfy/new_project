@@ -41,7 +41,7 @@ class Config:
     DEVICE = torch.device(f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() and NUM_GPUS > 0 else "cpu")
 
     SEED = 42
-    NUM_WORKERS = 4  # 每个GPU的数据加载器工作进程数
+    NUM_WORKERS = 8  # 每个GPU的数据加载器工作进程数
 
     # =============== 路径配置 ===============
     # 使用实际项目根目录
@@ -143,7 +143,7 @@ class Config:
     FUSION_DROPOUT = 0.1
 
     # =============== 训练配置 ===============
-    EPOCHS = 100
+    EPOCHS = 50
 
     # 批次大小设置（分布式训练）
     GLOBAL_BATCH_SIZE = 512  # 全局批次大小

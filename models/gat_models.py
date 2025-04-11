@@ -283,56 +283,45 @@ class ProteinGATv2Encoder(nn.Module):
             graph_embedding (torch.Tensor): 图级嵌入 [batch_size, output_dim]
             residue_scores (torch.Tensor): 残基重要性分数 [num_nodes, 1]
         """
-        # 边索引有效性验证
-        if edge_index.size(1) > 0:  # 确保有边存在
-            num_nodes = x.size(0)
-
-            # 检测无效边
-            valid_edge_mask = (edge_index[0] < num_nodes) & (edge_index[1] < num_nodes) & \
-                              (edge_index[0] >= 0) & (edge_index[1] >= 0)
-
-            # 如果发现无效边，进行过滤
-            if not valid_edge_mask.all():
-                invalid_count = (~valid_edge_mask).sum().item()
-                import logging
-                logging.warning(f"检测到{invalid_count}条无效边索引，将被过滤")
-
-                # 过滤边索引和相关属性
-                edge_index = edge_index[:, valid_edge_mask]
-                if edge_attr is not None:
-                    edge_attr = edge_attr[valid_edge_mask]
-                if edge_type is not None:
-                    edge_type = edge_type[valid_edge_mask]
-
-        # 确保批索引存在
+        # =============== 特征预处理 ===============
+        # 确保批次索引存在
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-        # =============== 特征预处理 ===============
-        # 物化属性标准化
+        # 1. 物化属性标准化
         x = self.property_normalizer(x)
 
-        # 节点特征初始编码
+        # 2. 节点特征初始编码
         h = self.node_encoder(x)
 
-        # 1. 节点特征预处理
-        # 物化属性标准化
-        x = self.property_normalizer(x)
+        # 3. 图结构验证和边特征处理
+        # 检查是否有边
+        if edge_index is None or edge_index.size(1) == 0:
+            # 创建自环边以保证消息传递
+            logger.warning("没有边存在，创建自环边以保证模型正常工作")
+            edge_index = torch.stack([
+                torch.arange(x.size(0), device=x.device),
+                torch.arange(x.size(0), device=x.device)
+            ], dim=0)
 
-        # 节点特征初始编码
-        h = self.node_encoder(x)
+            # 创建基本边特征和类型
+            if edge_attr is None and self.edge_input_dim > 0:
+                edge_attr = torch.zeros(edge_index.size(1), self.edge_input_dim, device=x.device)
+            if edge_type is None and self.edge_types > 0:
+                edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=x.device)
 
-        # 2. 边特征处理
-        # 确保边索引符合图结构
-        if edge_index.size(1) > 0:
-            # 优化: 只进行边界检查，不过滤
-            # 这样保留所有边，而边处理逻辑会在内部处理边界情况
-            max_node_idx = x.size(0) - 1
-            if edge_index.max() > max_node_idx or edge_index.min() < 0:
-                import logging
-                logging.warning(f"边索引范围异常：最大值 {edge_index.max().item()}，"
-                                f"最小值 {edge_index.min().item()}，"
-                                f"节点范围应为 [0, {max_node_idx}]")
+        # 最终检查边索引有效性 - 只为记录不再过滤
+        max_node_idx = x.size(0) - 1
+        invalid_edges = ((edge_index[0] > max_node_idx) |
+                         (edge_index[1] > max_node_idx) |
+                         (edge_index[0] < 0) |
+                         (edge_index[1] < 0))
+        invalid_count = invalid_edges.sum().item()
+
+        if invalid_count > 0:
+            # 只记录不过滤 - 此时已经有足够的预处理保证边索引有效
+            if dist.is_initialized() and dist.get_rank() == 0:
+                logger.info(f"忽略{invalid_count}条无效边索引，节点范围[0, {max_node_idx}]")
 
         # 处理边特征
         if edge_attr is not None:
@@ -342,7 +331,8 @@ class ProteinGATv2Encoder(nn.Module):
 
         # 应用边修剪（如果启用）
         if self.use_edge_pruning and edge_features is not None:
-            edge_mask, _ = self.edge_pruning(edge_features)
+            edge_mask, importance = self.edge_pruning(edge_features)
+            # 只缩放而不过滤
             edge_features = edge_features * edge_mask
 
         # =============== 图卷积处理 ===============

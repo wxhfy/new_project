@@ -132,65 +132,141 @@ class ProteinData:
         return new_obj
 
 
-# 新增：批处理类
 class ProteinBatch:
     """处理批次中的多个ProteinData对象"""
 
     def __init__(self, data_list):
-        self.edge_index = None
         self.num_graphs = len(data_list)
-        self.batch = torch.zeros(0, dtype=torch.long)
 
-        # 合并张量属性
-        for key in ["x", "edge_index", "edge_attr", "pos"]:
-            self._merge_tensor_attr(data_list, key)
+        # 按照正确顺序处理节点和边
+        node_attributes = self._merge_node_attributes(data_list)
+        edge_attributes = self._merge_edge_attributes(data_list, node_attributes['ptr'])
 
-        # 处理字符串属性 - 保留为列表
-        self._merge_string_attrs(data_list)
+        # 将所有属性设置为类属性
+        for k, v in {**node_attributes, **edge_attributes}.items():
+            setattr(self, k, v)
 
-        # 创建批次索引
-        offset = 0
+    def _merge_node_attributes(self, data_list):
+        """先处理所有节点属性，确保一致性"""
+        result = {
+            'x': [],
+            'batch': [],
+            'ptr': [0]
+        }
+
+        node_offset = 0
+
         for i, data in enumerate(data_list):
+            if not hasattr(data, 'x') or data.x is None:
+                continue
+
             num_nodes = data.x.size(0)
-            self.batch = torch.cat([self.batch, torch.full((num_nodes,), i, dtype=torch.long)])
 
-            # 更新边索引的偏移量
-            if i < len(data_list) - 1:
-                if hasattr(self, "edge_index") and self.edge_index is not None:
-                    data_list[i + 1].edge_index = data_list[i + 1].edge_index + offset
+            # 添加节点特征
+            result['x'].append(data.x)
 
-            offset += num_nodes
+            # 添加批次索引
+            result['batch'].append(torch.full((num_nodes,), i, dtype=torch.long))
 
-    def _merge_tensor_attr(self, data_list, key):
-        # 合并指定张量属性
-        tensors = [getattr(data, key) for data in data_list if hasattr(data, key) and getattr(data, key) is not None]
-        if tensors:
-            setattr(self, key, torch.cat(tensors, dim=0 if key != "edge_index" else 1))
+            # 更新节点偏移
+            node_offset += num_nodes
+            result['ptr'].append(node_offset)
+
+        # 合并张量
+        if result['x']:
+            result['x'] = torch.cat(result['x'], dim=0)
+            result['batch'] = torch.cat(result['batch'], dim=0)
         else:
-            setattr(self, key, None)
+            # 空批次处理
+            result['x'] = torch.zeros((0, 35))  # 假设特征是35维
+            result['batch'] = torch.zeros(0, dtype=torch.long)
 
-    def _merge_string_attrs(self, data_list):
-        # 收集所有出现的字符串属性
-        string_keys = set()
-        for data in data_list:
-            if hasattr(data, "string_data"):
-                string_keys.update(data.string_data.keys())
+        result['ptr'] = torch.tensor(result['ptr'], dtype=torch.long)
 
-        # 为每个字符串属性创建合并列表
-        for key in string_keys:
-            values = []
-            for data in data_list:
-                if hasattr(data, "string_data") and key in data.string_data:
-                    values.append(data.string_data[key])
+        return result
+
+    def _merge_edge_attributes(self, data_list, ptr):
+        """处理边属性，使用正确的节点偏移"""
+        result = {
+            'edge_index': [],
+            'edge_attr': [],
+            'edge_type': []
+        }
+
+        has_edge_attr = all(hasattr(d, 'edge_attr') and d.edge_attr is not None
+                            for d in data_list if hasattr(d, 'edge_index'))
+
+        has_edge_type = all(hasattr(d, 'edge_type') and d.edge_type is not None
+                            for d in data_list if hasattr(d, 'edge_index'))
+
+        # 处理每个图的边
+        for i, data in enumerate(data_list):
+            if not hasattr(data, 'edge_index') or data.edge_index is None:
+                continue
+
+            # 获取节点偏移
+            node_offset = ptr[i].item()
+
+            # 本地边验证和过滤
+            num_nodes_i = ptr[i + 1] - ptr[i]
+            edge_index = data.edge_index.clone()
+            valid_mask = (edge_index[0] < num_nodes_i) & (edge_index[1] < num_nodes_i) & \
+                         (edge_index[0] >= 0) & (edge_index[1] >= 0)
+
+            if not valid_mask.all():
+                # 过滤无效边
+                edge_index = edge_index[:, valid_mask]
+                if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+                    edge_attr_i = data.edge_attr[valid_mask]
                 else:
-                    values.append(None)  # 保持索引对齐
-            setattr(self, key, values)
+                    edge_attr_i = None
+
+                if hasattr(data, 'edge_type') and data.edge_type is not None:
+                    edge_type_i = data.edge_type[valid_mask]
+                else:
+                    edge_type_i = None
+            else:
+                edge_attr_i = data.edge_attr if hasattr(data, 'edge_attr') else None
+                edge_type_i = data.edge_type if hasattr(data, 'edge_type') else None
+
+            # 应用节点偏移
+            edge_index[0] += node_offset
+            edge_index[1] += node_offset
+
+            # 添加到结果
+            result['edge_index'].append(edge_index)
+
+            if edge_attr_i is not None:
+                result['edge_attr'].append(edge_attr_i)
+
+            if edge_type_i is not None:
+                result['edge_type'].append(edge_type_i)
+
+        # 合并边张量
+        if result['edge_index']:
+            result['edge_index'] = torch.cat(result['edge_index'], dim=1)
+
+            if result['edge_attr']:
+                result['edge_attr'] = torch.cat(result['edge_attr'], dim=0)
+            else:
+                del result['edge_attr']
+
+            if result['edge_type']:
+                result['edge_type'] = torch.cat(result['edge_type'], dim=0)
+            else:
+                del result['edge_type']
+        else:
+            del result['edge_index']
+            del result['edge_attr']
+            del result['edge_type']
+
+        return result
 
     def to(self, device):
-        """将批次中的张量移至指定设备"""
+        """将所有张量移至指定设备"""
         for key, value in self.__dict__.items():
             if isinstance(value, torch.Tensor):
-                self.__dict__[key] = value.to(device)
+                setattr(self, key, value.to(device))
         return self
 
 
@@ -1841,9 +1917,6 @@ class ProteinMultiModalTrainer:
                 if key not in ['batch_count', 'skipped_batches', 'embeddings', 'sequences']:
                     test_stats[key] /= test_stats['batch_count']
 
-        # 可视化测试结果（仅在主进程上）
-        if self.is_master and test_stats['embeddings']:
-            self._visualize_test_results(test_stats)
 
         return test_stats
 
