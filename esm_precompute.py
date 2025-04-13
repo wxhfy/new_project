@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-ESMC蛋白质嵌入分布式预计算系统 - 支持合并输出版本
+ESM-2 蛋白质嵌入分布式预计算系统 - (Transformers 版本)
 
-使用多GPU并行计算蛋白质序列的ESMC嵌入，并将结果合并保存为单一大文件
-支持断点续传、负载均衡和错误恢复机制
+使用 Hugging Face transformers 库处理 ESM-2 模型。
+在多个 GPU 上并行计算蛋白质序列的嵌入 (以及可选的注意力图)，
+并为每个输入数据集文件 (train/val/test) 生成独立的输出文件。
+支持断点续传、负载均衡和错误恢复机制。
 
-作者: wxhfy
-日期: 2025-04-08 (修改版)
+作者: wxhfy (基于 Transformers ESM-2 适配)
+日期: 2025-04-13
 """
 
 import os
@@ -27,756 +29,785 @@ from pathlib import Path
 from tqdm import tqdm
 from functools import partial
 from datetime import datetime
-from torch.nn import functional as F
 import torch.distributed as dist
 from torch.multiprocessing import Process
-from esm.models.esmc import ESMC
-from esm.sdk.api import ESMProteinTensor, LogitsConfig
-import h5py
+from torch.cuda.amp import autocast # 用于混合精度推理
 
-# 配置日志
+# 导入 Transformers 库
+from transformers import AutoModel, AutoTokenizer
+
+import h5py # 保留 HDF5 导入以备将来使用，但当前默认输出 PT
+
+# --- 日志配置 ---
+log_file = "esm2_precompute.log" # 日志文件名
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO, # 日志级别
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', # 日志格式
     handlers=[
-        logging.FileHandler("esm_precompute.log"),
-        logging.StreamHandler()
+        logging.FileHandler(log_file, encoding='utf-8'), # 保存到文件，使用 UTF-8 编码
+        logging.StreamHandler() # 输出到控制台
     ]
 )
+logger = logging.getLogger("esm2_precompute") # 日志记录器名称
+# --- 日志配置结束 ---
 
-logger = logging.getLogger("esm_precompute")
+# --- 辅助函数 ---
+def _extract_sequences(data_path):
+    """从数据文件中提取序列信息"""
+    logger.info(f"从 {data_path} 加载数据")
+    try:
+        # 加载 .pt 文件，假设包含一个列表的图数据对象或字典
+        data = torch.load(data_path, map_location='cpu') # 加载到 CPU 避免占用 GPU 内存
 
-# 设置环境变量
-os.environ["INFRA_PROVIDER"] = "True"
-os.environ["ESM_CACHE_DIR"] = "data/weights"
+        # 确保数据是列表格式
+        if not isinstance(data, list):
+            # 如果是字典，尝试提取值作为列表
+            if isinstance(data, dict):
+                data = list(data.values())
+            else:
+                data = [data] # 单个对象转为列表
 
+        sequences = []
+        sequence_ids = []
+        unique_sequences = set() # 跟踪唯一序列以避免初始重复
 
-class DistributedEmbeddingComputer:
-    """分布式ESMC嵌入计算器 - 支持合并输出"""
+        logger.info(f"开始从 {len(data)} 个图对象中提取序列...")
+        for idx, item in enumerate(tqdm(data, desc=f"提取序列 {Path(data_path).stem}")):
+            seq = None
+            seq_id = None
+            # 尝试从常见属性中获取序列和ID
+            if hasattr(item, 'sequence') and isinstance(item.sequence, str) and item.sequence:
+                seq = item.sequence
+                # 尝试获取ID
+                if hasattr(item, 'protein_id'):
+                    seq_id = item.protein_id
+                elif hasattr(item, 'id'):
+                     seq_id = item.id
+                elif hasattr(item, 'name'): # 备选ID字段
+                     seq_id = item.name
+                else:
+                    # 如果没有显式ID，使用索引作为基础构建一个
+                    seq_id = f"{Path(data_path).stem}_seq_{idx}"
+
+            # 进一步检查字典格式（如果item是字典）
+            elif isinstance(item, dict) and 'sequence' in item and item['sequence']:
+                 seq = item['sequence']
+                 seq_id = item.get('protein_id', item.get('id', item.get('name', f"{Path(data_path).stem}_seq_{idx}")))
+
+            # 如果成功获取序列和ID
+            if seq and seq_id:
+                # 仅添加未见过的序列
+                if seq not in unique_sequences:
+                    sequences.append(seq)
+                    sequence_ids.append(str(seq_id)) # 确保ID是字符串
+                    unique_sequences.add(seq)
+            # else:
+                 # logger.debug(f"跳过索引 {idx}: 未找到有效的序列或ID。")
+
+        logger.info(f"成功提取 {len(sequences)} 个唯一序列")
+        return sequences, sequence_ids
+    except FileNotFoundError:
+        logger.error(f"数据文件未找到: {data_path}")
+        return [], []
+    except Exception as e:
+        logger.error(f"数据加载或序列提取失败: {e}")
+        logger.error(traceback.format_exc())
+        return [], []
+
+def _create_seq_hash(sequence):
+    """为序列创建哈希值"""
+    if not sequence: # 处理空序列
+        return hashlib.md5("empty".encode('utf-8')).hexdigest()
+    # 使用 UTF-8 编码
+    return hashlib.md5(sequence.encode('utf-8')).hexdigest()
+# --- 辅助函数结束 ---
+
+class DistributedESM2Computer:
+    """分布式 ESM-2 嵌入计算器 (Transformers 版本)"""
 
     def __init__(
-            self,
-            model_name="esmc_600m",
-            cache_dir="data/esm_embeddings",
-            output_file=None,
-            num_gpus=3,
-            batch_size=1,
-            force_recompute=False,
-            master_port=29500,
-            format="pt"  # 输出格式: pt或hdf5
+        self,
+        model_path_or_name, # 模型路径或名称
+        output_dir, # 输出目录
+        gpu_ids, # 使用的 GPU ID 列表
+        batch_size=16, # 每个 GPU 的批处理大小
+        max_length=1022, # ESM-2 的最大序列长度 (不含特殊 token)
+        force_recompute=False, # 是否强制重新计算
+        master_port=29501, # 分布式通信端口
+        output_attentions=True # 是否计算并保存注意力图
     ):
-        """
-        初始化分布式嵌入计算器
-
-        参数:
-            model_name (str): ESMC模型名称
-            cache_dir (str): 嵌入缓存目录
-            output_file (str): 输出文件名（不包含扩展名）
-            num_gpus (int): 可用GPU数量
-            batch_size (int): 每个GPU的批处理大小
-            force_recompute (bool): 是否强制重新计算
-            master_port (int): 分布式通信端口
-            format (str): 输出文件格式，'pt'或'hdf5'
-        """
-        self.model_name = model_name
-        self.cache_dir = cache_dir
-        self.num_gpus = num_gpus
+        self.model_path_or_name = model_path_or_name
+        self.output_dir = os.path.join(output_dir, "embeddings")
+        self.gpu_ids = gpu_ids # 使用的 GPU ID 列表
+        self.num_gpus = len(gpu_ids) if gpu_ids else 0 # 使用的 GPU 数量
         self.batch_size = batch_size
+        self.max_length = max_length
         self.force_recompute = force_recompute
         self.master_port = master_port
-        self.format = format.lower()
+        self.output_attentions = output_attentions
+        self.format = "pt" # 固定输出格式为 .pt
+        # 创建输出目录
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        # 确定输出文件名
-        self.output_file = output_file
-        if self.output_file is None:
-            # 默认使用模型名称和时间戳
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.output_file = f"{model_name}_embeddings_{timestamp}"
+        # 临时目录 - 用于存储每个 GPU 的部分结果 (每个输入文件有自己的临时子目录)
+        self.temp_base_dir = os.path.join(self.output_dir, "temp_embeddings_esm2")
+        os.makedirs(self.temp_base_dir, exist_ok=True)
 
-        # 根据格式添加扩展名
-        if self.format == "pt":
-            self.merged_file = os.path.join(cache_dir, f"{self.output_file}.pt")
-        elif self.format == "hdf5":
-            self.merged_file = os.path.join(cache_dir, f"{self.output_file}.h5")
-        else:
-            raise ValueError(f"不支持的格式: {format}, 请使用 'pt' 或 'hdf5'")
+        # 统计信息跟踪
+        self.stats = {} # 每个文件分开统计
 
-        # 创建缓存目录
-        os.makedirs(cache_dir, exist_ok=True)
+    # --- Checkpoint 和 Index 相关函数 (调整为文件级别) ---
+    def _get_file_specific_paths(self, input_filename_stem):
+        """获取特定输入文件的索引和检查点路径"""
+        index_file = os.path.join(self.output_dir, f"{input_filename_stem}_index.pkl")
+        checkpoint_file = os.path.join(self.output_dir, f"{input_filename_stem}_checkpoint.json")
+        temp_dir = os.path.join(self.temp_base_dir, input_filename_stem)
+        os.makedirs(temp_dir, exist_ok=True) # 确保临时目录存在
+        return index_file, checkpoint_file, temp_dir
 
-        # 临时目录 - 用于存储每个GPU的部分结果
-        self.temp_dir = os.path.join(cache_dir, "temp_embeddings")
-        os.makedirs(self.temp_dir, exist_ok=True)
-
-        # 氨基酸编码映射表
-        self.ESM_AA_MAP = {
-            'A': 5, 'C': 23, 'D': 13, 'E': 9, 'F': 18,
-            'G': 6, 'H': 21, 'I': 12, 'K': 15, 'L': 4,
-            'M': 20, 'N': 17, 'P': 14, 'Q': 16, 'R': 10,
-            'S': 8, 'T': 11, 'V': 7, 'W': 22, 'Y': 19,
-            '_': 32, 'X': 32
-        }
-
-        # 索引文件路径 - 用于断点续传
-        self.index_file = os.path.join(cache_dir, "embedding_index.pkl")
-
-        # 加载或创建索引
-        self.embedding_index = self._load_or_create_index()
-
-        # 检查点文件
-        self.checkpoint_file = os.path.join(cache_dir, "precompute_checkpoint.json")
-
-        # 统计信息
-        self.stats = {
-            "total": 0,
-            "computed": 0,
-            "cached": 0,
-            "failed": 0,
-            "start_time": None,
-            "end_time": None,
-            "embedding_dim": 0,  # 将记录嵌入维度
-        }
-
-    def _load_or_create_index(self):
-        """加载已有索引或创建新索引"""
-        if os.path.exists(self.index_file) and not self.force_recompute:
+    def _load_or_create_index(self, index_file):
+        """加载或创建特定文件的索引"""
+        if os.path.exists(index_file) and not self.force_recompute:
             try:
-                with open(self.index_file, "rb") as f:
+                with open(index_file, "rb") as f:
                     embedding_index = pickle.load(f)
-                logger.info(f"已加载嵌入索引，包含 {len(embedding_index)} 条记录")
+                logger.info(f"已加载文件索引 {Path(index_file).name}，包含 {len(embedding_index)} 条记录")
                 return embedding_index
             except Exception as e:
-                logger.error(f"加载索引失败: {e}")
-
-        logger.info("创建新的嵌入索引")
+                logger.error(f"加载索引文件 {Path(index_file).name} 失败: {e}")
+        logger.info(f"为文件 {Path(index_file).stem.replace('_index','')} 创建新的嵌入索引")
         return {}
 
-    def _save_index(self):
-        """保存嵌入索引"""
+    def _save_index(self, embedding_index, index_file):
+        """保存特定文件的索引"""
         try:
-            with open(self.index_file, "wb") as f:
-                pickle.dump(self.embedding_index, f)
-            logger.info(f"已保存嵌入索引，包含 {len(self.embedding_index)} 条记录")
+            with open(index_file, "wb") as f:
+                pickle.dump(embedding_index, f)
+            logger.debug(f"已保存文件索引 {Path(index_file).name}，包含 {len(embedding_index)} 条记录")
         except Exception as e:
-            logger.error(f"保存索引失败: {e}")
+            logger.error(f"保存索引文件 {Path(index_file).name} 失败: {e}")
 
-    def _load_checkpoint(self):
-        """加载检查点信息"""
-        if os.path.exists(self.checkpoint_file):
+    def _load_checkpoint(self, checkpoint_file):
+        """加载特定文件的检查点信息"""
+        if os.path.exists(checkpoint_file):
             try:
-                with open(self.checkpoint_file, "r") as f:
+                with open(checkpoint_file, "r") as f:
                     checkpoint = json.load(f)
-                logger.info(f"已加载检查点: {checkpoint}")
+                processed_count = len(checkpoint.get("processed_sequences", []))
+                logger.info(f"已加载文件检查点 {Path(checkpoint_file).name}: 已处理 {processed_count} 个序列")
                 return checkpoint
             except Exception as e:
-                logger.error(f"加载检查点失败: {e}")
-
+                logger.error(f"加载检查点文件 {Path(checkpoint_file).name} 失败: {e}")
         return {"processed_sequences": []}
 
-    def _save_checkpoint(self, processed_sequences):
-        """保存检查点信息"""
+    def _save_checkpoint(self, processed_sequences, checkpoint_file):
+        """保存特定文件的检查点信息"""
         try:
             checkpoint = {"processed_sequences": processed_sequences}
-            with open(self.checkpoint_file, "w") as f:
+            with open(checkpoint_file, "w") as f:
                 json.dump(checkpoint, f)
+            logger.debug(f"已保存文件检查点 {Path(checkpoint_file).name}")
         except Exception as e:
-            logger.error(f"保存检查点失败: {e}")
+            logger.error(f"保存检查点文件 {Path(checkpoint_file).name} 失败: {e}")
+    # --- Checkpoint 和 Index 相关函数结束 ---
 
-    def _create_seq_hash(self, sequence):
-        """为序列创建哈希值"""
-        return hashlib.md5(sequence.encode()).hexdigest()
-
-    def _extract_sequences(self, data_path):
-        """从数据文件中提取序列信息"""
-        logger.info(f"从 {data_path} 加载数据")
-
-        try:
-            data = torch.load(data_path)
-
-            # 转换为列表格式
-            if not isinstance(data, list):
-                data = [data]
-
-            sequences = []
-            sequence_ids = []
-
-            for idx, item in enumerate(data):
-                if hasattr(item, 'sequence') and isinstance(item.sequence, str):
-                    seq = item.sequence
-                    if seq:  # 确保序列非空
-                        # 获取序列ID
-                        if hasattr(item, 'protein_id'):
-                            seq_id = item.protein_id
-                        else:
-                            seq_id = f"seq_{idx}"
-
-                        sequences.append(seq)
-                        sequence_ids.append(seq_id)
-
-            logger.info(f"成功提取 {len(sequences)} 个序列")
-            return sequences, sequence_ids
-
-        except Exception as e:
-            logger.error(f"数据加载失败: {e}")
-            logger.error(traceback.format_exc())
-            return [], []
-
-    def _partition_sequences(self, sequences, sequence_ids):
-        """根据缓存状态和任务平衡分配序列任务"""
-        # 恢复检查点
-        checkpoint = self._load_checkpoint()
+    def _partition_sequences(self, sequences, sequence_ids, embedding_index, checkpoint_file):
+        """根据缓存状态和任务平衡为单个文件分配序列任务"""
+        checkpoint = self._load_checkpoint(checkpoint_file)
         processed_ids = set(checkpoint.get("processed_sequences", []))
 
-        # 分析哪些序列需要计算
         need_compute = []
-        already_cached = []
+        already_cached_count = 0
 
         for i, (seq_id, seq) in enumerate(zip(sequence_ids, sequences)):
-            # 跳过已处理的序列
-            if seq_id in processed_ids and not self.force_recompute:
-                already_cached.append(i)
-                continue
+            seq_hash = _create_seq_hash(seq)
+            # 检查索引（现在是文件特定的）
+            cache_exists = seq_id in embedding_index # or seq_hash in embedding_index (哈希查找可能不太必要，如果ID唯一)
 
-            # 检查是否已经在全局索引中
-            if seq_id in self.embedding_index and not self.force_recompute:
-                already_cached.append(i)
+            if (seq_id in processed_ids or cache_exists) and not self.force_recompute:
+                already_cached_count += 1
             else:
-                need_compute.append((i, seq_id, seq))
+                need_compute.append((i, seq_id, seq)) # (原始索引, ID, 序列)
 
-        # 更新统计信息
-        self.stats["total"] = len(sequences)
-        self.stats["cached"] = len(already_cached)
+        # 文件级别的统计
+        file_stats = {
+            "total": len(sequences),
+            "cached": already_cached_count,
+            "to_compute": len(need_compute)
+        }
+        logger.info(f"序列分区统计 - 总数: {file_stats['total']}, 已缓存/处理: {file_stats['cached']}, 待计算: {file_stats['to_compute']}")
 
-        # 按序列长度排序，以优化计算效率
+        # 按序列长度排序以提高效率（短序列优先可能减少内存碎片）
         need_compute.sort(key=lambda x: len(x[2]))
 
-        # 负载均衡分配
-        partitions = [[] for _ in range(self.num_gpus)]
+        # 为 GPU 或 CPU 分配任务
+        if self.num_gpus > 0:
+            partitions = [[] for _ in range(self.num_gpus)]
+            seq_lens = [0] * self.num_gpus # 按总长度进行负载均衡
+            for item in need_compute:
+                # 分配给当前总长度最短的 GPU
+                min_gpu_idx = seq_lens.index(min(seq_lens))
+                partitions[min_gpu_idx].append(item)
+                seq_lens[min_gpu_idx] += len(item[2]) # 更新该 GPU 的总长度负载
+            for gpu_idx, partition in enumerate(partitions):
+                 logger.info(f"  GPU {self.gpu_ids[gpu_idx]} 分配到 {len(partition)} 个序列，总长度 {seq_lens[gpu_idx]}")
+        else: # 仅 CPU
+            partitions = [need_compute] # 所有任务都在一个分区
+            logger.info(f"  CPU 分配到 {len(need_compute)} 个序列")
 
-        # 使用贪心算法分配任务，确保各卡负载均衡
-        seq_lens = [0] * self.num_gpus
+        return partitions, list(processed_ids), file_stats # 返回分区、已处理ID列表、文件统计
 
-        for idx, seq_id, seq in need_compute:
-            # 找到当前负载最小的GPU
-            min_gpu = seq_lens.index(min(seq_lens))
-            partitions[min_gpu].append((idx, seq_id, seq))
-            # 更新负载（使用序列长度作为负载指标）
-            seq_lens[min_gpu] += len(seq)
-
-        # 输出分配情况
-        for gpu_id, partition in enumerate(partitions):
-            logger.info(f"GPU {gpu_id} 分配了 {len(partition)} 个序列, "
-                        f"总字符: {sum(len(seq) for _, _, seq in partition)}")
-
-        return partitions, already_cached
-
-    def _init_process(self, rank, partitions, world_size, init_method):
-        """初始化分布式进程"""
-        # 设置当前设备
-        torch.cuda.set_device(rank)
-
-        # 初始化进程组
-        dist.init_process_group(
-            backend='nccl',
-            init_method=init_method,
-            world_size=world_size,
-            rank=rank
-        )
-
-        # 获取当前进程的任务分区
-        partition = partitions[rank]
-
-        # 设置随机种子
-        torch.manual_seed(42 + rank)
-        torch.cuda.manual_seed(42 + rank)
-
+    def _init_process(self, rank_in_comm, partitions, world_size, init_method, temp_dir, input_filename_stem):
+        """初始化分布式计算进程"""
         try:
-            # 加载ESMC模型
-            device = torch.device(f"cuda:{rank}")
-            logger.info(f"进程 {rank} 加载模型到 {device}")
-            esm_model = ESMC.from_pretrained(self.model_name, device=device)
+            gpu_id_to_use = -1 # CPU 默认为 -1
+            # 确定设备
+            if self.num_gpus > 0:
+                gpu_id_to_use = self.gpu_ids[rank_in_comm] # 从提供的列表中获取 GPU ID
+                device = torch.device(f"cuda:{gpu_id_to_use}")
+                torch.cuda.set_device(device)
+                # 初始化分布式进程组
+                dist.init_process_group(
+                    backend='nccl', # NCCL 后端适用于 GPU
+                    init_method=init_method,
+                    world_size=world_size,
+                    rank=rank_in_comm # 使用通信器内的排名
+                )
+                logger.info(f"进程 {rank_in_comm}/{world_size} (全局排名) 初始化在 GPU {gpu_id_to_use} (设备ID)")
+            else:
+                device = torch.device("cpu")
+                logger.info(f"进程 {rank_in_comm}/{world_size} 初始化在 CPU")
 
-            # 处理分配的序列
-            self._process_partition(esm_model, partition, rank, device)
+            # 获取当前进程的任务分区
+            partition = partitions[rank_in_comm]
 
-            # 清理
-            del esm_model
-            torch.cuda.empty_cache()
+            # 设置此进程的随机种子
+            seed = 42 + rank_in_comm
+            torch.manual_seed(seed)
+            if torch.cuda.is_available() and self.num_gpus > 0:
+                torch.cuda.manual_seed(seed)
+
+            # 为此进程加载模型和 Tokenizer
+            logger.info(f"进程 {rank_in_comm}: 从 {self.model_path_or_name} 加载 Tokenizer")
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path_or_name)
+            logger.info(f"进程 {rank_in_comm}: 从 {self.model_path_or_name} 加载模型到 {device}")
+
+            # 决定加载 AutoModel 还是 AutoModelForMaskedLM
+            # 如果只需要嵌入，AutoModel 更轻量。如果需要 logits（虽然这里不需要），用 MaskedLM。
+            # 通常 AutoModel 就足够了。
+            model_class = AutoModel # 默认使用 AutoModel
+            # model_class = AutoModelForMaskedLM # 如果需要 MLM 头相关的输出
+
+            # 使用半精度（float16）可能在兼容的 GPU 上加速推理并减少显存占用
+            model_dtype = torch.float16 if torch.cuda.is_available() and self.num_gpus > 0 else torch.float32
+            model = model_class.from_pretrained(
+                self.model_path_or_name,
+                torch_dtype=model_dtype # 加载时指定数据类型
+            ).to(device)
+            model.eval() # 设置为评估模式，禁用 dropout 等
+
+            logger.info(f"进程 {rank_in_comm}: 模型和 Tokenizer 加载成功")
+
+            # 处理分配到的序列分区
+            # 传递临时目录和文件名用于保存部分结果
+            self._process_partition(model, tokenizer, partition, rank_in_comm, device, temp_dir, input_filename_stem)
+
+            # 清理模型和 Tokenizer 占用的内存
+            del model, tokenizer
+            if torch.cuda.is_available() and self.num_gpus > 0:
+                torch.cuda.empty_cache() # 清空 GPU 缓存
+
+            # 销毁分布式进程组（如果已初始化）
+            if self.num_gpus > 0 and dist.is_initialized():
+                dist.destroy_process_group()
+            logger.info(f"进程 {rank_in_comm} 完成并清理资源")
 
         except Exception as e:
-            logger.error(f"进程 {rank} 遇到错误: {e}")
+            logger.error(f"进程 {rank_in_comm} 遇到严重错误: {e}")
             logger.error(traceback.format_exc())
+            # 确保即使出错也销毁进程组
+            if self.num_gpus > 0 and dist.is_initialized():
+                dist.destroy_process_group()
 
-        # 销毁进程组
-        dist.destroy_process_group()
-
-    def _process_partition(self, esm_model, partition, rank, device):
+    def _process_partition(self, model, tokenizer, partition, rank, device, temp_dir, input_filename_stem):
         """处理分配给当前进程的序列分区"""
         if not partition:
-            logger.info(f"进程 {rank} 没有分配任务，退出")
-            # 创建空的结果文件，以便于后续合并
-            self._save_empty_result(rank)
+            logger.info(f"进程 {rank}: 无序列分配，退出。")
+            self._save_empty_result(rank, temp_dir, input_filename_stem)
             return
 
-        logger.info(f"进程 {rank} 开始处理 {len(partition)} 个序列")
-
-        # 设置进度条
-        pbar = tqdm(total=len(partition), desc=f"GPU {rank}", position=rank)
-
-        # 创建结果集合
+        logger.info(f"进程 {rank}: 开始处理 {len(partition)} 个序列。")
+        # 用于存储此分区结果的字典
         embeddings_dict = {}
+        processed_count_in_partition = 0
 
-        # 批处理缓冲区
-        batch_buffer = []
+        # 是否使用混合精度计算
+        use_amp = torch.cuda.is_available() and self.num_gpus > 0
 
-        # 处理序列
-        for item_idx, (idx, seq_id, seq) in enumerate(partition):
+        # 设置进度条（仅主进程或CPU模式下显示）
+        is_main_process = rank == 0 or self.num_gpus == 0
+        pbar = tqdm(total=len(partition), desc=f"GPU {self.gpu_ids[rank]}" if self.num_gpus > 0 else "CPU", position=rank, disable=not is_main_process)
+
+        # 按批次处理序列
+        for i in range(0, len(partition), self.batch_size):
+            # 获取当前批次的序列和 ID
+            batch_items = partition[i : i + self.batch_size]
+            # batch_indices = [item[0] for item in batch_items] # 原始索引
+            batch_seq_ids = [item[1] for item in batch_items] # 序列 ID
+            batch_sequences = [item[2] for item in batch_items] # 序列本身
+
             try:
-                # 清理序列
-                cleaned_seq = ''.join(aa for aa in seq if aa in self.ESM_AA_MAP)
-                if not cleaned_seq:
-                    cleaned_seq = "A"
+                # 使用 Tokenizer 处理批次
+                inputs = tokenizer(
+                    batch_sequences,
+                    return_tensors="pt", # 返回 PyTorch 张量
+                    padding=True,       # 填充到批次中最长序列
+                    truncation=True,    # 截断超过最大长度的序列
+                    max_length=self.max_length, # 使用实例的最大长度设置
+                ).to(device) # 将输入数据移动到目标设备
 
-                # 长度处理
-                max_length = 1024  # 增加最大长度支持
-                if len(cleaned_seq) > max_length:
-                    cleaned_seq = cleaned_seq[:max_length]
-                    logger.warning(f"序列 {seq_id} 已截断至 {max_length} 个氨基酸")
+                # 计算嵌入和注意力
+                with torch.no_grad(), autocast(enabled=use_amp): # 禁用梯度计算，并启用混合精度（如果可用）
+                    outputs = model(
+                        **inputs,
+                        output_hidden_states=True,  # 确保返回隐藏状态
+                        output_attentions=self.output_attentions # 根据设置决定是否计算注意力
+                    )
 
-                # 编码序列
-                token_ids = [0]  # BOS标记
-                for aa in cleaned_seq:
-                    token_ids.append(self.ESM_AA_MAP.get(aa, self.ESM_AA_MAP['X']))
-                token_ids.append(2)  # EOS标记
+                    # 提取最后一层隐藏状态作为嵌入
+                    # 形状: [batch_size, seq_len, embedding_dim]
+                    last_hidden_states = outputs.last_hidden_state
 
-                # 添加到批处理缓冲区
-                batch_buffer.append((idx, seq_id, cleaned_seq, token_ids))
+                    # 提取注意力图（如果计算了）
+                    attentions = None
+                    last_layer_attentions = None # 用于保存最后一层注意力
+                    if self.output_attentions and outputs.attentions:
+                        # 获取最后一层的注意力图
+                        # 形状: [batch_size, num_heads, seq_len, seq_len]
+                        last_layer_attentions = outputs.attentions[-1]
+                        # 在头部维度上取平均，得到更简洁的注意力表示
+                        # 形状: [batch_size, seq_len, seq_len]
+                        attentions = last_layer_attentions.mean(dim=1)
 
-                # 当缓冲区达到批处理大小或是最后一个序列时进行处理
-                if len(batch_buffer) >= self.batch_size or item_idx == len(partition) - 1:
-                    # 处理批次
-                    batch_results = self._process_batch(esm_model, batch_buffer, device, rank)
+                # --- 结果后处理与保存 ---
+                # 遍历批次中的每个结果
+                for j in range(last_hidden_states.size(0)):
+                    seq_id = batch_seq_ids[j]           # 当前序列的 ID
+                    original_seq = batch_sequences[j]   # 原始序列
 
-                    # 更新结果字典
-                    embeddings_dict.update(batch_results)
+                    # 获取真实的序列长度（去除填充部分）
+                    attention_mask = inputs['attention_mask'][j]
+                    true_len = attention_mask.sum().item()
 
-                    # 清空缓冲区
-                    batch_buffer = []
+                    # 提取每个残基的嵌入（去除 BOS 和 EOS token）
+                    # 索引 0 是 BOS, true_len-1 是 EOS
+                    embedding = last_hidden_states[j, 1:true_len-1, :] # 形状: [真实序列长度, embedding_dim]
 
-                # 每处理100个序列保存一次临时结果
-                if (item_idx + 1) % 100 == 0 or item_idx == len(partition) - 1:
-                    # 保存临时结果
-                    self._save_temp_results(embeddings_dict, rank)
+                    # 提取对应的注意力图（如果计算了）
+                    attention_map = None
+                    if attentions is not None:
+                        # 提取注意力图中对应真实序列的部分（去除 BOS/EOS 行和列）
+                        attention_map = attentions[j, 1:true_len-1, 1:true_len-1] # 形状: [真实序列长度, 真实序列长度]
+
+                    # 将结果移回 CPU 并转换为半精度（float16）以节省存储空间
+                    embedding_cpu = embedding.detach().cpu().half()
+                    attention_cpu = attention_map.detach().cpu().half() if attention_map is not None else None
+
+                    # 准备要保存的数据
+                    result_data = {
+                        "embedding": embedding_cpu,
+                        "sequence": original_seq, # 保存原始序列以供参考
+                        # 如果计算了注意力，则包含它
+                        "attention": attention_cpu,
+                    }
+                    # 如果 attention 是 None，从字典中移除该键
+                    if result_data["attention"] is None:
+                        del result_data["attention"]
+
+                    # 将结果存入字典
+                    embeddings_dict[seq_id] = result_data
+                    processed_count_in_partition += 1
+
+                    # 更新全局统计信息（仅需一次）
+                    if self.stats.get("embedding_dim", 0) == 0 and embedding_cpu is not None:
+                         self.stats["embedding_dim"] = embedding_cpu.shape[-1]
+                    if self.stats.get("attention_layers", 0) == 0 and self.output_attentions and last_layer_attentions is not None:
+                         self.stats["attention_layers"] = len(outputs.attentions) # 总层数
+                         self.stats["attention_heads"] = last_layer_attentions.shape[1] # 头数
+
+                # --- 后处理结束 ---
 
                 # 更新进度条
-                pbar.update(1)
+                if is_main_process:
+                    pbar.update(len(batch_items))
 
             except Exception as e:
-                logger.error(f"进程 {rank} 处理序列 {seq_id} 时出错: {e}")
+                logger.error(f"进程 {rank}: 处理批次（起始索引 {i}）时出错: {e}")
                 logger.error(traceback.format_exc())
+                # 记录失败的序列 ID
+                for item_id in batch_seq_ids:
+                     # 在文件统计中标记失败
+                     self.stats[input_filename_stem]['failed'] += 1
+                     logger.warning(f"进程 {rank}: 失败的序列 ID: {item_id}")
 
         # 关闭进度条
-        pbar.close()
+        if is_main_process:
+            pbar.close()
 
-        # 保存最终结果
-        self._save_temp_results(embeddings_dict, rank)
+        # 保存此分区的最终结果
+        self._save_temp_results(embeddings_dict, rank, temp_dir, input_filename_stem)
+        # 更新文件统计中的计算数量
+        self.stats[input_filename_stem]['computed'] += processed_count_in_partition
+        logger.info(f"进程 {rank}: 处理完成。计算了 {processed_count_in_partition} 个嵌入。")
 
-        # 记录处理的序列ID
-        completed_ids = list(embeddings_dict.keys())
-        logger.info(f"进程 {rank} 完成计算，处理了 {len(completed_ids)} 个序列")
 
-    def _save_empty_result(self, rank):
-        """保存空的临时结果文件"""
-        temp_file = os.path.join(self.temp_dir, f"embeddings_part_{rank}.pt")
-        torch.save({}, temp_file)
-        logger.info(f"进程 {rank} 保存了空的结果文件")
+    def _save_empty_result(self, rank, temp_dir, input_filename_stem):
+        """为当前文件保存一个空的临时结果文件"""
+        temp_file = os.path.join(temp_dir, f"{input_filename_stem}_part_{rank}.pt")
+        try:
+            torch.save({}, temp_file) # 保存空字典
+            logger.debug(f"进程 {rank}: 为文件 {input_filename_stem} 保存了空结果文件。")
+        except Exception as e:
+            logger.error(f"进程 {rank}: 保存空结果文件 {Path(temp_file).name} 失败: {e}")
 
-    def _save_temp_results(self, embeddings_dict, rank):
-        """保存临时结果到文件"""
+    def _save_temp_results(self, embeddings_dict, rank, temp_dir, input_filename_stem):
+        """将临时结果保存到特定于文件和进程的文件中"""
         if not embeddings_dict:
-            self._save_empty_result(rank)
+            self._save_empty_result(rank, temp_dir, input_filename_stem)
             return
 
-        temp_file = os.path.join(self.temp_dir, f"embeddings_part_{rank}.pt")
+        # 文件名包含输入文件名和进程排名
+        temp_file = os.path.join(temp_dir, f"{input_filename_stem}_part_{rank}.pt")
         try:
-            torch.save(embeddings_dict, temp_file)
-            logger.info(f"进程 {rank} 保存临时结果，包含 {len(embeddings_dict)} 条记录")
+            # 使用 pickle 最高协议可能提高效率
+            torch.save(embeddings_dict, temp_file, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"进程 {rank}: 为文件 {input_filename_stem} 保存了 {len(embeddings_dict)} 条临时结果到 {Path(temp_file).name}")
         except Exception as e:
-            logger.error(f"保存临时结果失败: {e}")
+            logger.error(f"进程 {rank}: 保存临时结果文件 {Path(temp_file).name} 失败: {e}")
             logger.error(traceback.format_exc())
 
-    def _safe_compute_embeddings(self, esm_model, protein_tensor, config):
-        """安全计算ESMC嵌入，处理维度不匹配问题"""
-        try:
-            # 尝试直接计算
-            return esm_model.logits(protein_tensor, config)
-        except Exception as e:
-            error_msg = str(e)
-
-            # 处理维度错误
-            if "Wrong shape: expected 3 dims" in error_msg and "Received 4-dim tensor" in error_msg:
-                # 修复序列维度
-                sequence = protein_tensor.sequence
-
-                if sequence.dim() == 4:
-                    # [b, 1, s, d] -> [b, s, d]
-                    if sequence.shape[1] == 1:
-                        fixed_sequence = sequence.squeeze(1)
-                    else:
-                        # 对于其他形状，尝试更通用的方法
-                        b = sequence.shape[0]
-                        s = sequence.shape[2]
-                        fixed_sequence = sequence.reshape(b, s, -1)
-
-                    # 创建新的蛋白质张量
-                    fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
-                    logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
-
-                    # 重试
-                    return esm_model.logits(fixed_tensor, config)
-
-                # 处理其他维度问题
-                if sequence.dim() == 3:
-                    b, s, d = sequence.shape
-                    if s == 1:
-                        # [b, 1, d] -> [b, d]
-                        fixed_sequence = sequence.squeeze(1)
-                        fixed_tensor = ESMProteinTensor(sequence=fixed_sequence)
-                        logger.info(f"修复维度形状: {sequence.shape} -> {fixed_sequence.shape}")
-                        return esm_model.logits(fixed_tensor, config)
-
-            # 无法处理的错误，重新抛出
-            raise
-
-    def _process_batch(self, esm_model, batch_buffer, device, rank):
-        """处理序列批次，返回结果字典"""
-        batch_results = {}
-
-        for idx, seq_id, seq, token_ids in batch_buffer:
-            try:
-                # 转换为张量
-                token_tensor = torch.tensor(token_ids, device=device)
-                protein_tensor = ESMProteinTensor(sequence=token_tensor)
-
-                # 计算嵌入
-                with torch.no_grad():
-                    try:
-                        # 使用安全计算方法
-                        logits_output = self._safe_compute_embeddings(
-                            esm_model,
-                            protein_tensor,
-                            LogitsConfig(sequence=True, return_embeddings=True)
-                        )
-
-                        # 提取嵌入
-                        embedding = logits_output.embeddings
-
-                        # 处理四维输出
-                        if embedding.dim() == 4:
-                            if embedding.shape[0] == 1 and embedding.shape[1] == 1:
-                                embedding = embedding.squeeze(1)
-                            else:
-                                b, extra, s, d = embedding.shape
-                                embedding = embedding.reshape(b, s, d)
-
-                        # 提取注意力（如果有）
-                        attention = None
-                        if hasattr(logits_output, 'attentions'):
-                            try:
-                                # 处理多头注意力
-                                attn_data = logits_output.attentions
-                                if attn_data.dim() == 4:  # [batch, heads, seq_len, seq_len]
-                                    cls_attention = attn_data.mean(dim=1)[:, 0, 1:-1]
-                                    attention = F.softmax(cls_attention, dim=-1).unsqueeze(-1)
-                            except Exception as attn_err:
-                                logger.warning(f"进程 {rank} 提取序列 {seq_id} 的注意力失败: {attn_err}")
-
-                        # 获取嵌入维度，用于统计信息
-                        if self.stats["embedding_dim"] == 0 and embedding is not None:
-                            if embedding.dim() > 2:  # 处理多维张量
-                                self.stats["embedding_dim"] = embedding.size(-1)
-                            else:
-                                self.stats["embedding_dim"] = embedding.size(-1)
-
-                        # 创建结果对象 - 转为半精度以节省空间
-                        if embedding is not None:
-                            # 统一张量到CPU并转换为半精度
-                            embedding_data = {
-                                "embedding": embedding.cpu().half(),  # 半精度存储
-                                "attention": attention.cpu().half() if attention is not None else None,
-                                "sequence": seq,
-                            }
-
-                            # 添加到批次结果
-                            batch_results[seq_id] = embedding_data
-
-                    except Exception as inner_e:
-                        logger.error(f"进程 {rank} 处理序列 {seq_id} 计算嵌入失败: {inner_e}")
-                        logger.error(traceback.format_exc())
-
-            except Exception as e:
-                logger.error(f"进程 {rank} 处理序列 {seq_id} 时出错: {e}")
-                logger.error(traceback.format_exc())
-
-        return batch_results
-
-    def _merge_embeddings(self):
-        """合并所有临时嵌入文件到单一大文件"""
-        logger.info("开始合并嵌入结果...")
-
-        # 收集所有临时文件
-        temp_files = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir)
-                      if f.startswith("embeddings_part_") and f.endswith(".pt")]
+    def _merge_embeddings_for_file(self, input_filename_stem, temp_dir, final_output_path, embedding_index, index_file):
+        """合并特定输入文件的所有临时嵌入文件到最终输出文件"""
+        logger.info(f"开始合并文件 {input_filename_stem} 的嵌入结果...")
+        # 查找属于此文件的所有临时部分文件
+        temp_files = sorted([
+            os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+            if f.startswith(f"{input_filename_stem}_part_") and f.endswith(".pt")
+        ])
 
         if not temp_files:
-            logger.warning("没有找到临时嵌入文件，无法合并")
+            logger.warning(f"未找到文件 {input_filename_stem} 的临时嵌入文件，无法合并。")
             return False
 
-        # 合并结果
-        merged_embeddings = {}
-        total_count = 0
+        merged_embeddings = {} # 用于存储合并后的嵌入
+        total_loaded_count = 0
+        failed_files = [] # 记录合并失败的文件
 
-        # 逐个加载临时文件并合并
-        for temp_file in temp_files:
+        # 遍历并加载每个临时文件
+        for temp_file in tqdm(temp_files, desc=f"合并 {input_filename_stem}"):
             try:
-                part_embeddings = torch.load(temp_file)
-                part_count = len(part_embeddings)
-
-                if part_count > 0:
-                    # 更新索引和合并结果
-                    merged_embeddings.update(part_embeddings)
-                    total_count += part_count
-
-                    logger.info(f"合并 {temp_file}, 添加了 {part_count} 条记录")
-
-                # 删除临时文件以节省空间
-                os.remove(temp_file)
-
+                # 从 CPU 加载，避免 GPU 内存问题
+                part_embeddings = torch.load(temp_file, map_location='cpu')
+                if isinstance(part_embeddings, dict):
+                    merged_embeddings.update(part_embeddings) # 合并字典
+                    total_loaded_count += len(part_embeddings)
+                    # 合并成功后删除临时文件
+                    try:
+                        os.remove(temp_file)
+                    except OSError as e:
+                        logger.warning(f"无法删除临时文件 {temp_file}: {e}")
+                else:
+                    logger.warning(f"跳过无效的临时文件（非字典格式）: {temp_file}")
+                    failed_files.append(temp_file)
             except Exception as e:
-                logger.error(f"合并 {temp_file} 失败: {e}")
+                logger.error(f"加载或合并文件 {temp_file} 失败: {e}. 跳过。")
+                failed_files.append(temp_file)
+
+        # 如果有合并失败的文件，发出警告
+        if failed_files:
+            logger.warning(f"合并文件 {input_filename_stem} 时，{len(failed_files)} 个临时文件处理失败。")
+            logger.warning(f"失败的文件列表: {failed_files}")
+
+        # 如果合并后的结果非空，则保存
+        if merged_embeddings:
+            try:
+                # 保存最终的 .pt 文件
+                torch.save(merged_embeddings, final_output_path, pickle_protocol=pickle.HIGHEST_PROTOCOL, _use_new_zipfile_serialization=True)
+                logger.info(f"成功合并 {len(merged_embeddings)} 条嵌入记录到: {final_output_path}")
+
+                # 更新文件索引（指向最终合并的文件）
+                output_filename = Path(final_output_path).name
+                for seq_id, data in merged_embeddings.items():
+                     embedding_index[seq_id] = {
+                         "hash": _create_seq_hash(data.get("sequence", "")),
+                         "sequence": data.get("sequence", ""),
+                         "file": output_filename, # 指向合并后的文件名
+                         "timestamp": time.time()
+                     }
+                self._save_index(embedding_index, index_file) # 保存更新后的索引
+
+                return True
+            except Exception as e:
+                logger.error(f"保存最终合并文件 {final_output_path} 失败: {e}")
                 logger.error(traceback.format_exc())
-
-        # 保存合并结果
-        if total_count > 0:
-            if self.format == "pt":
-                self._save_pt_format(merged_embeddings)
-            elif self.format == "hdf5":
-                self._save_hdf5_format(merged_embeddings)
-
-            logger.info(f"成功合并 {total_count} 条嵌入记录到: {self.merged_file}")
-            return True
+                return False
         else:
-            logger.warning("没有有效的嵌入记录，合并操作取消")
+            logger.error(f"文件 {input_filename_stem} 没有有效的嵌入记录可合并。")
             return False
 
-    def _save_pt_format(self, merged_embeddings):
-        """保存为PyTorch (.pt) 格式"""
-        try:
-            # 可选：压缩大型文件
-            torch.save(merged_embeddings, self.merged_file, _use_new_zipfile_serialization=True)
-            logger.info(f"保存合并嵌入为PyTorch格式: {self.merged_file}")
+    def compute_embeddings_for_file(self, input_file_path):
+        """为单个输入文件计算嵌入"""
+        input_filename_stem = Path(input_file_path).stem # 获取文件名（不含扩展名）
+        logger.info(f"===== 开始处理文件: {input_filename_stem} =====")
 
-            # 创建元数据文件
-            metadata = {
-                "format": "pytorch",
-                "num_embeddings": len(merged_embeddings),
-                "embedding_dim": self.stats["embedding_dim"],
-                "model_name": self.model_name,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "sequence_ids": list(merged_embeddings.keys())
-            }
+        # 初始化此文件的统计信息
+        self.stats[input_filename_stem] = {
+            "total": 0, "computed": 0, "cached": 0, "failed": 0,
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
-            metadata_file = os.path.join(self.cache_dir, f"{self.output_file}.meta.json")
-            with open(metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
+        # 获取文件特定的路径
+        index_file, checkpoint_file, temp_dir = self._get_file_specific_paths(input_filename_stem)
 
-        except Exception as e:
-            logger.error(f"保存PyTorch格式失败: {e}")
-            logger.error(traceback.format_exc())
-
-    def _save_hdf5_format(self, merged_embeddings):
-        """保存为HDF5格式"""
-        try:
-            with h5py.File(self.merged_file, 'w') as h5f:
-                # 创建元数据组
-                meta_group = h5f.create_group('metadata')
-                meta_group.attrs['model_name'] = self.model_name
-                meta_group.attrs['embedding_dim'] = self.stats["embedding_dim"]
-                meta_group.attrs['num_sequences'] = len(merged_embeddings)
-                meta_group.attrs['created_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                # 创建序列ID数据集
-                seq_ids = list(merged_embeddings.keys())
-                meta_group.create_dataset('sequence_ids', data=np.array(seq_ids, dtype=h5py.string_dtype()))
-
-                # 创建嵌入组
-                emb_group = h5f.create_group('embeddings')
-
-                # 存储每个序列的嵌入
-                for seq_id, data in tqdm(merged_embeddings.items(), desc="保存HDF5"):
-                    seq_group = emb_group.create_group(seq_id)
-
-                    # 存储嵌入张量
-                    if 'embedding' in data and data['embedding'] is not None:
-                        seq_group.create_dataset('embedding', data=data['embedding'].numpy())
-
-                    # 存储注意力（如果有）
-                    if 'attention' in data and data['attention'] is not None:
-                        seq_group.create_dataset('attention', data=data['attention'].numpy())
-
-                    # 存储序列
-                    if 'sequence' in data:
-                        seq_group.attrs['sequence'] = data['sequence']
-
-            logger.info(f"保存合并嵌入为HDF5格式: {self.merged_file}")
-
-        except Exception as e:
-            logger.error(f"保存HDF5格式失败: {e}")
-            logger.error(traceback.format_exc())
-
-    def compute_embeddings(self, data_path):
-        """计算并缓存嵌入"""
-        # 记录开始时间
-        self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 加载此文件的索引
+        embedding_index = self._load_or_create_index(index_file)
 
         # 提取序列
-        sequences, sequence_ids = self._extract_sequences(data_path)
+        sequences, sequence_ids = _extract_sequences(input_file_path)
         if not sequences:
-            logger.error("未提取到有效序列，退出")
+            logger.error(f"文件 {input_filename_stem} 未提取到有效序列，跳过。")
+            self.stats[input_filename_stem]['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return
 
         # 分配任务
-        partitions, already_cached = self._partition_sequences(sequences, sequence_ids)
+        partitions, processed_ids, file_stats = self._partition_sequences(sequences, sequence_ids, embedding_index, checkpoint_file)
+        self.stats[input_filename_stem].update(file_stats) # 更新统计
 
-        # 记录已经缓存的序列
-        self.stats["cached"] = len(already_cached)
-        logger.info(f"跳过 {len(already_cached)} 个已缓存序列")
-
-        # 检查是否有需要计算的序列
-        total_to_compute = sum(len(p) for p in partitions)
-        if total_to_compute == 0:
-            logger.info("所有序列已经计算并缓存，无需进一步计算")
+        total_to_compute = file_stats['to_compute']
+        if total_to_compute == 0 and not self.force_recompute:
+            logger.info(f"文件 {input_filename_stem} 的所有序列已处理或缓存，跳过计算。")
+            self.stats[input_filename_stem]['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return
 
-        logger.info(f"需要计算 {total_to_compute} 个序列，使用 {self.num_gpus} 个GPU")
+        logger.info(f"文件 {input_filename_stem}: 需要计算 {total_to_compute} 个序列。")
 
-        # 设置分布式环境
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = str(self.master_port)
+        # 设置分布式环境或在 CPU 上运行
+        if self.num_gpus > 0:
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = str(self.master_port)
+            world_size = self.num_gpus
+            init_method = f"tcp://localhost:{self.master_port}"
+            processes = []
+            try:
+                # 尝试设置 'spawn' 启动方法，这在某些系统上更稳定
+                mp.set_start_method('spawn', force=True)
+                logger.info("设置多进程启动方法为 'spawn'")
+            except RuntimeError:
+                logger.warning("无法设置多进程启动方法为 'spawn'，继续使用默认方法。")
+                pass # 如果设置失败，继续使用默认方法
 
-        # 初始化进程
-        world_size = self.num_gpus
-        init_method = f"tcp://localhost:{self.master_port}"
+            try:
+                logger.info(f"为文件 {input_filename_stem} 启动 {world_size} 个 GPU 进程...")
+                # 启动进程，传递特定于文件的临时目录和文件名
+                for rank_in_comm in range(world_size):
+                    p = Process(target=self._init_process, args=(rank_in_comm, partitions, world_size, init_method, temp_dir, input_filename_stem))
+                    p.start()
+                    processes.append(p)
 
-        # 启动多进程
-        processes = []
-        try:
-            mp.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass
+                # 等待所有进程完成
+                for p in processes:
+                    p.join()
+                logger.info(f"文件 {input_filename_stem} 的所有 GPU 进程已完成。")
 
-        try:
-            for rank in range(world_size):
-                p = Process(
-                    target=self._init_process,
-                    args=(rank, partitions, world_size, init_method)
-                )
-                p.start()
-                processes.append(p)
+            except Exception as e:
+                logger.error(f"文件 {input_filename_stem} 的多进程执行失败: {e}")
+                logger.error(traceback.format_exc())
+                # 终止仍在运行的进程
+                for p in processes:
+                    if p.is_alive():
+                        p.terminate()
+                        p.join()
+        else: # CPU 计算
+            logger.info(f"在 CPU 上计算文件 {input_filename_stem} 的嵌入...")
+            # 在主进程中直接运行
+            self._init_process(0, partitions, 1, None, temp_dir, input_filename_stem) # rank=0, world_size=1
+            logger.info(f"文件 {input_filename_stem} 的 CPU 计算完成。")
 
-            # 等待所有进程完成
-            for p in processes:
-                p.join()
-        except Exception as e:
-            logger.error(f"多进程执行失败: {e}")
-            logger.error(traceback.format_exc())
+        # --- 合并结果 ---
+        # 定义最终输出文件路径
+        final_output_path = os.path.join(self.output_dir, f"{input_filename_stem}_embedding.pt")
+        # 合并此文件的临时结果
+        merge_success = self._merge_embeddings_for_file(input_filename_stem, temp_dir, final_output_path, embedding_index, index_file)
 
-        # 合并嵌入结果
-        success = self._merge_embeddings()
+        # 更新统计信息
+        if merge_success:
+             # 从合并后的文件读取实际计算的数量
+             try:
+                  merged_data = torch.load(final_output_path, map_location='cpu')
+                  actual_computed = len(merged_data)
+                  self.stats[input_filename_stem]['computed'] = actual_computed - file_stats['cached']
+                  self.stats[input_filename_stem]['failed'] = file_stats['total'] - actual_computed
+             except Exception as e:
+                  logger.warning(f"读取合并文件 {final_output_path} 以更新统计信息失败: {e}")
+                  self.stats[input_filename_stem]['failed'] = file_stats['to_compute'] - self.stats[input_filename_stem]['computed'] # 估算失败数
+
+        else:
+            self.stats[input_filename_stem]['failed'] = file_stats['to_compute'] # 如果合并失败，认为所有待计算的都失败了
+            self.stats[input_filename_stem]['computed'] = 0
+
+        # 保存此文件的检查点（标记所有已处理的ID）
+        # 首先，获取本次计算中新处理的所有 ID
+        newly_processed_ids_set = set(id for _, id, _ in sum(partitions, []))
+        # 然后，将从检查点加载的 processed_ids (确保是集合类型) 与新处理的 ID 集合合并
+        current_processed_ids_set = set(processed_ids).union(newly_processed_ids_set) # 确保 processed_ids 是集合
+        # 最后，转换回列表以保存到 JSON
+        self._save_checkpoint(list(current_processed_ids_set), checkpoint_file)
 
         # 记录结束时间
-        self.stats["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.stats[input_filename_stem]['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"===== 完成文件: {input_filename_stem} =====")
+        logger.info(f"  统计: {self.stats[input_filename_stem]}")
+        logger.info(f"  输出文件: {final_output_path if merge_success else '失败'}")
+        logger.info(f"==========================================")
 
-        # 计算统计信息
-        if success:
-            self.stats["computed"] = total_to_compute
-            self.stats["failed"] = 0  # 实际失败数无法精确计算
-        else:
-            self.stats["computed"] = 0
-            self.stats["failed"] = total_to_compute
+    def save_global_stats(self):
+        """保存所有文件的全局统计信息"""
+        global_stats_file = os.path.join(self.output_dir, "precompute_summary_stats.json")
+        # 添加全局汇总信息
+        total_processed = sum(s['total'] for s in self.stats.values())
+        total_computed = sum(s['computed'] for s in self.stats.values())
+        total_cached = sum(s['cached'] for s in self.stats.values())
+        total_failed = sum(s['failed'] for s in self.stats.values())
 
-        # 输出统计信息
-        logger.info(f"嵌入计算完成: ")
-        logger.info(f"- 总序列数: {self.stats['total']}")
-        logger.info(f"- 已缓存: {self.stats['cached']}")
-        logger.info(f"- 新计算: {self.stats['computed']}")
-        logger.info(f"- 计算失败: {self.stats['failed']}")
-        logger.info(f"- 开始时间: {self.stats['start_time']}")
-        logger.info(f"- 结束时间: {self.stats['end_time']}")
-        logger.info(f"- 嵌入维度: {self.stats['embedding_dim']}")
+        summary_data = {
+             "global_summary": {
+                 "total_sequences_processed": total_processed,
+                 "total_embeddings_computed": total_computed,
+                 "total_from_cache": total_cached,
+                 "total_failed": total_failed,
+                 "embedding_dim": self.stats.get("embedding_dim", 0), # 从第一个文件的统计中获取
+                 "attention_layers": self.stats.get("attention_layers", 0),
+                 "attention_heads": self.stats.get("attention_heads", 0),
+                 "model_name": self.model_path_or_name,
+                 "completion_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+             },
+             "file_details": self.stats # 包含每个文件的详细统计
+        }
 
-        # 保存统计信息
-        stats_file = os.path.join(self.cache_dir, f"{self.output_file}_stats.json")
-        with open(stats_file, "w") as f:
-            json.dump(self.stats, f, indent=2)
+        try:
+            with open(global_stats_file, "w") as f:
+                json.dump(summary_data, f, indent=2)
+            logger.info(f"全局统计信息已保存到: {global_stats_file}")
+        except Exception as e:
+            logger.error(f"保存全局统计信息失败: {e}")
 
 
 def parse_arguments():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="ESMC嵌入分布式预计算工具")
-    parser.add_argument("--data", type=str, required=True, help="数据集路径")
-    parser.add_argument("--model", type=str, default="esmc_600m", help="ESMC模型名称")
-    parser.add_argument("--cache-dir", type=str, default="data/esm_embeddings", help="嵌入缓存目录")
-    parser.add_argument("--output", type=str, default=None, help="输出文件名(不含扩展名)")
-    parser.add_argument("--format", type=str, choices=["pt", "hdf5"], default="pt", help="输出文件格式")
-    parser.add_argument("--num-gpus", type=int, default=3, help="使用GPU数量")
-    parser.add_argument("--batch-size", type=int, default=16, help="每个GPU的批处理大小")
-    parser.add_argument("--force", action="store_true", help="强制重新计算所有嵌入")
-    parser.add_argument("--port", type=int, default=29500, help="分布式通信端口")
+    parser = argparse.ArgumentParser(description="ESM-2 嵌入分布式预计算工具 (Transformers 版本, 中文注释)")
+    parser.add_argument("--data-dir", type=str, default="data", help="包含 train.pt, val.pt, test.pt 的数据目录")
+    parser.add_argument("--output-dir", type=str, default="data", help="保存 *_embedding.pt 文件的输出目录 (默认与 --data-dir 相同)")
+    parser.add_argument("--model-path", type=str, default="/home/fyh0106/project/encoder/data/esm2/", help="本地 ESM-2 模型目录路径")
+    parser.add_argument("--gpu-ids", type=str, default="1,2,3", help="要使用的 GPU 设备 ID 列表，用逗号分隔 (例如 '0,1,2')。留空则使用所有可用 GPU。")
+    parser.add_argument("--batch-size", type=int, default=256, help="每个 GPU (或 CPU 进程) 的批处理大小")
+    parser.add_argument("--max-length", type=int, default=1022, help="Tokenizer 处理的最大序列长度 (不含特殊 token)")
+    parser.add_argument("--force", action="store_true", help="强制重新计算所有嵌入，忽略缓存和检查点")
+    parser.add_argument("--port", type=int, default=29501, help="分布式通信的主端口")
+    parser.add_argument("--no-attentions", action="store_true", help="禁用计算和保存注意力图 (默认为保存)")
     return parser.parse_args()
 
-
 def main():
-    """主函数"""
-    # 解析参数
+    """主执行函数"""
     args = parse_arguments()
 
-    # 设置输出文件名为数据集名称（如果未指定）
-    if args.output is None:
-        data_name = os.path.basename(args.data).split(".")[0]
-        args.output = f"{data_name}_embeddings"
+    # --- GPU ID 处理 ---
+    gpu_ids_to_use = []
+    if args.gpu_ids:
+        try:
+            gpu_ids_to_use = [int(gid.strip()) for gid in args.gpu_ids.split(',')]
+            available_gpus = list(range(torch.cuda.device_count()))
+            # 过滤掉无效或不存在的 GPU ID
+            valid_gpu_ids = [gid for gid in gpu_ids_to_use if gid in available_gpus]
+            if len(valid_gpu_ids) != len(gpu_ids_to_use):
+                logger.warning(f"提供的 GPU IDs: {gpu_ids_to_use} 包含无效 ID。仅使用有效的: {valid_gpu_ids}")
+            gpu_ids_to_use = valid_gpu_ids
+            if not gpu_ids_to_use:
+                logger.warning("未指定有效的 GPU ID，将在 CPU 上运行。")
+        except ValueError:
+            logger.error(f"无效的 GPU ID 格式: '{args.gpu_ids}'。请使用逗号分隔的整数。将在 CPU 上运行。")
+            gpu_ids_to_use = []
+    elif torch.cuda.is_available():
+        # 如果未指定，则默认使用所有可用 GPU
+        gpu_ids_to_use = list(range(torch.cuda.device_count()))
+        if not gpu_ids_to_use:
+             logger.warning("未检测到 CUDA 设备，将在 CPU 上运行。")
+    else:
+         logger.warning("CUDA 不可用，将在 CPU 上运行。")
 
-    # 设置根据数据集名称的缓存子目录
-    data_name = os.path.basename(args.data).split(".")[0]
-    cache_subdir = os.path.join(args.cache_dir, data_name)
+    num_gpus = len(gpu_ids_to_use)
+    # --- GPU ID 处理结束 ---
 
-    # 检查GPU可用性
-    available_gpus = torch.cuda.device_count()
-    if available_gpus < args.num_gpus:
-        logger.warning(f"请求 {args.num_gpus} 个GPU，但只有 {available_gpus} 个可用")
-        args.num_gpus = available_gpus
+    logger.info(f"--- ESM-2 嵌入预计算 (中文注释版) ---")
+    logger.info(f"数据目录: {args.data_dir}")
+    logger.info(f"输出目录: {args.output_dir}")
+    logger.info(f"模型路径: {args.model_path}")
+    logger.info(f"使用的 GPU IDs: {gpu_ids_to_use if num_gpus > 0 else 'CPU'}")
+    logger.info(f"每个设备的批大小: {args.batch_size}")
+    logger.info(f"最大序列长度: {args.max_length}")
+    logger.info(f"输出注意力图: {not args.no_attentions}")
+    logger.info(f"强制重新计算: {args.force}")
+    logger.info(f"主端口: {args.port}")
+    logger.info(f"------------------------------------")
 
-    if args.num_gpus == 0:
-        logger.error("没有可用的GPU，退出")
-        return
+    # 确保输出目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    logger.info(f"使用 {args.num_gpus} 个GPU: {[i for i in range(args.num_gpus)]}")
-
-    # 创建分布式计算器
-    computer = DistributedEmbeddingComputer(
-        model_name=args.model,
-        cache_dir=cache_subdir,
-        output_file=args.output,
-        num_gpus=args.num_gpus,
+    # 初始化分布式计算器
+    computer = DistributedESM2Computer(
+        model_path_or_name=args.model_path,
+        output_dir=args.output_dir, # 输出目录
+        gpu_ids=gpu_ids_to_use,     # 使用解析后的 GPU ID 列表
         batch_size=args.batch_size,
+        max_length=args.max_length,
         force_recompute=args.force,
         master_port=args.port,
-        format=args.format
+        output_attentions=not args.no_attentions
     )
 
-    # 计算嵌入
-    computer.compute_embeddings(args.data)
+    # 查找要处理的文件
+    input_files = []
+    for filename in ["train_data.pt", "val_data.pt", "test_data.pt"]:
+        filepath = os.path.join(args.data_dir, filename)
+        if os.path.exists(filepath):
+            input_files.append(filepath)
+        else:
+            logger.warning(f"输入文件未找到，将跳过: {filepath}")
 
+    if not input_files:
+        logger.error("在数据目录中未找到任何 train_data.pt, val_data.pt, test_data.pt 文件。退出。")
+        return
+
+    # 依次处理每个文件
+    global_start_time = time.time()
+    for input_file in input_files:
+        computer.compute_embeddings_for_file(input_file)
+
+    # 保存全局统计信息
+    computer.save_global_stats()
+    global_end_time = time.time()
+    logger.info(f"所有文件处理完成，总耗时: {global_end_time - global_start_time:.2f} 秒")
+    logger.info("预计算脚本执行完毕。")
 
 if __name__ == "__main__":
+    # 增加对 Windows 平台的兼容性检查
+    if os.name == 'nt':
+         # 在 Windows 上，需要将多进程代码放在 if __name__ == "__main__": 块内
+         # 并且可能需要调整启动方法或使用其他策略
+         logger.warning("检测到 Windows 平台，多进程行为可能与 Linux 不同。建议在 Linux 环境运行以获得最佳性能和稳定性。")
+         # Windows 可能不支持 'spawn' 之外的启动方法
+         try:
+             mp.set_start_method('spawn', force=True)
+         except RuntimeError:
+             logger.warning("设置 'spawn' 启动方法失败。")
+
     main()
