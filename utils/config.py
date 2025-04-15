@@ -16,8 +16,6 @@ import os
 import torch
 from datetime import datetime
 
-from sympy import false
-
 
 class Config:
     """配置类，包含所有训练和模型参数"""
@@ -41,7 +39,7 @@ class Config:
     DEVICE = torch.device(f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() and NUM_GPUS > 0 else "cpu")
 
     SEED = 42
-    NUM_WORKERS = 8  # 每个GPU的数据加载器工作进程数
+    NUM_WORKERS = 32  # 每个GPU的数据加载器工作进程数
 
     # =============== 路径配置 ===============
     # 使用实际项目根目录
@@ -58,12 +56,18 @@ class Config:
         os.makedirs(directory, exist_ok=True)
 
     # =============== 数据配置 ===============
+    # --- 预计算嵌入配置 ---
+    USE_PRECOMPUTED_EMBEDDINGS = True  # 是否使用预计算嵌入，必须为True以启用预计算嵌入管理器
+    FALLBACK_TO_COMPUTE = False  # 不启用回退机制，完全依赖预计算嵌入
+    PRECOMPUTED_FORMAT = "pt"  # 预计算嵌入格式，'pt', 'hdf5'或'auto'(自动检测)
+    PRECOMPUTED_EMBEDDINGS_PATH = "/home/20T-1/fyh0106/kg/embeddings/"  # 预计算嵌入文件路径，支持{dataset_name}占位符
+
     # 数据处理参数
     MAX_SEQ_LENGTH = 512
     PLDDT_THRESHOLD = 70.0  # AlphaFold质量阈值
     SAMPLES_PER_LENGTH = 10000  # 每个长度取样本数量
     TRAIN_VAL_TEST_SPLIT = [0.7, 0.2, 0.1]  # 训练:验证:测试比例
-    USE_SUBSET = False
+    USE_SUBSET = True
     SUBSET_RATIO = 0.1
 
     # 训练数据缓存文件
@@ -112,19 +116,15 @@ class Config:
         "direction": slice(6, 8)  # 方向向量：2维
     }
 
-    # =============== ESM配置 ===============
-    ESM_MODEL_PATH = "/home/fyh0106/project/encoder/esm/esmc_600m_2024_12_v0.pth"
-    ESM_MODEL_NAME = "esmc_600m"
-    ESM_EMBEDDING_DIM = 1152
-    USE_ESM_ATTENTION = True
-    ESM_ATTENTION_LAYER = -1  # 使用最后一层的注意力
-
     # 分布式ESM设置
-    ESM_SHARDED = True  # 是否在多个GPU上分片ESM模型
+    ESM_SHARDED = False  # 是否在多个GPU上分片ESM模型（未使用）
+    # ESM_MODEL_NAME = "esm2_t36_3B_UR50D"  # ESM模型名称，已移除，因为不使用实时计算
+    ESM_EMBEDDING_DIM = 2560  # ESM模型嵌入维度，保留以确保模型架构兼容
+    ESM_GUIDANCE = True  # 不启用ESM注意力引导机制，因为不使用ESM模型
 
     # =============== 图模型配置 ===============
-    HIDDEN_DIM = 1152
-    OUTPUT_DIM = 1152  # 最终图表示维度
+    HIDDEN_DIM = 512
+    OUTPUT_DIM = 512  # 最终图表示维度
     NUM_LAYERS = 3  # GAT层数
     NUM_HEADS = 16  # 注意力头数
     DROPOUT = 0.2
@@ -133,11 +133,10 @@ class Config:
     USE_POS_ENCODING = True  # 相对位置编码
     USE_HETEROGENEOUS_EDGES = True  # 异质边处理
     USE_EDGE_PRUNING = True  # 动态边修剪
-    ESM_GUIDANCE = True  # ESM注意力引导
 
     # =============== 融合模块配置 ===============
-    FUSION_HIDDEN_DIM = 1152
-    FUSION_OUTPUT_DIM = 1152
+    FUSION_HIDDEN_DIM = 512
+    FUSION_OUTPUT_DIM = 512
     FUSION_NUM_HEADS = 16
     FUSION_NUM_LAYERS = 3
     FUSION_DROPOUT = 0.1
@@ -163,9 +162,11 @@ class Config:
     # 添加setter方法允许外部设置批处理大小
     @BATCH_SIZE.setter
     def BATCH_SIZE(self, value):
+        if value <= 0:
+            raise ValueError(f"批处理大小必须为正整数，当前值: {value}")
         self._batch_size = value
 
-    EVAL_BATCH_SIZE = 64  # 验证和测试时的批次大小
+    EVAL_BATCH_SIZE = 256  # 验证和测试时的批次大小
     ACCUMULATION_STEPS = 1  # 梯度累积步数，可进一步增大有效批次大小
 
     # 优化器配置
@@ -180,7 +181,7 @@ class Config:
     FP16_TRAINING = True  # 是否使用混合精度训练
     SYNC_BN = True  # 是否使用跨GPU同步BatchNorm
 
-    EARLY_STOPPING_PATIENCE = 10
+    EARLY_STOPPING_PATIENCE = 3
 
     # 对比学习参数
     TEMPERATURE = 0.07
@@ -190,6 +191,9 @@ class Config:
     GRAPH_MODEL_WEIGHT = 0.3  # 图模型权重
     SEQ_MODEL_WEIGHT = 0.7  # 序列模型权重
 
+    # 训练配置 - 内存管理
+    MEMORY_CLEAN_INTERVAL = 50  # 每隔多少批次清理一次GPU内存，0表示不清理
+
     # =============== 任务配置 ===============
     # 抗菌肽活性预测
     TASK_TYPE = "classification"  # 'classification' 或 'regression'
@@ -197,8 +201,8 @@ class Config:
     TASK_METRICS = ["accuracy", "f1", "auc"]  # 评估指标
 
     # =============== 日志配置 ===============
-    LOG_INTERVAL = 10  # 每隔多少batch记录一次训练信息
-    EVAL_INTERVAL = 1  # 每隔多少epoch进行一次验证
+    LOG_INTERVAL = 5  # 每隔多少batch记录一次训练信息
+    EVAL_INTERVAL = 5  # 每隔多少epoch进行一次验证
     SAVE_INTERVAL = 5  # 每隔多少epoch保存一次模型
     DIST_LOGGING = True  # 分布式训练时是否只在主进程中记录日志
 
